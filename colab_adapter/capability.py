@@ -2,7 +2,7 @@
 
 Provides:
 1. CapabilityProbe: offline inspection of google-colab-cli version and feature flags (zero VM allocation).
-2. SshSafetyGuard: strict invariant checks preventing 'colab ssh' from auto-allocating a missing session.
+2. SshSafetyGuard: strict fail-closed invariants preventing 'colab ssh' from auto-allocating a missing session.
 """
 from dataclasses import asdict, dataclass
 import json
@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .errors import (
     AutoAllocationBlockedError,
@@ -22,6 +22,13 @@ from .errors import (
 )
 from .provider import ManagedSessionRegistry
 
+_ANSI_REGEX = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def _strip_ansi(text: str) -> str:
+    """Strip ANSI escape sequences from rich/colored terminal outputs."""
+    return _ANSI_REGEX.sub("", text)
+
 
 @dataclass(frozen=True)
 class CliCapabilities:
@@ -29,7 +36,7 @@ class CliCapabilities:
 
     cli_path: str
     version: str
-    available_commands: List[str]
+    available_commands: Tuple[str, ...]
     supports_ssh: bool
     supports_ssh_proxy_mode: bool
     supports_upload: bool
@@ -39,7 +46,9 @@ class CliCapabilities:
     supports_usage: bool
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["available_commands"] = list(self.available_commands)
+        return d
 
 
 class CapabilityProbe:
@@ -63,7 +72,7 @@ class CapabilityProbe:
         return CliCapabilities(
             cli_path=self.cli_path,
             version=version,
-            available_commands=sorted(commands),
+            available_commands=tuple(sorted(commands)),
             supports_ssh=supports_ssh,
             supports_ssh_proxy_mode=supports_ssh_proxy_mode,
             supports_upload="upload" in commands,
@@ -83,11 +92,12 @@ class CapabilityProbe:
                 check=True,
                 timeout=timeout,
             )
-            return res.stdout
+            return _strip_ansi(res.stdout)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            stderr = _strip_ansi(getattr(e, "stderr", "") or "")
             raise UpstreamCliError(
-                f"Failed to invoke '{' '.join(cmd)}': {e}",
-                details={"cmd": cmd, "stderr": getattr(e, "stderr", None)},
+                f"Failed to invoke '{' '.join(args)}': {e}",
+                details={"args": args, "stderr": stderr},
             )
 
     def _get_version(self) -> str:
@@ -99,7 +109,6 @@ class CapabilityProbe:
 
     def _get_commands(self) -> Set[str]:
         out = self._run_cmd(["--help"])
-        # Commands are listed in a table / section: "│ command_name" or "  command_name  "
         commands = set()
         in_commands = False
         for line in out.splitlines():
@@ -107,7 +116,7 @@ class CapabilityProbe:
                 in_commands = True
                 continue
             if in_commands:
-                # Format is typically "│ console         Connect to..." or "  console   ..."
+                # Format typically: "│ command-name    Description" or "  command-name  Description"
                 match = re.search(r"[│\s]+([a-z][a-z0-9\-]+)\s{2,}", line)
                 if match:
                     cmd_name = match.group(1).strip()
@@ -123,13 +132,31 @@ class CapabilityProbe:
 
 
 class SshSafetyGuard:
-    """Guards against upstream 'colab ssh' auto-allocating missing sessions."""
+    """Enforces fail-closed invariants preventing 'colab ssh' from auto-allocating a session.
+
+    CRITICAL ARCHITECTURAL FINDING:
+    Upstream 'colab ssh --proxy-mode -s NAME' checks if NAME is in the session store;
+    if absent, it invokes `_auto_create_session(name=NAME)` which creates a remote VM!
+    A preflight existence check alone cannot eliminate TOCTOU race conditions.
+
+    SAFE EXECUTION INVARIANT:
+    To ensure ZERO chance of auto-allocation:
+    1. Direct 'colab ssh -s NAME' is STRICTLY FORBIDDEN.
+    2. Proxy mode MUST be invoked WITHOUT '-s': 'colab --config <isolated> ssh --proxy-mode'.
+    3. The isolated config MUST contain only the approved, managed session entry.
+    4. When '-s' is omitted, upstream '_select_proxy_session(session=None)' resolves the unique
+       active session. If the session has disappeared (or is empty), it fails closed with Exit(1)
+       without ever calling '_auto_create_session()'.
+    5. SSH transport remains DISABLED by default (allow_ssh=False) for autonomous execution,
+       using official CLI upload/exec transport as the fail-closed fallback.
+    """
 
     def __init__(
         self,
         registry: ManagedSessionRegistry,
         colab_config_path: Optional[str] = None,
         allow_ssh: bool = False,
+        cli_path: Optional[str] = None,
     ):
         self.registry = registry
         self.config_path = Path(
@@ -138,15 +165,13 @@ class SshSafetyGuard:
             or os.path.expanduser("~/.config/colab-cli/sessions.json")
         )
         self.allow_ssh = allow_ssh
+        self.cli_path = cli_path or shutil.which("colab") or "colab"
 
     def check_ssh_allowed_for_session(self, session_name: str) -> None:
-        """Verifies that an SSH connection to session_name will not auto-allocate a VM.
+        """Verifies session ownership and local store presence.
 
-        Raises:
-            TransportUnavailableError: If SSH transport is globally disabled.
-            UnmanagedSessionError: If the session is not owned in the adapter registry.
-            AutoAllocationBlockedError: If the session is missing from colab-cli store,
-                which would trigger upstream CLI auto-provisioning.
+        Note: A precheck alone is not a guarantee if passing '-s NAME'.
+        Use `build_safe_ssh_proxy_invocation` to prevent TOCTOU auto-allocation.
         """
         if not self.allow_ssh:
             raise TransportUnavailableError(
@@ -169,15 +194,57 @@ class SshSafetyGuard:
                 "Operation blocked."
             )
 
+    def build_safe_ssh_proxy_invocation(
+        self,
+        session_name: str,
+        isolated_dir: Union[str, Path],
+    ) -> List[str]:
+        """Builds a fail-closed, race-free SSH proxy command without '-s'.
+
+        Creates an isolated session config file containing ONLY the single approved session.
+        Invokes: ['colab', '--config', isolated_config_path, 'ssh', '--proxy-mode']
+        
+        Because '-s' is NOT passed, upstream code resolves session=None, which CANNOT
+        enter the `_auto_create_session` branch if the session was pruned or missing.
+        """
+        self.check_ssh_allowed_for_session(session_name)
+
+        session_entry = self._get_session_data(session_name)
+        if not session_entry:
+            raise AutoAllocationBlockedError(
+                f"Session '{session_name}' data could not be retrieved from local store."
+            )
+
+        isolated_path = Path(isolated_dir) / f"isolated_colab_session_{session_name}.json"
+        # Write single session store
+        isolated_data = {session_name: session_entry}
+        isolated_path.write_text(json.dumps(isolated_data, indent=2), encoding="utf-8")
+
+        # Command intentionally OMITS '-s NAME' to prevent upstream auto-creation!
+        return [
+            self.cli_path,
+            "--config",
+            str(isolated_path.resolve()),
+            "ssh",
+            "--proxy-mode",
+        ]
+
     def _session_in_colab_cli_store(self, session_name: str) -> bool:
+        data = self._read_config_data()
+        return session_name in data
+
+    def _get_session_data(self, session_name: str) -> Optional[Dict[str, Any]]:
+        data = self._read_config_data()
+        return data.get(session_name)
+
+    def _read_config_data(self) -> Dict[str, Any]:
         if not self.config_path.exists():
-            return False
+            return {}
         try:
             content = self.config_path.read_text(encoding="utf-8")
             if not content.strip():
-                return False
-            data = json.loads(content)
-            return session_name in data
+                return {}
+            return json.loads(content)
         except Exception:
-            # If the config file cannot be safely read, fail closed!
-            return False
+            # Corrupted or unreadable config fails closed!
+            return {}

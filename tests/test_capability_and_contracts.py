@@ -7,7 +7,12 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from colab_adapter.capability import CapabilityProbe, CliCapabilities, SshSafetyGuard
+from colab_adapter.capability import (
+    CapabilityProbe,
+    CliCapabilities,
+    SshSafetyGuard,
+    _strip_ansi,
+)
 from colab_adapter.errors import (
     ArtifactValidationError,
     AutoAllocationBlockedError,
@@ -62,6 +67,24 @@ class TestV2ContractsAndCapabilityProbe(unittest.TestCase):
         self.assertIsInstance(ArtifactValidationError("missing pt"), ColabV2Error)
         self.assertIsInstance(SessionNotFoundError("no session"), TransportError)
 
+    def test_secret_redaction_in_errors(self):
+        secret_token = "ya29.a0AfH6SMB_secret_access_token_12345"
+        oauth_code = "4/0AfH6SMB_authorization_code_abcdef"
+        err = UpstreamCliError(
+            f"Failed with token {secret_token}",
+            details={
+                "cmd": ["colab", "--token", secret_token, "--auth", oauth_code],
+                "api_key": "super_secret_key_999",
+            },
+        )
+        msg = str(err)
+        d = err.to_dict()
+        self.assertNotIn(secret_token, msg)
+        self.assertNotIn(secret_token, str(d))
+        self.assertNotIn(oauth_code, str(d))
+        self.assertIn("[REDACTED]", msg)
+        self.assertEqual(d["details"]["api_key"], "[REDACTED]")
+
     def test_capability_probe_offline_with_mocked_cli(self):
         mock_cli_path = "/usr/local/bin/colab"
 
@@ -71,8 +94,7 @@ class TestV2ContractsAndCapabilityProbe(unittest.TestCase):
             if "version" in cmd:
                 res.stdout = "Version: 0.7.5\n"
             elif "--help" in cmd and "ssh" not in cmd:
-                res.stdout = """
-Colab CLI
+                res.stdout = """\x1b[1mColab CLI\x1b[0m
 ╭─ Commands ───────────────────╮
 │ download   Download a file   │
 │ exec       Execute code      │
@@ -102,6 +124,7 @@ Usage: colab ssh [OPTIONS]
             caps = probe.probe()
 
             self.assertEqual(caps.version, "0.7.5")
+            self.assertIsInstance(caps.available_commands, tuple)
             self.assertTrue(caps.supports_ssh)
             self.assertTrue(caps.supports_ssh_proxy_mode)
             self.assertTrue(caps.supports_upload)
@@ -124,6 +147,24 @@ Usage: colab ssh [OPTIONS]
         probe = CapabilityProbe(cli_path="/nonexistent/colab_binary")
         with self.assertRaises(UpstreamCliNotFoundError):
             probe.probe()
+
+    def test_strip_ansi_helper(self):
+        raw = "\x1b[31;1mError: \x1b[0mSomething went wrong \x1b[32m[OK]\x1b[0m"
+        clean = _strip_ansi(raw)
+        self.assertEqual(clean, "Error: Something went wrong [OK]")
+
+    def test_live_installed_colab_cli_probe_if_available(self):
+        real_colab = shutil.which("colab")
+        if real_colab and os.path.isfile(real_colab):
+            probe = CapabilityProbe(cli_path=real_colab)
+            caps = probe.probe()
+            self.assertIn(".", caps.version)
+            self.assertIsInstance(caps.available_commands, tuple)
+            self.assertIn("upload", caps.available_commands)
+            self.assertIn("download", caps.available_commands)
+            self.assertIn("exec", caps.available_commands)
+            self.assertIn("sessions", caps.available_commands)
+            self.assertTrue(caps.supports_ssh_proxy_mode)
 
     def test_ssh_safety_guard_refuses_when_disabled(self):
         guard = SshSafetyGuard(
@@ -148,14 +189,12 @@ Usage: colab ssh [OPTIONS]
     def test_ssh_safety_guard_blocks_auto_allocation_when_session_missing_from_colab_store(
         self,
     ):
-        # Register session in adapter registry
         self.registry.register(
             session_id="managed-session-123",
             job_id="job-1",
             gpu="T4",
             project_name="proj",
         )
-        # But sessions.json does not exist or does not contain managed-session-123
         guard = SshSafetyGuard(
             registry=self.registry,
             colab_config_path=self.config_path,
@@ -174,7 +213,6 @@ Usage: colab ssh [OPTIONS]
             gpu="T4",
             project_name="proj",
         )
-        # Create valid sessions.json
         Path(self.config_path).write_text(
             json.dumps({session_id: {"name": session_id, "endpoint": "https://foo"}}),
             encoding="utf-8",
@@ -184,8 +222,84 @@ Usage: colab ssh [OPTIONS]
             colab_config_path=self.config_path,
             allow_ssh=True,
         )
-        # Should not raise any error
+        # Passes precheck
         guard.check_ssh_allowed_for_session(session_id)
+
+    def test_ssh_safety_guard_builds_safe_invocation_without_s_flag(self):
+        session_id = "safe-session-456"
+        self.registry.register(
+            session_id=session_id,
+            job_id="job-3",
+            gpu="T4",
+            project_name="proj",
+        )
+        session_data = {"name": session_id, "endpoint": "https://foo", "token": "tok"}
+        Path(self.config_path).write_text(
+            json.dumps({session_id: session_data}),
+            encoding="utf-8",
+        )
+        guard = SshSafetyGuard(
+            registry=self.registry,
+            colab_config_path=self.config_path,
+            allow_ssh=True,
+            cli_path="/usr/bin/colab",
+        )
+        isolated_dir = tempfile.mkdtemp(dir=self.tmp_dir)
+        cmd = guard.build_safe_ssh_proxy_invocation(session_id, isolated_dir)
+
+        # Invariant checks:
+        # 1. Must NOT include "-s" or "--session"
+        self.assertNotIn("-s", cmd, "Safe invocation MUST NOT pass '-s' to avoid auto-allocation")
+        self.assertNotIn("--session", cmd, "Safe invocation MUST NOT pass '--session'")
+        # 2. Must include --config pointing to the isolated single-session config
+        self.assertIn("--config", cmd)
+        config_idx = cmd.index("--config") + 1
+        isolated_config_file = cmd[config_idx]
+        self.assertTrue(os.path.isfile(isolated_config_file))
+        # 3. Isolated config must contain ONLY the single session
+        isolated_content = json.loads(Path(isolated_config_file).read_text(encoding="utf-8"))
+        self.assertEqual(list(isolated_content.keys()), [session_id])
+        # 4. Command must specify ssh --proxy-mode
+        self.assertIn("ssh", cmd)
+        self.assertIn("--proxy-mode", cmd)
+
+    def test_adversarial_session_disappearance_toctou_upstream_behavior(self):
+        """Proves that upstream _select_proxy_session(session=None) fails closed
+        if the session disappears, whereas passing session='NAME' would call _auto_create_session.
+        """
+        import sys
+        if sys.version_info < (3, 10):
+            self.skipTest("Upstream colab_cli requires Python >=3.10 (uses pattern matching)")
+
+        uv_path = Path("/mnt/ssd/genos2/.local/share/uv/tools/google-colab-cli/lib/python3.12/site-packages")
+        if uv_path.exists() and str(uv_path) not in sys.path:
+            sys.path.insert(0, str(uv_path))
+
+        try:
+            from colab_cli.commands import ssh as upstream_ssh
+        except ImportError:
+            self.skipTest("colab_cli not installed in this Python environment")
+
+        # Case A: When session='missing_name' is passed to upstream _select_proxy_session:
+        with patch.object(upstream_ssh, "_session_exists", return_value=False), \
+             patch.object(upstream_ssh, "_auto_create_session") as mock_auto_create:
+            mock_auto_create.return_value = MagicMock()
+            upstream_ssh._select_proxy_session("missing_name", gpu="T4", tpu=None)
+            self.assertTrue(
+                mock_auto_create.called,
+                "Confirmed vulnerability: passing '-s missing_name' triggers _auto_create_session!"
+            )
+
+        # Case B: When session=None is passed (our safe invocation without '-s'):
+        with patch.object(upstream_ssh, "_auto_create_session") as mock_auto_create_b, \
+             patch.object(upstream_ssh, "_resolve_session") as mock_resolve:
+            mock_resolve.side_effect = SystemExit(2)
+            with self.assertRaises(SystemExit):
+                upstream_ssh._select_proxy_session(None, gpu="T4", tpu=None)
+            self.assertFalse(
+                mock_auto_create_b.called,
+                "Verified invariant: omitting '-s' NEVER calls _auto_create_session!"
+            )
 
 
 if __name__ == "__main__":

@@ -65,12 +65,15 @@ Furthermore, a simple read preflight (e.g. `colab sessions`) followed by `colab 
 
 ### 2.3 Binding Invariant for V2
 To guarantee zero unexpected cloud allocations:
-1. **Official CLI fallback is the primary transport:** `colab upload`, `colab exec`, and `colab download` NEVER auto-allocate. They fail closed if a session is missing.
-2. **Guarded SSH Transport:** SSH transport is strictly disabled by default. If enabled by explicit configuration:
-   - The session MUST be verified in `ManagedSessionRegistry` (local ownership check).
-   - An active lease check must be performed.
-   - An independent `SshSafetyGuard` checks `colab-cli` local state file directly to ensure the session exists in `~/.config/colab-cli/sessions.json` BEFORE dispatching any `colab ssh` process.
-   - If the session is missing, `AutoAllocationBlockedError` is raised immediately. No `colab ssh` command is spawned.
+1. **Never treat a local-store precheck as a guarantee against TOCTOU auto-allocation if passing `-s NAME`:** Upstream `colab ssh` can race against concurrent cleanup, server-side session termination, or token expiry.
+2. **Official CLI fallback is the primary, guaranteed fail-closed transport:** `colab upload`, `colab exec`, and `colab download` NEVER auto-allocate under any circumstances. They fail closed (`typer.Exit(1)`) if a session is missing.
+3. **Guarded SSH Transport (Disabled by Default):**
+   - For autonomous and unattended execution, SSH transport is DISABLED (`allow_ssh=False`).
+   - If interactive SSH is explicitly requested by a human operator:
+     - Direct `colab ssh -s NAME` is strictly prohibited because upstream `-s` triggers `_auto_create_session()`.
+     - `SshSafetyGuard.build_safe_ssh_proxy_invocation` generates an isolated single-session config containing ONLY the approved session and executes `colab --config <isolated_config> ssh --proxy-mode` WITHOUT `-s`.
+     - When `-s` is omitted, upstream `_select_proxy_session(session=None)` calls `_resolve_session(None)`. If the session is missing or pruned, it exits with error (Exit 1 or 2) and **cannot enter the auto-create branch**.
+     - If the session disappeared before or during connection, it fails closed without allocating a new VM.
 
 ---
 

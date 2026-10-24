@@ -2,8 +2,10 @@
 
 Establishes typed, deterministic error classes covering manifest validation,
 transport abstraction, SSH safety guards, delta sync, and artifact recovery.
+Ensures sensitive credentials, authorization codes, and private keys are redacted.
 """
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, List, Optional, Union
 from .provider import (
     ArtifactMissingError,
     ColabProviderError,
@@ -11,14 +13,41 @@ from .provider import (
     InvalidJobSpecError,
 )
 
+_SECRET_PATTERN = re.compile(
+    r"(4/[0-9A-Za-z\-_]+|ya29\.[0-9A-Za-z\-_]+|eyJ[0-9A-Za-z\-_]+\.[0-9A-Za-z\-_]+|"
+    r"(?:token|secret|password|key|client_secret|access_token|refresh_token)\s*[:=]\s*['\"]?[^\s'\"]+)",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_details(val: Any) -> Any:
+    """Recursively redact potential secrets from error detail structures."""
+    if isinstance(val, str):
+        return _SECRET_PATTERN.sub("[REDACTED]", val)
+    elif isinstance(val, list):
+        return [_sanitize_details(v) for v in val]
+    elif isinstance(val, tuple):
+        return tuple(_sanitize_details(v) for v in val)
+    elif isinstance(val, dict):
+        sanitized = {}
+        for k, v in val.items():
+            if any(s in k.lower() for s in ("token", "secret", "password", "key", "auth")):
+                sanitized[k] = "[REDACTED]"
+            else:
+                sanitized[k] = _sanitize_details(v)
+        return sanitized
+    return val
+
 
 class ColabV2Error(ColabProviderError):
     """Base error class for all V2 Colab Project Workspace operations."""
 
     def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
-        super().__init__(message)
-        self.message = message
-        self.details = details or {}
+        sanitized_msg = _sanitize_details(message)
+        sanitized_details = _sanitize_details(details or {})
+        super().__init__(sanitized_msg)
+        self.message = sanitized_msg
+        self.details = sanitized_details
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a structured dictionary suitable for JSON serialization."""
@@ -42,7 +71,7 @@ class UpstreamCliNotFoundError(UpstreamCliError, DependencyMissingError):
 class AutoAllocationBlockedError(ColabV2Error):
     """Raised when an operation would risk implicitly allocating a cloud VM without approval.
     
-    Specifically guards against 'colab ssh -s <name>' auto-creating a missing session.
+    Guards against 'colab ssh -s <name>' auto-creating a missing session or any race condition.
     """
     pass
 

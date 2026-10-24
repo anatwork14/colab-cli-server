@@ -21,9 +21,10 @@
 - Investigated real google-colab-cli v0.7.5 source and host behavior for version, help, ssh, upload, download, exec, new, run, sessions, and usage.
 - Documented in `docs/UPSTREAM_COMPATIBILITY_V2.md`: source-verified vs host-verified matrix, error taxonomy, and threat model.
 - Discovered and addressed critical upstream asymmetry: `colab ssh -s NAME` auto-creates missing sessions (`_auto_create_session`), while `upload`, `download`, and `exec` fail closed.
-- Implemented `colab_adapter/errors.py` (V2 typed error taxonomy), `colab_adapter/capability.py` (`CapabilityProbe` with zero allocation and `SshSafetyGuard` preventing auto-allocation).
-- Added comprehensive unit tests in `tests/test_capability_and_contracts.py` (all 7 new tests passed; 50/50 total suite passed).
-- **Gate G1 Satisfied:** 0 runtime spend, subprocess spy proves no allocating calls, SSH auto-allocation risk guarded.
+- Established provably fail-closed SSH execution invariant: passing `-s` is strictly prohibited. To connect via SSH, `build_safe_ssh_proxy_invocation` creates an isolated single-session config and executes bare `colab ssh --proxy-mode` without `-s`, which upstream `_select_proxy_session(session=None)` resolves without entering the auto-creation branch. SSH transport remains disabled by default for autonomous execution.
+- Implemented `colab_adapter/errors.py` (V2 typed error taxonomy with secret/token redaction), `colab_adapter/capability.py` (`CapabilityProbe` with ANSI stripping and immutable tuple capabilities, and `SshSafetyGuard` preventing auto-allocation).
+- Added comprehensive unit tests in `tests/test_capability_and_contracts.py` (12 tests, including adversarial session disappearance TOCTOU and real host CLI probe). Full suite: 55 tests passing.
+- **Gate G1 Satisfied:** 0 runtime spend, subprocess spy proves no allocating calls, SSH auto-allocation risk guarded and tested against TOCTOU.
 
 ## M2 — Project manifest & planning (G2)
 **Status: NOT_STARTED. Dependencies: M1.**
