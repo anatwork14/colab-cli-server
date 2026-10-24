@@ -90,6 +90,8 @@ Stable ID + ingestion timestamp + source timestamp are required for deduplicatio
 
 All routes require authentication and authorization, including SSE and exports; restrict filters/pages, protect against cross-origin access, XSS via logs, path traversal, ID enumeration and disclosure of private project information.
 
+Authentication is strictly accepted via `Authorization: Bearer <token>`, `X-API-Token: <token>`, or trusted reverse proxy headers (`X-Remote-User`). URL query parameter authentication (`?token=...`) is strictly rejected. In the browser UI, bearer tokens are maintained in `sessionStorage` (prompted upon first 401) and cleared on tab closure. External binding requires TLS or a trusted reverse-proxy identity gateway. Wildcard CORS (`Access-Control-Allow-Origin: *`) is strictly prohibited.
+
 **Explicitly out of scope:** `POST /run`, `POST /stop`, shell, Colab SSH, OAuth sign-in and self-approval from browser. Future controls need protected executor and separate review.
 
 ## Monitoring implementation slices

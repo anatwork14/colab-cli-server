@@ -7,8 +7,12 @@ Tracks resumable upload sessions, byte offsets, retries, and errors with atomic 
 from __future__ import annotations
 
 import json
+import logging
 import os
+import shutil
+import stat
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -23,8 +27,10 @@ except ImportError:
     fcntl = None
 
 
-from ..errors import InvalidStateTransitionError
+from ..errors import InvalidStateTransitionError, JournalCorruptionError, JournalLockError
 from .base import _utc_now_iso
+
+logger = logging.getLogger(__name__)
 
 
 class TransferStatus(str, Enum):
@@ -76,6 +82,7 @@ class TransferRecord:
     remote_file_id: Optional[str] = None
     retry_count: int = 0
     max_retries: int = 5
+    next_retry_at: Optional[float] = None
     last_error: Optional[str] = None
     created_at: str = field(default_factory=_utc_now_iso)
     updated_at: str = field(default_factory=_utc_now_iso)
@@ -95,8 +102,12 @@ class TransferRecord:
         if error_message:
             self.last_error = error_message
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+    def to_dict(self, safe: bool = False) -> Dict[str, Any]:
+        """Convert record to dict, optionally redacting sensitive session URLs."""
+        d = asdict(self)
+        if safe and d.get("resumable_session_url"):
+            d["resumable_session_url"] = "[REDACTED_SESSION_URL]"
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TransferRecord":
@@ -104,8 +115,8 @@ class TransferRecord:
             "transfer_id", "project_id", "run_id", "artifact_id", "local_path",
             "target_rel_path", "size_bytes", "sha256", "status", "md5",
             "resumable_session_url", "bytes_transferred", "remote_file_id",
-            "retry_count", "max_retries", "last_error", "created_at",
-            "updated_at", "metadata"
+            "retry_count", "max_retries", "next_retry_at", "last_error",
+            "created_at", "updated_at", "metadata"
         }
         filtered = {k: v for k, v in data.items() if k in valid}
         return cls(**filtered)
@@ -117,6 +128,10 @@ class TransferJournal:
     def __init__(self, journal_path: Union[str, Path]):
         self.path = Path(journal_path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(str(self.path.parent), 0o700)
+        except OSError:
+            pass
         self.lock_path = self.path.with_suffix(".lock")
         self._thread_lock = threading.Lock()
         if not self.path.exists():
@@ -126,40 +141,89 @@ class TransferJournal:
 
     @contextmanager
     def _acquire_locks(self):
-        """Cross-thread and cross-process file lock guard."""
-        with self._thread_lock:
-            lock_fd = None
+        """Cross-thread and cross-process file lock guard. Fails closed if locking fails."""
+        if not self._thread_lock.acquire(timeout=30.0):
+            raise JournalLockError("Thread lock acquisition timed out.")
+        lock_fd = None
+        try:
             if fcntl is not None:
                 try:
                     lock_fd = os.open(str(self.lock_path), os.O_RDWR | os.O_CREAT, 0o600)
                     fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                except (OSError, AttributeError):
-                    lock_fd = None
-            try:
-                yield
-            finally:
-                if lock_fd is not None:
-                    try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                        os.close(lock_fd)
-                    except OSError:
-                        pass
+                except (OSError, AttributeError) as e:
+                    raise JournalLockError(f"Failed to acquire exclusive lock on {self.lock_path}: {e}") from e
+            yield
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+            self._thread_lock.release()
 
     def _read_records(self) -> Dict[str, Dict[str, Any]]:
+        """Read records from journal. Recovers from .bak or preserves corrupt file without silent wipe."""
+        if not self.path.exists():
+            return {}
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            return {}
+        except (json.JSONDecodeError, ValueError) as jde:
+            # Preserve corrupt copy
+            corrupt_file = self.path.parent / f"{self.path.name}.corrupt.{int(time.time())}"
+            try:
+                shutil.copy2(str(self.path), str(corrupt_file))
+            except Exception:
+                pass
+
+            # Attempt recovery from validated backup
+            bak = self.path.with_suffix(".bak")
+            if bak.exists():
+                try:
+                    with open(bak, "r", encoding="utf-8") as f_bak:
+                        data = json.load(f_bak)
+                        logger.warning(f"Journal corruption detected; recovered {len(data)} records from backup {bak}")
+                        return data
+                except Exception:
+                    pass
+
+            raise JournalCorruptionError(
+                f"Transfer journal at {self.path} is corrupted: {jde}. Corrupt copy preserved at {corrupt_file}."
+            ) from jde
 
     def _write_records(self, records: Dict[str, Dict[str, Any]]) -> None:
+        """Atomically persist records to journal file with 0600 mode and backup."""
         tmp = self.path.parent / f"{self.path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
         payload = json.dumps(records, indent=2, sort_keys=True)
-        with open(tmp, "w", encoding="utf-8") as f:
+
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
+
         os.replace(str(tmp), str(self.path))
+        try:
+            os.chmod(str(self.path), 0o600)
+        except OSError:
+            pass
+
+        # Create/update backup file
+        try:
+            bak = self.path.with_suffix(".bak")
+            shutil.copy2(str(self.path), str(bak))
+            os.chmod(str(bak), 0o600)
+        except OSError:
+            pass
+
+        # Fsync parent directory descriptor if supported
+        try:
+            dfd = os.open(str(self.path.parent), os.O_RDONLY)
+            os.fsync(dfd)
+            os.close(dfd)
+        except OSError:
+            pass
 
     def record_transfer(self, record: TransferRecord) -> None:
         """Create or update a transfer record under lock."""

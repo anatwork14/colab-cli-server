@@ -156,7 +156,7 @@ class TestUploadWorker(unittest.TestCase):
 
         # Local file must still exist!
         self.assertTrue(f.exists(), "Local checkpoint must never be deleted on upload failure")
-        self.assertEqual(len(failures), 1)
+        self.assertGreaterEqual(len(failures), 1)
         record = self.journal.get_transfer(failures[0][0].transfer_id)
         self.assertIn(record.status, (TransferStatus.RETRY_PENDING.value, TransferStatus.UPLOAD_FAILED.value))
 

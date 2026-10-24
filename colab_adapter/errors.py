@@ -195,3 +195,18 @@ class CheckpointPolicyError(ColabV2Error):
     pass
 
 
+class JournalError(StorageError):
+    """Base error for persistent transfer journal operations."""
+    pass
+
+
+class JournalCorruptionError(JournalError):
+    """Raised when transfer journal JSON is corrupted and cannot be recovered from backup."""
+    pass
+
+
+class JournalLockError(JournalError):
+    """Raised when transfer journal lock cannot be safely acquired."""
+    pass
+
+

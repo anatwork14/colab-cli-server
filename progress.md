@@ -37,7 +37,7 @@
 | M6 | Artifact/cache/resume and observability | COMPLETE | Issue #10, colab_adapter/artifacts.py, colab_adapter/telemetry.py; 95/95 tests pass |
 | M7 | Integration, end-to-end signoff and docs | COMPLETE | Issue #11, colab_adapter/cli.py, tests/test_project_e2e.py; 111/111 tests pass |
 | M8 | Secure browser training & compute monitor | COMPLETE | Issue #12, colab_adapter/monitor/, tests/test_monitor_backend.py; 105/105 tests pass |
-| V2-Drive | Cross-Device Workspaces & Google Drive Artifacts | COMPLETE | Issue #21, colab_adapter/storage/, broker, reproducibility; 142/142 tests pass |
+| V2-Drive | Cross-Device Workspaces & Google Drive Artifacts | COMPLETE | Issue #21, colab_adapter/storage/, broker, reproducibility; 154/154 tests pass |
 | M9 | Cross-provider abstraction (optional) | DEFERRED | Only after Colab V2 is independently usable |
 
 
@@ -46,19 +46,36 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
-- **2026-10-24 — V2 Extension / Gate G-Drive COMPLETE (branch `feat/v2-drive-workspaces`):**
-  - Implemented provider-independent storage abstraction (`ArtifactStore`, `StoredArtifact`, `LocalArtifactStore`, `PublicationManifest`, `TransferJournal`, `TransferRecord`) in `colab_adapter/storage/`.
-  - Implemented Google Drive API v3 resumable chunked upload protocol (`GoogleDriveArtifactStore`) with Range query resume, exponential backoff, Drive quota handling (403), token refresh (401), local SHA256 canonical digests, and remote MD5/size validation.
-  - Connected M6 `ArtifactManager` with asynchronous background `ArtifactUploadWorker` featuring persistent journal task recovery across process restarts.
-  - Implemented deterministic source snapshot creation (`source_snapshot.tar.gz`) with normalized mtime=0, uid=0, and strict secret filtering (`.env`, `*.pem`, `id_rsa`, `__pycache__`, `.git`).
-  - Implemented Ubuntu `WorkspaceBroker` for multi-client read-only attach, token validation, audit logging, expired runtime inspection, and strictly zero VM allocation on attach.
-  - Extended M8 monitoring server (`/api/v1/runs/<id>/artifacts`, `/drive`, `/manifest`) and responsive dashboard for Google Drive artifacts and run history continuity.
-  - Implemented `CheckpointPolicyManager` with minimum interval throttling, keep_last retention, and strict preservation of at least 1 verified local checkpoint.
-  - Added 7 comprehensive test suites in `tests/`: `test_storage_abstraction.py`, `test_google_drive_store.py`, `test_reproducibility.py`, `test_checkpoint_policy.py`, `test_upload_worker.py`, `test_workspace_broker.py`, `test_drive_and_broker_e2e.py`.
-  - Full test suite: **142 tests passing** in `9.0s` (100% pass, 0 failures, 1 skipped).
-  - Preserved 100% backward compatibility with V1 baseline and all M1–M8 milestones.
-  - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive tokens transmitted).
-  - **IMPLEMENTATION READY — LIVE DRIVE VALIDATION PENDING USER APPROVAL.**
+- **2026-10-24 — V2 Security Hardening & Resumable Recovery COMPLETE (branch `feat/v2-drive-workspaces`):**
+  - **P0 Authentication & Remote Access Security**:
+    - Completely removed browser authentication through `?token=` query parameters across all endpoints (`/api/v1/summary`, `/api/v1/runs`, `/api/v1/events/stream`, `/api/v1/export/compute.csv`).
+    - Updated embedded dashboard UI to manage bearer token via `sessionStorage` (cleared on tab close, never leaked into URLs, server logs, or referrer headers).
+    - Removed `Access-Control-Allow-Origin: *`. Enforced strict same-origin by default, optional explicit origin whitelist, and defense-in-depth security headers (`Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`).
+    - Enforced secure remote binding: external binding (`allow_external=True`) over unencrypted HTTP without trusted identity proxy is rejected with `ValueError`.
+    - Added protected `tokens_file` support to `WorkspaceBroker` with `0600` mode permissions and `0700` parent directory, ensuring authorization survives server restarts.
+  - **P1 Google Drive Resumable Uploads & Authoritative Verification**:
+    - Strict `Range` header parsing on HTTP 308 responses (`bytes=0-N` correctly updates offset to `N+1`; never assumes whole chunk was committed).
+    - Reconciled committed byte offset via status query after ambiguous network errors before resuming.
+    - Handled session expiration (`HTTP 404/410`) by clearing session URL and querying target folder to prevent duplicate file objects before re-initiating.
+    - Authoritative integrity verification: eliminated local size substitution `remote_size = int(drive_file_meta.get("size", size_bytes))`. Queries remote metadata if missing; raises `DriveIntegrityError` if remote size cannot be verified.
+    - Implemented bounded-memory streaming download in `retrieve()` using 64 KiB chunks into a private temporary file (`0600`), incremental SHA256/MD5 hashing, `fsync`, atomic rename, and automatic cleanup on error.
+  - **P1 Persistent Transfer Journal & In-Process Retry Scheduler**:
+    - Restricted `TransferJournal` directories to `0700` and files/locks to `0600`.
+    - Implemented atomic writes with `fsync` and parent directory sync.
+    - Replaced silent dictionary resets on corrupted JSON with `.corrupt.<timestamp>` copy preservation and recovery from `.bak` or explicit `JournalCorruptionError`.
+    - Implemented in-process exponential backoff retry scheduler in `ArtifactUploadWorker` allowing `RETRY_PENDING` tasks to retry without worker restart.
+    - Added pre-publication validation of local source file existence and SHA256 checksum.
+  - **P1 Reproducibility Code Snapshots**:
+    - Strictly excluded symlinked files and directories by default.
+    - Validated canonical resolved paths strictly within project root.
+    - Prevented self-referential inclusion of the destination archive itself.
+    - Normalized tar entry paths with no leading `/` and no `..` traversal components.
+  - **Comprehensive Regression Suite**:
+    - Created/expanded `tests/test_v2_security_and_resumable_recovery.py` with 12 focused regression tests covering all P0 and P1 review findings.
+    - Full test suite: **154 tests passing** in `11.7s` (100% pass, 0 failures, 1 skipped).
+    - Syntax and CLI planning checks (`compileall`, `bash -n`, `colab_server.py plan`) pass cleanly (code 0).
+    - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive API calls made).
+    - **STATUS: READY FOR INDEPENDENT SECURITY & CODE REVIEW.**
 
 - **2026-10-24 — Milestone M7 / Gate G7 COMPLETE (branch `feat/v2-m7-integration`):**
 

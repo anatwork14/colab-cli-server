@@ -224,12 +224,13 @@ class TestMonitorBackend(unittest.TestCase):
                 data = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(data["current_balance_cu"], 150.0)
 
-            # 3. Authenticated request via ?token= query parameter -> 200
+            # 3. Request via ?token= query parameter is strictly rejected (P0) -> 401
             req_param = urllib.request.Request(f"{base_url}/api/v1/health?token={self.auth_token}")
-            with urllib.request.urlopen(req_param) as resp:
-                self.assertEqual(resp.status, 200)
-                data = json.loads(resp.read().decode("utf-8"))
-                self.assertIn(data["status"], ("HEALTHY", "DEGRADED"))
+            try:
+                urllib.request.urlopen(req_param)
+                self.fail("Expected HTTP 401 for ?token= query parameter")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 401)
 
             # 4. Q29: POST request -> 405 Method Not Allowed
             req_post = urllib.request.Request(
@@ -244,9 +245,10 @@ class TestMonitorBackend(unittest.TestCase):
             except urllib.error.HTTPError as e:
                 self.assertEqual(e.code, 405)
 
-            # 5. Q26: CSV export
+            # 5. Q26: CSV export with Authorization header
             req_csv = urllib.request.Request(
-                f"{base_url}/api/v1/export/compute.csv?token={self.auth_token}"
+                f"{base_url}/api/v1/export/compute.csv",
+                headers={"Authorization": f"Bearer {self.auth_token}"},
             )
             with urllib.request.urlopen(req_csv) as resp:
                 self.assertEqual(resp.status, 200)
@@ -282,8 +284,8 @@ class TestMonitorBackend(unittest.TestCase):
         try:
             # Request SSE resuming from ev1
             cursor = ev1["event_id"]
-            url = f"{base_url}/api/v1/events/stream?from_id={cursor}&token={self.auth_token}"
-            req = urllib.request.Request(url)
+            url = f"{base_url}/api/v1/events/stream?from_id={cursor}"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self.auth_token}"})
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 stream_chunk = resp.read().decode("utf-8")
                 # ev1 should be skipped because of cursor; ev2 and ev3 should be present
@@ -318,7 +320,8 @@ class TestMonitorBackend(unittest.TestCase):
         base_url = f"http://127.0.0.1:{port}"
         try:
             req = urllib.request.Request(
-                f"{base_url}/api/v1/runs?token={self.auth_token}"
+                f"{base_url}/api/v1/runs",
+                headers={"Authorization": f"Bearer {self.auth_token}"},
             )
             with urllib.request.urlopen(req) as resp:
                 body = resp.read().decode("utf-8")

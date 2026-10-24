@@ -7,13 +7,20 @@ from __future__ import annotations
 
 import logging
 import queue
+import random
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from ..errors import DriveAuthenticationError, DriveIntegrityError, DriveQuotaExceededError
+from ..errors import (
+    ArtifactValidationError,
+    DriveAuthenticationError,
+    DriveIntegrityError,
+    DriveQuotaExceededError,
+)
 from .base import ArtifactStore, ArtifactType, StoredArtifact
+from .manifest import compute_file_sha256
 from .transfer import TransferJournal, TransferRecord, TransferStatus
 
 logger = logging.getLogger(__name__)
@@ -27,12 +34,14 @@ class ArtifactUploadWorker:
         store: ArtifactStore,
         journal: TransferJournal,
         max_workers: int = 2,
+        initial_retry_delay_sec: float = 0.2,
         on_success: Optional[Callable[[StoredArtifact], None]] = None,
         on_failure: Optional[Callable[[TransferRecord, Exception], None]] = None,
     ):
         self.store = store
         self.journal = journal
         self.max_workers = max(1, max_workers)
+        self.initial_retry_delay_sec = initial_retry_delay_sec
         self.on_success = on_success
         self.on_failure = on_failure
 
@@ -40,6 +49,7 @@ class ArtifactUploadWorker:
         self._threads: List[threading.Thread] = []
         self._stop_event = threading.Event()
         self._active_transfers: Dict[str, TransferRecord] = {}
+        self._scheduled_retries: List[TransferRecord] = []
         self._lock = threading.Lock()
 
         # Load pending or interrupted transfers from persistent journal
@@ -77,6 +87,22 @@ class ArtifactUploadWorker:
             for t in self._threads:
                 t.join(timeout=timeout)
         self._threads.clear()
+
+    def _check_scheduled_retries(self) -> None:
+        """Promote due retries from scheduled list into the active queue."""
+        now = time.time()
+        with self._lock:
+            due: List[TransferRecord] = []
+            remaining: List[TransferRecord] = []
+            for rec in self._scheduled_retries:
+                if rec.next_retry_at is None or now >= rec.next_retry_at:
+                    due.append(rec)
+                else:
+                    remaining.append(rec)
+            self._scheduled_retries = remaining
+
+        for rec in due:
+            self._queue.put(rec)
 
     def enqueue(
         self,
@@ -118,14 +144,17 @@ class ArtifactUploadWorker:
             TransferStatus.UPLOAD_PENDING.value,
             TransferStatus.RETRY_PENDING.value,
         ):
-            self._queue.put(record)
+            with self._lock:
+                if record.transfer_id not in self._active_transfers:
+                    self._queue.put(record)
 
         return record
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
+            self._check_scheduled_retries()
             try:
-                record = self._queue.get(timeout=0.5)
+                record = self._queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -136,6 +165,17 @@ class ArtifactUploadWorker:
                 self._active_transfers[record.transfer_id] = record
 
             try:
+                # Revalidate local source file integrity before publication
+                src_path = Path(record.local_path)
+                if not src_path.is_file():
+                    raise ArtifactValidationError(f"Local artifact source file missing: {record.local_path}")
+
+                current_sha256 = compute_file_sha256(src_path)
+                if record.sha256 and len(record.sha256) == 64 and current_sha256.lower() != record.sha256.lower():
+                    raise ArtifactValidationError(
+                        f"Local artifact modified before publication: expected {record.sha256}, got {current_sha256}"
+                    )
+
                 # Execute publication through store
                 stored = self.store.publish(
                     source=record.local_path,
@@ -151,13 +191,18 @@ class ArtifactUploadWorker:
                 logger.warning(f"Artifact upload failed for {record.artifact_id}: {e}")
                 # Refresh record state from journal
                 refreshed = self.journal.get_transfer(record.transfer_id) or record
-                if refreshed.status not in (TransferStatus.RETRY_PENDING.value, TransferStatus.UPLOAD_FAILED.value):
-                    refreshed.retry_count += 1
-                    refreshed.last_error = str(e)
-                    if refreshed.retry_count <= refreshed.max_retries:
-                        refreshed.status = TransferStatus.RETRY_PENDING.value
-                    else:
-                        refreshed.status = TransferStatus.UPLOAD_FAILED.value
+                refreshed.retry_count += 1
+                refreshed.last_error = str(e)
+
+                if refreshed.retry_count <= refreshed.max_retries:
+                    backoff = self.initial_retry_delay_sec * (2 ** (refreshed.retry_count - 1)) + random.uniform(0.01, 0.05)
+                    refreshed.next_retry_at = time.time() + backoff
+                    refreshed.status = TransferStatus.RETRY_PENDING.value
+                    self.journal.record_transfer(refreshed)
+                    with self._lock:
+                        self._scheduled_retries.append(refreshed)
+                else:
+                    refreshed.status = TransferStatus.UPLOAD_FAILED.value
                     self.journal.record_transfer(refreshed)
 
                 if self.on_failure:
@@ -169,9 +214,9 @@ class ArtifactUploadWorker:
                 self._queue.task_done()
 
     def wait_for_completion(self, timeout: Optional[float] = None) -> bool:
-        """Block until all enqueued items are processed or timeout expires."""
+        """Block until all enqueued items and scheduled retries are processed."""
         start = time.time()
-        while not self._queue.empty() or len(self._active_transfers) > 0:
+        while not self._queue.empty() or len(self._active_transfers) > 0 or len(self._scheduled_retries) > 0:
             if timeout and (time.time() - start) >= timeout:
                 return False
             time.sleep(0.05)

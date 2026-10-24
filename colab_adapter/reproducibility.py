@@ -141,13 +141,39 @@ def create_deterministic_source_snapshot(
     source_manifest: Dict[str, Dict[str, Any]] = {}
 
     all_files: List[Tuple[str, Path]] = []
-    for root, dirs, files in os.walk(src_dir):
-        # Sort in-place for determinism
+    dest_resolved = dest.resolve()
+
+    for root, dirs, files in os.walk(src_dir, followlinks=False):
+        # Reject and exclude symlinked directories to prevent escaping project root
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
         dirs.sort()
         files.sort()
+
         for f in files:
             full_path = Path(root) / f
+
+            # Reject symlinked files by default (adversarial secret leak prevention)
+            if full_path.is_symlink() or os.path.islink(str(full_path)):
+                continue
+
+            # Validate that canonical resolved path is strictly within project root
+            try:
+                canonical = full_path.resolve()
+                canonical.relative_to(src_dir)
+            except (ValueError, RuntimeError):
+                # Path traverses or escapes outside src_dir
+                continue
+
+            # Prevent self-referential inclusion of the destination archive
+            if canonical == dest_resolved:
+                continue
+
             rel_path = str(full_path.relative_to(src_dir)).replace("\\", "/")
+
+            # Security: entries must be clean relative paths without traversal
+            if rel_path.startswith("/") or ".." in rel_path.split("/"):
+                continue
+
             if is_excluded_path(rel_path):
                 continue
             if any(p.search(rel_path) for p in extra_patterns):

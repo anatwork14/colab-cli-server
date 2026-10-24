@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import random
 import re
@@ -22,6 +23,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+import hashlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -141,6 +144,38 @@ class StandardDriveHttpClient:
             return e.code, resp_headers, e.read()
         except urllib.error.URLError as ue:
             raise DriveTransferError(f"Network error contacting Google Drive: {ue}") from ue
+
+    def stream_download(
+        self,
+        url: str,
+        dest_path: Union[str, Path],
+        headers: Optional[Dict[str, str]] = None,
+        chunk_size: int = 64 * 1024,
+        timeout: float = 60.0,
+    ) -> Tuple[int, Dict[str, str], int]:
+        """Stream response body directly into destination file with bounded memory."""
+        req = urllib.request.Request(url, headers=headers or {}, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+                if resp.status != 200:
+                    return resp.status, resp_headers, 0
+                bytes_written = 0
+                with open(dest_path, "wb") as f:
+                    while True:
+                        buf = resp.read(chunk_size)
+                        if not buf:
+                            break
+                        f.write(buf)
+                        bytes_written += len(buf)
+                    f.flush()
+                    os.fsync(f.fileno())
+                return resp.status, resp_headers, bytes_written
+        except urllib.error.HTTPError as e:
+            resp_headers = {k.lower(): v for k, v in e.headers.items()}
+            return e.code, resp_headers, 0
+        except urllib.error.URLError as ue:
+            raise DriveTransferError(f"Network error downloading Drive file: {ue}") from ue
 
 
 class GoogleDriveArtifactStore:
@@ -367,6 +402,23 @@ class GoogleDriveArtifactStore:
             return self._find_or_create_folder(subfolder, parent_id=run_folder_id)
         return run_folder_id
 
+    def _find_file_in_folder(self, filename: str, folder_id: str) -> Optional[Dict[str, Any]]:
+        """Query for existing non-trashed file with matching name in folder to prevent duplicates."""
+        safe_name = filename.replace("'", "\\'")
+        query = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
+        encoded = urllib.parse.quote(query)
+        url = f"https://www.googleapis.com/drive/v3/files?q={encoded}&fields=files(id,name,size,md5Checksum)"
+        try:
+            status, _, body = self._request_with_retry("GET", url)
+            if status == 200:
+                res = json.loads(body.decode("utf-8"))
+                files = res.get("files", [])
+                if files:
+                    return files[0]
+        except Exception:
+            pass
+        return None
+
     def _initiate_resumable_upload(
         self,
         filename: str,
@@ -408,7 +460,7 @@ class GoogleDriveArtifactStore:
         }
         status, resp_headers, body = self.http_client.request("PUT", session_url, headers=hdrs)
         if status == 308:
-            range_hdr = resp_headers.get("range")
+            range_hdr = resp_headers.get("range", "")
             if range_hdr and "-" in range_hdr:
                 # range format: "bytes=0-1048575"
                 m = re.search(r"bytes=0-(\d+)", range_hdr)
@@ -435,6 +487,14 @@ class GoogleDriveArtifactStore:
         src = Path(local_path).resolve()
         total_size = src.stat().st_size
         filename = src.name
+
+        # Check if identical file already exists in target folder (idempotency)
+        existing = self._find_file_in_folder(filename, target_folder_id)
+        if existing and int(existing.get("size", -1)) == total_size:
+            transfer_record.bytes_transferred = total_size
+            transfer_record.remote_file_id = existing.get("id")
+            self.journal.record_transfer(transfer_record)
+            return existing
 
         session_url = transfer_record.resumable_session_url
         if not session_url:
@@ -475,6 +535,19 @@ class GoogleDriveArtifactStore:
                     try:
                         status, resp_headers, body = self.http_client.request("PUT", session_url, headers=hdrs, data=chunk)
                     except Exception as ce:
+                        # Ambiguous network failure: query server to reconcile committed offset
+                        synced_offset, final_res = self._query_upload_progress(session_url, total_size)
+                        if final_res:
+                            transfer_record.bytes_transferred = total_size
+                            transfer_record.remote_file_id = final_res.get("id")
+                            self.journal.record_transfer(transfer_record)
+                            return final_res
+                        if synced_offset > uploaded_bytes:
+                            uploaded_bytes = synced_offset
+                            transfer_record.bytes_transferred = uploaded_bytes
+                            self.journal.record_transfer(transfer_record)
+                            break
+
                         if attempt == self.max_retries:
                             raise DriveTransferError(f"Chunk upload network failure after {self.max_retries} retries: {ce}") from ce
                         time.sleep(chunk_backoff * (1.0 + random.uniform(0.1, 0.4)))
@@ -482,7 +555,14 @@ class GoogleDriveArtifactStore:
                         continue
 
                     if status == 308:
-                        uploaded_bytes += chunk_len
+                        range_hdr = resp_headers.get("range", "")
+                        m = re.search(r"bytes=0-(\d+)", range_hdr)
+                        if m:
+                            uploaded_bytes = int(m.group(1)) + 1
+                        else:
+                            synced_offset, _ = self._query_upload_progress(session_url, total_size)
+                            uploaded_bytes = max(uploaded_bytes + chunk_len, synced_offset)
+
                         transfer_record.bytes_transferred = uploaded_bytes
                         self.journal.record_transfer(transfer_record)
                         break
@@ -495,7 +575,21 @@ class GoogleDriveArtifactStore:
                     elif status in (404, 410):
                         transfer_record.resumable_session_url = None
                         self.journal.record_transfer(transfer_record)
-                        raise DriveTransferError(f"Resumable upload session expired or missing on Google Drive (HTTP {status})")
+                        # Check whether file was committed before session expired
+                        existing_after_expiry = self._find_file_in_folder(filename, target_folder_id)
+                        if existing_after_expiry and int(existing_after_expiry.get("size", -1)) == total_size:
+                            transfer_record.bytes_transferred = total_size
+                            transfer_record.remote_file_id = existing_after_expiry.get("id")
+                            self.journal.record_transfer(transfer_record)
+                            return existing_after_expiry
+
+                        # Re-initiate upload session
+                        session_url = self._initiate_resumable_upload(filename, target_folder_id, total_size)
+                        transfer_record.resumable_session_url = session_url
+                        uploaded_bytes = 0
+                        transfer_record.bytes_transferred = 0
+                        self.journal.record_transfer(transfer_record)
+                        break
                     elif status in (429, 500, 502, 503, 504):
                         if attempt == self.max_retries:
                             error_msg = f"Resumable upload chunk failed after {self.max_retries} retries (HTTP {status}): {body.decode('utf-8', errors='replace')}"
@@ -604,19 +698,41 @@ class GoogleDriveArtifactStore:
         try:
             drive_file_meta = self.upload_file_resumable(src, target_folder_id, record)
 
-            # Step 2: Integrity Verification
+            # Step 2: Authoritative Integrity Verification
             remote_id = drive_file_meta.get("id")
             if not remote_id:
                 raise DriveIntegrityError("Drive upload succeeded but no remote file ID was returned.")
 
-            remote_size = int(drive_file_meta.get("size", size_bytes))
+            # Never substitute local expected size: fetch authoritative remote metadata if missing
+            remote_size_raw = drive_file_meta.get("size")
+            remote_md5 = drive_file_meta.get("md5Checksum")
+
+            if remote_size_raw is None or not remote_md5:
+                query_url = f"https://www.googleapis.com/drive/v3/files/{remote_id}?fields=id,name,size,md5Checksum"
+                try:
+                    q_status, _, q_body = self._request_with_retry("GET", query_url)
+                    if q_status == 200:
+                        authoritative_meta = json.loads(q_body.decode("utf-8"))
+                        if authoritative_meta.get("size") is not None:
+                            remote_size_raw = authoritative_meta["size"]
+                        if authoritative_meta.get("md5Checksum"):
+                            remote_md5 = authoritative_meta["md5Checksum"]
+                except Exception:
+                    pass
+
+            if remote_size_raw is None:
+                raise DriveIntegrityError(
+                    f"Drive remote file '{remote_id}' missing authoritative size in response and file metadata; cannot verify integrity.",
+                    details={"remote_id": remote_id},
+                )
+
+            remote_size = int(remote_size_raw)
             if remote_size != size_bytes:
                 raise DriveIntegrityError(
                     f"Drive file size mismatch: local {size_bytes} bytes, remote {remote_size} bytes",
                     details={"local_size": size_bytes, "remote_size": remote_size},
                 )
 
-            remote_md5 = drive_file_meta.get("md5Checksum")
             if remote_md5 and remote_md5.lower() != local_md5.lower():
                 raise DriveIntegrityError(
                     f"Drive MD5 mismatch: local {local_md5}, remote {remote_md5}",
@@ -698,7 +814,7 @@ class GoogleDriveArtifactStore:
             raise
 
     def retrieve(self, artifact_id: str, destination: Union[str, Path]) -> Path:
-        """Download artifact from Google Drive by ID with integrity check."""
+        """Download artifact from Google Drive by ID with bounded memory streaming and integrity check."""
         meta = self.get_metadata(artifact_id)
         if not meta or not meta.remote_file_id:
             raise ArtifactNotFoundError(f"Artifact '{artifact_id}' not found in Google Drive registry.")
@@ -708,26 +824,66 @@ class GoogleDriveArtifactStore:
             dest = dest / Path(meta.path).name
 
         dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.parent / f"{dest.name}.tmp.{os.getpid()}"
+        tmp = dest.parent / f"{dest.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
 
         download_url = f"https://www.googleapis.com/drive/v3/files/{meta.remote_file_id}?alt=media"
-        status, headers, body = self._request_with_retry("GET", download_url)
-        if status != 200:
-            raise DriveTransferError(f"Failed to download Drive file '{meta.remote_file_id}' (HTTP {status})")
+        downloaded_bytes = 0
+        fd = None
 
-        with open(tmp, "wb") as f:
-            f.write(body)
+        try:
+            # Check if http_client implements stream_download
+            if hasattr(self.http_client, "stream_download"):
+                status, _, downloaded_bytes = self.http_client.stream_download(
+                    download_url, tmp, headers={"authorization": f"Bearer {self._ensure_token()}"}
+                )
+                if status != 200:
+                    raise DriveTransferError(f"Failed to download Drive file '{meta.remote_file_id}' (HTTP {status})")
+                downloaded_sha256 = compute_file_sha256(tmp)
+            else:
+                # Fallback streaming write with bounded buffer and incremental hash
+                status, headers, body = self._request_with_retry("GET", download_url)
+                if status != 200:
+                    raise DriveTransferError(f"Failed to download Drive file '{meta.remote_file_id}' (HTTP {status})")
 
-        downloaded_sha256 = compute_file_sha256(tmp)
-        if downloaded_sha256.lower() != meta.sha256.lower():
+                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                hasher = hashlib.sha256()
+                with os.fdopen(fd, "wb") as f:
+                    fd = None
+                    chunk_sz = 64 * 1024
+                    for i in range(0, len(body), chunk_sz):
+                        chunk = body[i : i + chunk_sz]
+                        f.write(chunk)
+                        hasher.update(chunk)
+                        downloaded_bytes += len(chunk)
+                    f.flush()
+                    os.fsync(f.fileno())
+                downloaded_sha256 = hasher.hexdigest()
+
+            # Verify integrity
+            if downloaded_sha256.lower() != meta.sha256.lower():
+                raise DriveIntegrityError(
+                    f"Retrieved Drive artifact hash mismatch: recorded {meta.sha256}, got {downloaded_sha256}"
+                )
+            if meta.size_bytes and downloaded_bytes != meta.size_bytes:
+                raise DriveIntegrityError(
+                    f"Retrieved Drive artifact size mismatch: expected {meta.size_bytes}, got {downloaded_bytes}"
+                )
+
+            os.replace(str(tmp), str(dest))
+            return dest
+
+        except Exception:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             if tmp.exists():
-                tmp.unlink()
-            raise DriveIntegrityError(
-                f"Retrieved Drive artifact hash mismatch: recorded {meta.sha256}, got {downloaded_sha256}"
-            )
-
-        os.replace(str(tmp), str(dest))
-        return dest
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            raise
 
     def exists(self, artifact_id: str) -> bool:
         meta = self.get_metadata(artifact_id)

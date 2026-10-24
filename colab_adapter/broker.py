@@ -11,6 +11,7 @@ or completed Colab runs in strictly READ-ONLY mode. Guarantees:
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import os
 import re
@@ -70,25 +71,72 @@ class WorkspaceBroker:
         telemetry: Optional[TelemetryEmitter] = None,
         storage: Optional[ArtifactStore] = None,
         auth_tokens: Optional[Set[str]] = None,
+        tokens_file: Optional[Union[str, Path]] = None,
+        require_configured_auth: bool = False,
+        trusted_proxy: bool = False,
         artifacts_dir: Union[str, Path] = "./artifacts",
     ):
         self.registry = registry
         self.session_manager = session_manager
         self.telemetry = telemetry
         self.storage = storage
+        self.tokens_file = Path(tokens_file).resolve() if tokens_file else None
+        self.require_configured_auth = require_configured_auth
+        self.trusted_proxy = trusted_proxy
+        self.auth_tokens: Set[str] = set()
 
         if auth_tokens:
             self.auth_tokens = set(auth_tokens)
+        elif self.tokens_file and self.tokens_file.is_file():
+            # Load tokens from protected file (enforcing 0600)
+            self._load_tokens_from_file()
+        elif self.require_configured_auth:
+            raise BrokerAuthenticationError(
+                "Protected authentication configuration required: specify auth_tokens or a protected tokens_file."
+            )
         else:
             generated = secrets.token_urlsafe(32)
             self.auth_tokens = {generated}
+            logger.warning("WorkspaceBroker initialized with ephemeral random token. Authorization will not survive restart.")
 
-        self.primary_token = next(iter(self.auth_tokens))
+        if self.tokens_file and not self.tokens_file.exists() and self.auth_tokens:
+            self._save_tokens_to_file()
+
+        self.primary_token = next(iter(self.auth_tokens)) if self.auth_tokens else ""
         self.artifacts_dir = Path(artifacts_dir).resolve()
 
         self._clients: Dict[str, ClientAttachSession] = {}
         self._audit_log: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
+
+    def _load_tokens_from_file(self) -> None:
+        """Load tokens from tokens_file with 0600 mode enforcement."""
+        if not self.tokens_file:
+            return
+        import stat
+        mode = self.tokens_file.stat().st_mode
+        if mode & (stat.S_IRWXG | stat.S_IRWXO):
+            os.chmod(self.tokens_file, stat.S_IRUSR | stat.S_IWUSR)
+        with open(self.tokens_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                self.auth_tokens = set(data)
+            elif isinstance(data, dict):
+                self.auth_tokens = set(data.get("tokens", []))
+
+    def _save_tokens_to_file(self) -> None:
+        """Save tokens to protected tokens_file with 0600 mode and 0700 parent."""
+        if not self.tokens_file:
+            return
+        import stat
+        self.tokens_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.tokens_file.parent, 0o700)
+        except OSError:
+            pass
+        fd = os.open(str(self.tokens_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"tokens": list(self.auth_tokens)}, f, indent=2)
 
     def verify_token(self, token: Optional[str]) -> bool:
         """Verify client bearer token against authorized set with constant-time compare."""
@@ -100,8 +148,10 @@ class WorkspaceBroker:
                 return True
         return False
 
-    def authenticate_client(self, token: Optional[str]) -> None:
-        """Raise BrokerAuthenticationError if client token is invalid."""
+    def authenticate_client(self, token: Optional[str] = None, remote_user: Optional[str] = None) -> None:
+        """Raise BrokerAuthenticationError if client authentication fails."""
+        if self.trusted_proxy and remote_user:
+            return
         if not self.verify_token(token):
             raise BrokerAuthenticationError("Unauthorized: invalid or missing broker bearer token.")
 
@@ -288,6 +338,13 @@ class WorkspaceBroker:
             "telemetry_events_count": len(events),
             "audit_note": "Read-only attach verified. Zero GPU resources allocated.",
         }
+
+    def get_connected_clients(self, run_id: Optional[str] = None) -> List[ClientAttachSession]:
+        """Return list of active client attach sessions, optionally filtered by run_id."""
+        with self._lock:
+            if run_id:
+                return [c for c in self._clients.values() if c.run_id == run_id]
+            return list(self._clients.values())
 
     def get_run_artifacts(
         self,

@@ -67,4 +67,11 @@ Multiple independent devices can attach to the same running or historical experi
 | `/api/v1/runs/<run_id>/logs` | `GET` | Filtered standard output and training logs |
 | `/api/v1/events/stream` | `GET` | Server-Sent Events (SSE) stream supporting cursor resume (`?from_id=...`) |
 
-All API endpoints require authentication via `Authorization: Bearer <token>`, `X-API-Token: <token>`, or `?token=<token>`.
+All API endpoints strictly require authentication via `Authorization: Bearer <token>`, `X-API-Token: <token>`, or a trusted reverse-proxy identity header (`X-Remote-User`). Query parameter authentication (`?token=...`) is strictly rejected to prevent secret leakage in URLs, browser history, reverse-proxy logs, and referrer headers.
+
+## Remote Access & Deployment Security
+
+1. **Loopback Default Binding**: The monitoring server binds to `127.0.0.1` by default.
+2. **Encrypted External Binding**: Binding to an external network interface (`allow_external=True`) strictly requires TLS/HTTPS encryption (`require_tls=True`) or a trusted reverse-proxy identity gateway (`trusted_proxy=True`). Raw unencrypted HTTP on external interfaces is rejected with `ValueError`.
+3. **Strict CORS Policy**: Wildcard CORS (`Access-Control-Allow-Origin: *`) is completely eliminated. The server restricts access to same-origin requests or explicitly configured allowed origins, sending `Vary: Origin`.
+4. **Persistent Credentials**: Broker tokens can be loaded from and persisted to a protected `tokens_file` with `0600` permissions (parent directory `0700`), ensuring authentication configuration survives service restarts.

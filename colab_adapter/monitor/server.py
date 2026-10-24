@@ -215,14 +215,31 @@ _EMBEDDED_HTML_DASHBOARD = """<!DOCTYPE html>
 
 
   <script>
-    const token = new URLSearchParams(window.location.search).get('token') || '';
-    const headers = token ? { 'Authorization': 'Bearer ' + token } : {};
+    let token = sessionStorage.getItem('colab_monitor_token') || '';
+
+    function getHeaders() {
+      return token ? { 'Authorization': 'Bearer ' + token } : {};
+    }
+
+    async function promptForToken() {
+      const entered = window.prompt("Enter Monitor Authorization Bearer Token:");
+      if (entered) {
+        token = entered.trim();
+        sessionStorage.setItem('colab_monitor_token', token);
+        refresh();
+      }
+    }
 
     async function refresh() {
       try {
-        const res = await fetch('/api/v1/summary', { headers });
+        const res = await fetch('/api/v1/summary', { headers: getHeaders() });
         if (res.status === 401) {
-          document.getElementById('header-meta').innerText = '401 Unauthorized: token required in URL ?token=...';
+          document.getElementById('header-meta').innerText = '401 Unauthorized: Authorization token required.';
+          const badge = document.getElementById('health-badge');
+          badge.innerText = 'AUTH REQUIRED';
+          badge.className = 'badge stale';
+          badge.style.cursor = 'pointer';
+          badge.onclick = promptForToken;
           return;
         }
         const data = await res.json();
@@ -258,39 +275,55 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
     server: "MonitorServer"
 
     def _send_cors_and_security_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, X-API-Token, Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        """Enforce strict CORS and defense-in-depth security headers."""
+        origin = self.headers.get("Origin")
+        allowed = getattr(self.server, "allowed_origins", None) or [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+        ]
+
+        if origin and origin in allowed:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, X-API-Token, Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
 
     def _is_authenticated(self, query_params: Dict[str, List[str]]) -> bool:
-        """Validate bearer token from Authorization header, X-API-Token header, or ?token=."""
+        """Validate credentials from Authorization header, X-API-Token, or trusted gateway."""
         expected_token = self.server.auth_token
+        trusted_proxy = getattr(self.server, "trusted_proxy", False)
+
+        # 1. Trusted reverse proxy gateway principal validation
+        if trusted_proxy:
+            remote_user = self.headers.get("X-Remote-User") or self.headers.get("X-Forwarded-User")
+            if remote_user:
+                return True
+
         if not expected_token:
             return True  # Auth disabled (for local-only test mode)
 
         import hmac
         expected_bytes = expected_token.encode("utf-8")
 
-        # Check Authorization header: Bearer <token>
+        # 2. Check Authorization header: Bearer <token>
         auth_header = self.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
             if hmac.compare_digest(token.encode("utf-8"), expected_bytes):
                 return True
 
-        # Check X-API-Token header
+        # 3. Check X-API-Token header
         api_token = self.headers.get("X-API-Token", "")
         if api_token and hmac.compare_digest(api_token.encode("utf-8"), expected_bytes):
             return True
 
-        # Check query parameters (?token=...)
-        token_params = query_params.get("token", [])
-        if token_params and hmac.compare_digest(token_params[0].encode("utf-8"), expected_bytes):
-            return True
-
+        # Query parameter tokens (?token=...) are strictly rejected
         return False
 
 
@@ -700,6 +733,9 @@ class MonitorServer(ThreadingHTTPServer):
         allow_external: bool = False,
         artifacts_dir: Optional[Union[str, Path]] = None,
         broker: Optional[Any] = None,
+        allowed_origins: Optional[List[str]] = None,
+        require_tls: bool = False,
+        trusted_proxy: bool = False,
     ):
 
         host, port = server_address
@@ -709,16 +745,26 @@ class MonitorServer(ThreadingHTTPServer):
                 f"Security violation: Monitor server attempted to bind to external interface '{host}'. "
                 "Only loopback (127.0.0.1) is permitted unless allow_external=True is explicitly set."
             )
-        if allow_external and not auth_token:
-            raise ValueError(
-                "Security violation: Monitor server allow_external=True requires a non-empty auth_token."
-            )
+        if allow_external:
+            if not auth_token and not trusted_proxy:
+                raise ValueError(
+                    "Security violation: Monitor server allow_external=True requires a non-empty auth_token or trusted_proxy=True."
+                )
+            if not require_tls and not trusted_proxy:
+                raise ValueError(
+                    "Security violation: External binding over unencrypted HTTP without a trusted identity proxy is rejected. "
+                    "Set require_tls=True or trusted_proxy=True."
+                )
 
         super().__init__((host, port), MonitorRequestHandler)
         self.collector = collector
         self.registry = registry
         self.telemetry = telemetry
         self.auth_token = auth_token
+        self.allow_external = allow_external
+        self.allowed_origins = allowed_origins
+        self.require_tls = require_tls
+        self.trusted_proxy = trusted_proxy
         self.artifacts_dir = Path(artifacts_dir or "./artifacts").resolve()
         self.broker = broker
         self.start_time = time.time()
@@ -734,6 +780,9 @@ def start_monitor_server(
     allow_external: bool = False,
     artifacts_dir: Optional[Union[str, Path]] = None,
     broker: Optional[Any] = None,
+    allowed_origins: Optional[List[str]] = None,
+    require_tls: bool = False,
+    trusted_proxy: bool = False,
 ) -> MonitorServer:
     """Instantiate and start the MonitorServer."""
     col = collector or AccountUsageCollector()
@@ -749,6 +798,9 @@ def start_monitor_server(
         allow_external=allow_external,
         artifacts_dir=artifacts_dir,
         broker=broker,
+        allowed_origins=allowed_origins,
+        require_tls=require_tls,
+        trusted_proxy=trusted_proxy,
     )
     return server
 

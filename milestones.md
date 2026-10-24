@@ -129,8 +129,19 @@
 - Implemented Ubuntu-hosted `WorkspaceBroker` for multi-device read-only session inspection with constant-time token verification, audit logging, expired session historical inspection, and zero cloud VM allocation.
 - Extended M8 monitoring server (`/api/v1/runs/<id>/artifacts`, `/drive`, `/manifest`) and embedded responsive SPA dashboard for Google Drive artifact tracking and checkpoint continuity.
 - Implemented `CheckpointPolicyManager` with minimum interval throttling, keep_last local cleanup, strict preservation of at least 1 verified local checkpoint, and zero remote deletion.
-- Added comprehensive offline test suites in `tests/test_storage_abstraction.py`, `tests/test_google_drive_store.py`, `tests/test_reproducibility.py`, `tests/test_checkpoint_policy.py`, `tests/test_upload_worker.py`, `tests/test_workspace_broker.py`, and `tests/test_drive_and_broker_e2e.py`.
-- **Full test suite: 142 tests passing** (100% pass, 0 failures, 1 skipped).
+- Completed comprehensive security hardening & resumable recovery:
+  - Eliminated browser query-token authentication across all API endpoints.
+  - Eliminated wildcard CORS; enforced strict same-origin and defense-in-depth HTTP headers.
+  - Enforced secure ingress on external bindings; rejected unencrypted public access.
+  - Supported protected `tokens_file` with `0600` permissions surviving server restarts.
+  - Hardened resumable upload Range 308 parsing and status reconciliation after ambiguous network errors.
+  - Authoritative remote metadata verification (never substituting local expected size).
+  - Implemented bounded-memory streaming download for multi-GB checkpoints.
+  - Added atomic TransferJournal writes (`0600` files, `0700` dirs, fsync) and safe corruption recovery.
+  - Implemented in-process background retry scheduler for transient failures without worker restart.
+  - Hardened reproducible source snapshots against symlinks and self-referential output archives.
+- Added comprehensive offline test suites in `tests/test_storage_abstraction.py`, `tests/test_google_drive_store.py`, `tests/test_reproducibility.py`, `tests/test_checkpoint_policy.py`, `tests/test_upload_worker.py`, `tests/test_workspace_broker.py`, `tests/test_drive_and_broker_e2e.py`, and `tests/test_v2_security_and_resumable_recovery.py`.
+- **Full test suite: 154 tests passing** (100% pass, 0 failures, 1 skipped).
 - **Gate G-Drive Satisfied:** 0 runtime spend, 0 cloud VMs allocated, 100% offline mocked verification. Live Drive validation pending user approval.
 
 
