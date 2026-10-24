@@ -160,6 +160,144 @@ class TestWorkspaceBroker(unittest.TestCase):
                 authorization_token="auth_code",
             )
 
+    def test_trusted_proxy_requires_non_empty_secret(self):
+        """trusted_proxy=True without trusted_proxy_secret raises BrokerAuthenticationError."""
+        with self.assertRaises(BrokerAuthenticationError) as ctx:
+            WorkspaceBroker(
+                registry=self.registry,
+                artifacts_dir=self.artifacts_dir,
+                trusted_proxy=True,
+                trusted_proxy_secret=None,
+            )
+        self.assertIn("requires a non-empty trusted_proxy_secret", str(ctx.exception))
+
+        with self.assertRaises(BrokerAuthenticationError) as ctx2:
+            WorkspaceBroker(
+                registry=self.registry,
+                artifacts_dir=self.artifacts_dir,
+                trusted_proxy=True,
+                trusted_proxy_secret="",
+            )
+        self.assertIn("requires a non-empty trusted_proxy_secret", str(ctx2.exception))
+
+    def test_trusted_proxy_direct_attacker_rejected(self):
+        """Direct attacker supplying remote_user without valid proxy_secret is rejected."""
+        proxy_broker = WorkspaceBroker(
+            registry=self.registry,
+            artifacts_dir=self.artifacts_dir,
+            auth_tokens={self.token},
+            trusted_proxy=True,
+            trusted_proxy_secret="trusted-secret-789",
+        )
+        # 1. remote_user with no secret
+        with self.assertRaises(BrokerAuthenticationError):
+            proxy_broker.authenticate_client(remote_user="attacker")
+
+        # 2. remote_user with wrong secret
+        with self.assertRaises(BrokerAuthenticationError):
+            proxy_broker.authenticate_client(remote_user="attacker", proxy_secret="wrong-secret")
+
+        # 3. list_runs with attacker remote_user
+        with self.assertRaises(BrokerAuthenticationError):
+            proxy_broker.list_runs(remote_user="attacker")
+
+    def test_trusted_proxy_untrusted_peer_ip_rejected(self):
+        """Untrusted peer IP supplying remote_user and secret is rejected."""
+        proxy_broker = WorkspaceBroker(
+            registry=self.registry,
+            artifacts_dir=self.artifacts_dir,
+            auth_tokens={self.token},
+            trusted_proxy=True,
+            trusted_proxy_secret="trusted-secret-789",
+            trusted_proxy_ips={"10.0.0.1"},  # 127.0.0.1 is not in trusted set
+        )
+        with self.assertRaises(BrokerAuthenticationError):
+            proxy_broker.authenticate_client(
+                remote_user="alice",
+                proxy_secret="trusted-secret-789",
+                client_ip="127.0.0.1",
+            )
+
+    def test_trusted_proxy_invalid_remote_user_format_rejected(self):
+        """Remote user with illegal characters is rejected."""
+        proxy_broker = WorkspaceBroker(
+            registry=self.registry,
+            artifacts_dir=self.artifacts_dir,
+            auth_tokens={self.token},
+            trusted_proxy=True,
+            trusted_proxy_secret="trusted-secret-789",
+        )
+        with self.assertRaises(BrokerAuthenticationError):
+            proxy_broker.authenticate_client(
+                remote_user="admin; DROP TABLE",
+                proxy_secret="trusted-secret-789",
+                client_ip="127.0.0.1",
+            )
+
+    def test_trusted_proxy_valid_request_authenticated_for_all_methods(self):
+        """Valid loopback proxy request with remote_user and proxy_secret succeeds across broker methods."""
+        proxy_broker = WorkspaceBroker(
+            registry=self.registry,
+            artifacts_dir=self.artifacts_dir,
+            auth_tokens={self.token},
+            trusted_proxy=True,
+            trusted_proxy_secret="trusted-secret-789",
+            trusted_proxy_ips={"127.0.0.1", "::1"},
+        )
+
+        # authenticate_client succeeds
+        proxy_broker.authenticate_client(
+            remote_user="alice",
+            proxy_secret="trusted-secret-789",
+            client_ip="127.0.0.1",
+        )
+
+        # Pre-seed run
+        self.registry.register(
+            session_id="run-proxy-01",
+            job_id="run-proxy-01",
+            gpu="T4",
+            project_name="proxy-test",
+        )
+
+        # list_runs
+        runs = proxy_broker.list_runs(
+            remote_user="alice",
+            proxy_secret="trusted-secret-789",
+            client_ip="127.0.0.1",
+        )
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["run_id"], "run-proxy-01")
+
+        # attach_run
+        attach_res = proxy_broker.attach_run(
+            run_id="run-proxy-01",
+            client_id="tablet",
+            remote_user="alice",
+            proxy_secret="trusted-secret-789",
+            client_ip="127.0.0.1",
+        )
+        self.assertEqual(attach_res["run_id"], "run-proxy-01")
+
+        # get_run_artifacts
+        artifacts = proxy_broker.get_run_artifacts(
+            run_id="run-proxy-01",
+            project_id="proxy-test",
+            remote_user="alice",
+            proxy_secret="trusted-secret-789",
+            client_ip="127.0.0.1",
+        )
+        self.assertIsInstance(artifacts, list)
+
+        # get_audit_log
+        audit = proxy_broker.get_audit_log(
+            remote_user="alice",
+            proxy_secret="trusted-secret-789",
+            client_ip="127.0.0.1",
+        )
+        self.assertTrue(len(audit) >= 1)
+        self.assertEqual(audit[-1]["client_id"], "tablet")
+
 
 if __name__ == "__main__":
     unittest.main()

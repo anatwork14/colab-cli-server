@@ -74,8 +74,13 @@ class WorkspaceBroker:
         tokens_file: Optional[Union[str, Path]] = None,
         require_configured_auth: bool = False,
         trusted_proxy: bool = False,
+        trusted_proxy_secret: Optional[str] = None,
+        trusted_proxy_ips: Optional[Set[str]] = None,
         artifacts_dir: Union[str, Path] = "./artifacts",
     ):
+        if trusted_proxy and not trusted_proxy_secret:
+            raise BrokerAuthenticationError("trusted_proxy=True requires a non-empty trusted_proxy_secret.")
+
         self.registry = registry
         self.session_manager = session_manager
         self.telemetry = telemetry
@@ -83,6 +88,8 @@ class WorkspaceBroker:
         self.tokens_file = Path(tokens_file).resolve() if tokens_file else None
         self.require_configured_auth = require_configured_auth
         self.trusted_proxy = trusted_proxy
+        self.trusted_proxy_secret = trusted_proxy_secret
+        self.trusted_proxy_ips = set(trusted_proxy_ips) if trusted_proxy_ips is not None else {"127.0.0.1", "::1"}
         self.auth_tokens: Set[str] = set()
 
         if auth_tokens:
@@ -148,10 +155,25 @@ class WorkspaceBroker:
                 return True
         return False
 
-    def authenticate_client(self, token: Optional[str] = None, remote_user: Optional[str] = None) -> None:
+    def authenticate_client(
+        self,
+        token: Optional[str] = None,
+        remote_user: Optional[str] = None,
+        proxy_secret: Optional[str] = None,
+        client_ip: Optional[str] = None,
+    ) -> None:
         """Raise BrokerAuthenticationError if client authentication fails."""
-        if self.trusted_proxy and remote_user:
+        if (
+            self.trusted_proxy
+            and remote_user
+            and self.trusted_proxy_secret
+            and proxy_secret
+            and re.match(r"^[a-zA-Z0-9_.@-]{1,128}$", remote_user)
+            and (client_ip is None or client_ip in self.trusted_proxy_ips)
+            and hmac.compare_digest(proxy_secret.encode("utf-8"), self.trusted_proxy_secret.encode("utf-8"))
+        ):
             return
+
         if not self.verify_token(token):
             raise BrokerAuthenticationError("Unauthorized: invalid or missing broker bearer token.")
 
@@ -159,9 +181,12 @@ class WorkspaceBroker:
         self,
         project_id: Optional[str] = None,
         token: Optional[str] = None,
+        remote_user: Optional[str] = None,
+        proxy_secret: Optional[str] = None,
+        client_ip: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """List all known active and historical runs."""
-        self.authenticate_client(token)
+        self.authenticate_client(token=token, remote_user=remote_user, proxy_secret=proxy_secret, client_ip=client_ip)
         if project_id:
             _validate_safe_id(project_id, "project_id")
 
@@ -241,12 +266,15 @@ class WorkspaceBroker:
         run_id: str,
         client_id: str,
         token: Optional[str] = None,
+        remote_user: Optional[str] = None,
+        proxy_secret: Optional[str] = None,
+        client_ip: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Attach to an existing run in strictly read-only mode.
 
         CRITICAL: Never provisions, triggers, or allocates a Colab VM.
         """
-        self.authenticate_client(token)
+        self.authenticate_client(token=token, remote_user=remote_user, proxy_secret=proxy_secret, client_ip=client_ip)
         _validate_safe_id(run_id, "run_id")
         _validate_safe_id(client_id, "client_id")
 
@@ -309,7 +337,14 @@ class WorkspaceBroker:
 
 
         # Discover artifacts from local manifest
-        artifacts = self.get_run_artifacts(run_id, project_id=project_id, token=token)
+        artifacts = self.get_run_artifacts(
+            run_id,
+            project_id=project_id,
+            token=token,
+            remote_user=remote_user,
+            proxy_secret=proxy_secret,
+            client_ip=client_ip,
+        )
         latest_checkpoint = None
         for a in artifacts:
             if a.get("artifact_type") == "checkpoint":
@@ -351,9 +386,12 @@ class WorkspaceBroker:
         run_id: str,
         project_id: Optional[str] = None,
         token: Optional[str] = None,
+        remote_user: Optional[str] = None,
+        proxy_secret: Optional[str] = None,
+        client_ip: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch list of verified local and Drive-published artifacts."""
-        self.authenticate_client(token)
+        self.authenticate_client(token=token, remote_user=remote_user, proxy_secret=proxy_secret, client_ip=client_ip)
         _validate_safe_id(run_id, "run_id")
         if project_id:
             _validate_safe_id(project_id, "project_id")
@@ -391,8 +429,14 @@ class WorkspaceBroker:
             "All cross-device workspace attachments are strictly READ-ONLY."
         )
 
-    def get_audit_log(self, token: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_audit_log(
+        self,
+        token: Optional[str] = None,
+        remote_user: Optional[str] = None,
+        proxy_secret: Optional[str] = None,
+        client_ip: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Return broker attach and access audit history."""
-        self.authenticate_client(token)
+        self.authenticate_client(token=token, remote_user=remote_user, proxy_secret=proxy_secret, client_ip=client_ip)
         with self._lock:
             return list(self._audit_log)
