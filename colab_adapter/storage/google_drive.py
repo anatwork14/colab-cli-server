@@ -48,6 +48,70 @@ DEFAULT_DRIVE_ROOT_FOLDER = "Colab-Research"
 _SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
 
 
+def _sanitize_drive_error(raw: Union[str, bytes], url: str = "") -> str:
+    """Sanitize error messages and URLs by redacting tokens, secrets, and session URLs."""
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", errors="replace")
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        text = str(raw)
+
+    if url:
+        sanitized_url = re.sub(
+            r"https://www\.googleapis\.com/upload/[^\s\"'>]+",
+            "[REDACTED_UPLOAD_SESSION_URL]",
+            str(url),
+        )
+        if str(url) in text:
+            text = text.replace(str(url), sanitized_url)
+
+    # 1. Full resumable upload session URLs
+    text = re.sub(
+        r"https://www\.googleapis\.com/upload/[^\s\"'>]+",
+        "[REDACTED_UPLOAD_SESSION_URL]",
+        text,
+    )
+
+    # 2. Bearer authorization tokens
+    text = re.sub(
+        r"Bearer\s+[A-Za-z0-9._\-]+",
+        "Bearer [REDACTED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 3. session_id and upload_id query parameters
+    text = re.sub(r"session_id=[^&\s\"'>]+", "session_id=[REDACTED]", text)
+    text = re.sub(r"upload_id=[^&\s\"'>]+", "upload_id=[REDACTED]", text)
+
+    # 4. JSON or quoted key-values for secrets
+    text = re.sub(
+        r'(["\']?(?:access_token|refresh_token|client_secret|id_token)["\']?\s*[:=]\s*)["\'][^"\']*["\']',
+        r'\1"[REDACTED]"',
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 5. Form-encoded, query string, or non-quoted key-values for secrets
+    text = re.sub(
+        r'(["\']?(?:access_token|refresh_token|client_secret|id_token)["\']?\s*[:=]\s*)[^\s&,;\'"}]+',
+        r'\1[REDACTED]',
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 6. Unquoted or whitespace-separated key value pairs: e.g. client_secret 'secret' or client_secret secret
+    text = re.sub(
+        r'(\b(?:access_token|refresh_token|client_secret|id_token)\s+[\'"]?)[^\s&,;\'"}]+([\'"]?)',
+        r'\1[REDACTED]\2',
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    return text
+
+
 def _validate_safe_id(name: str, field: str = "identifier") -> str:
     if not name or not isinstance(name, str) or not _SAFE_ID_PATTERN.match(name) or ".." in name or "/" in name or "\\" in name:
         raise ArtifactValidationError(
@@ -256,8 +320,9 @@ class GoogleDriveArtifactStore:
             data=payload,
         )
         if status != 200:
+            sanitized = _sanitize_drive_error(body, self.credentials.token_uri)
             raise DriveAuthenticationError(
-                f"Failed to refresh Drive access token (HTTP {status}): {body.decode('utf-8', errors='replace')}"
+                f"Failed to refresh Drive access token (HTTP {status}): {sanitized}"
             )
 
         data = json.loads(body.decode("utf-8"))
@@ -297,22 +362,25 @@ class GoogleDriveArtifactStore:
                         token = self._refresh_access_token()
                         hdrs["authorization"] = f"Bearer {token}"
                         continue
-                    raise DriveAuthenticationError(f"Drive authentication rejected (401): {body.decode('utf-8', errors='replace')}")
+                    raise DriveAuthenticationError(
+                        f"Drive authentication rejected (401): {_sanitize_drive_error(body, url)}"
+                    )
 
                 if status == 403:
                     body_text = body.decode("utf-8", errors="replace")
+                    sanitized_body = _sanitize_drive_error(body, url)
                     if "rateLimitExceeded" in body_text or "userRateLimitExceeded" in body_text:
                         # Rate limit retry
                         pass
                     elif "quotaExceeded" in body_text or "storageQuotaExceeded" in body_text:
-                        raise DriveQuotaExceededError(f"Drive storage quota exceeded: {body_text}")
+                        raise DriveQuotaExceededError(f"Drive storage quota exceeded: {sanitized_body}")
                     else:
-                        raise DriveAuthenticationError(f"Drive access forbidden (403): {body_text}")
+                        raise DriveAuthenticationError(f"Drive access forbidden (403): {sanitized_body}")
 
                 if status in (429, 500, 502, 503, 504):
                     if attempt == self.max_retries:
                         raise DriveTransferError(
-                            f"Drive request failed after {self.max_retries} retries (HTTP {status}): {body.decode('utf-8', errors='replace')}"
+                            f"Drive request failed after {self.max_retries} retries (HTTP {status}): {_sanitize_drive_error(body, url)}"
                         )
                     sleep_time = backoff * (1.0 + random.uniform(0.1, 0.5))
                     time.sleep(sleep_time)
@@ -326,12 +394,16 @@ class GoogleDriveArtifactStore:
             except Exception as e:
                 last_error = e
                 if attempt == self.max_retries:
-                    raise DriveTransferError(f"Drive request failed after {self.max_retries} retries: {e}") from e
+                    raise DriveTransferError(
+                        f"Drive request failed after {self.max_retries} retries: {_sanitize_drive_error(str(e), url)}"
+                    ) from e
                 sleep_time = backoff * (1.0 + random.uniform(0.1, 0.5))
                 time.sleep(sleep_time)
                 backoff *= 2.0
 
-        raise DriveTransferError(f"Drive request retry loop exhausted: {last_error}")
+        raise DriveTransferError(
+            f"Drive request retry loop exhausted: {_sanitize_drive_error(str(last_error), url)}"
+        )
 
     def _find_or_create_folder(self, folder_name: str, parent_id: Optional[str] = None) -> str:
         """Find existing folder by name and parent or create it safely."""
@@ -374,7 +446,7 @@ class GoogleDriveArtifactStore:
         )
         if status not in (200, 201):
             raise DriveTransferError(
-                f"Failed to create Drive folder '{folder_name}' (HTTP {status}): {body.decode('utf-8', errors='replace')}"
+                f"Failed to create Drive folder '{folder_name}' (HTTP {status}): {_sanitize_drive_error(body, create_url)}"
             )
 
         res = json.loads(body.decode("utf-8"))
@@ -402,7 +474,13 @@ class GoogleDriveArtifactStore:
             return self._find_or_create_folder(subfolder, parent_id=run_folder_id)
         return run_folder_id
 
-    def _find_file_in_folder(self, filename: str, folder_id: str) -> Optional[Dict[str, Any]]:
+    def _find_file_in_folder(
+        self,
+        filename: str,
+        folder_id: str,
+        expected_size: Optional[int] = None,
+        expected_md5: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Query for existing non-trashed file with matching name in folder to prevent duplicates."""
         safe_name = filename.replace("'", "\\'")
         query = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
@@ -413,8 +491,17 @@ class GoogleDriveArtifactStore:
             if status == 200:
                 res = json.loads(body.decode("utf-8"))
                 files = res.get("files", [])
-                if files:
-                    return files[0]
+                for f in files:
+                    if expected_size is not None:
+                        f_sz = f.get("size")
+                        if f_sz is None or int(f_sz) != expected_size:
+                            continue
+                    if expected_md5 is not None:
+                        f_md5 = f.get("md5Checksum")
+                        if not f_md5 or f_md5.lower() != expected_md5.lower():
+                            continue
+                    return f
+                return None
         except Exception:
             pass
         return None
@@ -443,8 +530,18 @@ class GoogleDriveArtifactStore:
 
         status, resp_headers, body = self.http_client.request("POST", init_url, headers=hdrs, data=meta_bytes)
         if status != 200:
+            body_text = body.decode("utf-8", errors="replace")
+            sanitized = _sanitize_drive_error(body, init_url)
+            if status == 401:
+                raise DriveAuthenticationError(
+                    f"Failed to initiate resumable upload for '{filename}' (HTTP 401): {sanitized}"
+                )
+            if status == 403:
+                if "quotaExceeded" in body_text or "storageQuotaExceeded" in body_text:
+                    raise DriveQuotaExceededError(f"Drive storage quota exceeded: {sanitized}")
+                raise DriveAuthenticationError(f"Drive access forbidden (403): {sanitized}")
             raise DriveTransferError(
-                f"Failed to initiate resumable upload for '{filename}' (HTTP {status}): {body.decode('utf-8', errors='replace')}"
+                f"Failed to initiate resumable upload for '{filename}' (HTTP {status}): {sanitized}"
             )
 
         location = resp_headers.get("location")
@@ -454,28 +551,126 @@ class GoogleDriveArtifactStore:
 
     def _query_upload_progress(self, session_url: str, total_size: int) -> Tuple[int, Optional[Dict[str, Any]]]:
         """Query Drive for received byte offset or completed upload response."""
-        hdrs = {
-            "content-range": f"bytes */{total_size}",
-            "content-length": "0",
-        }
-        status, resp_headers, body = self.http_client.request("PUT", session_url, headers=hdrs)
-        if status == 308:
-            range_hdr = resp_headers.get("range", "")
-            if range_hdr and "-" in range_hdr:
-                # range format: "bytes=0-1048575"
-                m = re.search(r"bytes=0-(\d+)", range_hdr)
-                if m:
-                    return int(m.group(1)) + 1, None
-            return 0, None
-        elif status in (200, 201):
+        backoff = self.initial_backoff_sec
+        for attempt in range(self.max_retries + 1):
+            token = self._ensure_token()
+            hdrs = {
+                "content-range": f"bytes */{total_size}",
+                "content-length": "0",
+                "authorization": f"Bearer {token}",
+            }
             try:
-                res = json.loads(body.decode("utf-8"))
-                return total_size, res
-            except Exception:
-                return total_size, {}
-        elif status in (404, 410):
-            return 0, None
-        return 0, None
+                status, resp_headers, body = self.http_client.request("PUT", session_url, headers=hdrs)
+            except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+                raise
+            except Exception as e:
+                if attempt == self.max_retries:
+                    raise DriveTransferError(
+                        f"Upload progress query failed after {self.max_retries} retries: {_sanitize_drive_error(str(e), session_url)}"
+                    ) from e
+                sleep_time = backoff * (1.0 + random.uniform(0.1, 0.5))
+                time.sleep(sleep_time)
+                backoff *= 2.0
+                continue
+
+            if status == 308:
+                range_hdr = resp_headers.get("range", "").strip()
+                if not range_hdr:
+                    return 0, None
+                m = re.match(r"^bytes=0-(\d+)$", range_hdr)
+                if not m:
+                    raise DriveTransferError(f"Malformed Range header in status query: {range_hdr!r}")
+                next_offset = int(m.group(1)) + 1
+                if next_offset > total_size:
+                    raise DriveTransferError(f"Impossible Range offset {next_offset} > {total_size} in status query")
+                return next_offset, None
+
+            elif status in (200, 201):
+                try:
+                    res = json.loads(body.decode("utf-8"))
+                    if not isinstance(res, dict) or "id" not in res:
+                        raise ValueError("Missing 'id' or not a dictionary")
+                    return total_size, res
+                except Exception as je:
+                    raise DriveTransferError("Invalid or incomplete JSON response on 200/201 upload completion") from je
+
+            elif status in (404, 410):
+                return -1, None
+
+            elif status == 401:
+                if attempt < self.max_retries and self.credentials and self.credentials.refresh_token:
+                    self._refresh_access_token()
+                    continue
+                raise DriveAuthenticationError(
+                    f"Upload progress query unauthorized (HTTP 401): {_sanitize_drive_error(body, session_url)}"
+                )
+
+            elif status == 403:
+                body_text = body.decode("utf-8", errors="replace")
+                if "rateLimitExceeded" in body_text or "userRateLimitExceeded" in body_text:
+                    if attempt == self.max_retries:
+                        raise DriveTransferError(
+                            f"Upload progress query rate limit exceeded after retries (HTTP 403): {_sanitize_drive_error(body, session_url)}"
+                        )
+                    sleep_time = backoff * (1.0 + random.uniform(0.1, 0.5))
+                    time.sleep(sleep_time)
+                    backoff *= 2.0
+                    continue
+                elif "quotaExceeded" in body_text or "storageQuotaExceeded" in body_text:
+                    raise DriveQuotaExceededError(
+                        f"Drive storage quota exceeded: {_sanitize_drive_error(body, session_url)}"
+                    )
+                else:
+                    raise DriveAuthenticationError(
+                        f"Drive access forbidden (403): {_sanitize_drive_error(body, session_url)}"
+                    )
+
+            elif status in (429, 500, 502, 503, 504):
+                if attempt == self.max_retries:
+                    raise DriveTransferError(f"Upload progress query failed after retries (HTTP {status})")
+                sleep_time = backoff * (1.0 + random.uniform(0.1, 0.5))
+                time.sleep(sleep_time)
+                backoff *= 2.0
+                continue
+
+            else:
+                raise DriveTransferError(
+                    f"Unexpected HTTP {status} during upload progress query: {_sanitize_drive_error(body, session_url)}"
+                )
+
+        raise DriveTransferError(
+            f"Upload progress query retry loop exhausted for session: {_sanitize_drive_error(session_url)}"
+        )
+
+    def _handle_expired_session(
+        self,
+        filename: str,
+        target_folder_id: str,
+        total_size: int,
+        local_md5: str,
+        transfer_record: TransferRecord,
+    ) -> Tuple[Optional[Dict[str, Any]], str, int]:
+        """Recover from expired upload session (HTTP 404/410)."""
+        transfer_record.resumable_session_url = None
+        self.journal.record_transfer(transfer_record)
+
+        existing = self._find_file_in_folder(
+            filename,
+            target_folder_id,
+            expected_size=total_size,
+            expected_md5=local_md5,
+        )
+        if existing and existing.get("id"):
+            transfer_record.bytes_transferred = total_size
+            transfer_record.remote_file_id = existing.get("id")
+            self.journal.record_transfer(transfer_record)
+            return existing, "", total_size
+
+        new_session_url = self._initiate_resumable_upload(filename, target_folder_id, total_size)
+        transfer_record.resumable_session_url = new_session_url
+        transfer_record.bytes_transferred = 0
+        self.journal.record_transfer(transfer_record)
+        return None, new_session_url, 0
 
     def upload_file_resumable(
         self,
@@ -487,10 +682,18 @@ class GoogleDriveArtifactStore:
         src = Path(local_path).resolve()
         total_size = src.stat().st_size
         filename = src.name
+        local_md5 = transfer_record.md5 or compute_file_md5(src)
+        if not transfer_record.md5:
+            transfer_record.md5 = local_md5
 
         # Check if identical file already exists in target folder (idempotency)
-        existing = self._find_file_in_folder(filename, target_folder_id)
-        if existing and int(existing.get("size", -1)) == total_size:
+        existing = self._find_file_in_folder(
+            filename,
+            target_folder_id,
+            expected_size=total_size,
+            expected_md5=local_md5,
+        )
+        if existing and existing.get("id"):
             transfer_record.bytes_transferred = total_size
             transfer_record.remote_file_id = existing.get("id")
             self.journal.record_transfer(transfer_record)
@@ -504,14 +707,22 @@ class GoogleDriveArtifactStore:
 
         uploaded_bytes = 0
         if transfer_record.bytes_transferred > 0:
-            uploaded_bytes, completed_meta = self._query_upload_progress(session_url, total_size)
+            synced_offset, completed_meta = self._query_upload_progress(session_url, total_size)
             if completed_meta:
                 transfer_record.bytes_transferred = total_size
                 transfer_record.remote_file_id = completed_meta.get("id")
                 self.journal.record_transfer(transfer_record)
                 return completed_meta
-            transfer_record.bytes_transferred = uploaded_bytes
-            self.journal.record_transfer(transfer_record)
+            if synced_offset == -1:
+                existing_rec, session_url, uploaded_bytes = self._handle_expired_session(
+                    filename, target_folder_id, total_size, local_md5, transfer_record
+                )
+                if existing_rec:
+                    return existing_rec
+            else:
+                uploaded_bytes = synced_offset
+                transfer_record.bytes_transferred = uploaded_bytes
+                self.journal.record_transfer(transfer_record)
 
         with open(src, "rb") as f:
             while uploaded_bytes < total_size:
@@ -524,24 +735,39 @@ class GoogleDriveArtifactStore:
                 start_byte = uploaded_bytes
                 end_byte = uploaded_bytes + chunk_len - 1
 
-                hdrs = {
-                    "content-range": f"bytes {start_byte}-{end_byte}/{total_size}",
-                    "content-length": str(chunk_len),
-                    "content-type": "application/octet-stream",
-                }
-
                 chunk_backoff = self.initial_backoff_sec
                 for attempt in range(self.max_retries + 1):
+                    token = self._ensure_token()
+                    hdrs = {
+                        "content-range": f"bytes {start_byte}-{end_byte}/{total_size}",
+                        "content-length": str(chunk_len),
+                        "content-type": "application/octet-stream",
+                        "authorization": f"Bearer {token}",
+                    }
+
                     try:
                         status, resp_headers, body = self.http_client.request("PUT", session_url, headers=hdrs, data=chunk)
+                    except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+                        raise
                     except Exception as ce:
                         # Ambiguous network failure: query server to reconcile committed offset
-                        synced_offset, final_res = self._query_upload_progress(session_url, total_size)
+                        try:
+                            synced_offset, final_res = self._query_upload_progress(session_url, total_size)
+                        except Exception:
+                            synced_offset, final_res = 0, None
+
                         if final_res:
                             transfer_record.bytes_transferred = total_size
                             transfer_record.remote_file_id = final_res.get("id")
                             self.journal.record_transfer(transfer_record)
                             return final_res
+                        if synced_offset == -1:
+                            existing_rec, session_url, uploaded_bytes = self._handle_expired_session(
+                                filename, target_folder_id, total_size, local_md5, transfer_record
+                            )
+                            if existing_rec:
+                                return existing_rec
+                            break
                         if synced_offset > uploaded_bytes:
                             uploaded_bytes = synced_offset
                             transfer_record.bytes_transferred = uploaded_bytes
@@ -549,78 +775,167 @@ class GoogleDriveArtifactStore:
                             break
 
                         if attempt == self.max_retries:
-                            raise DriveTransferError(f"Chunk upload network failure after {self.max_retries} retries: {ce}") from ce
+                            raise DriveTransferError(
+                                f"Chunk upload network failure after {self.max_retries} retries: {_sanitize_drive_error(str(ce), session_url)}"
+                            ) from ce
                         time.sleep(chunk_backoff * (1.0 + random.uniform(0.1, 0.4)))
                         chunk_backoff *= 2.0
                         continue
 
                     if status == 308:
-                        range_hdr = resp_headers.get("range", "")
-                        m = re.search(r"bytes=0-(\d+)", range_hdr)
-                        if m:
-                            uploaded_bytes = int(m.group(1)) + 1
+                        range_hdr = resp_headers.get("range", "").strip()
+                        if range_hdr:
+                            m = re.match(r"^bytes=0-(\d+)$", range_hdr)
+                            if not m:
+                                raise DriveTransferError(f"Malformed HTTP 308 Range header: {range_hdr!r}")
+                            confirmed_next = int(m.group(1)) + 1
+                            if not (0 < confirmed_next <= start_byte + chunk_len and confirmed_next <= total_size and confirmed_next >= start_byte):
+                                raise DriveTransferError(
+                                    f"Impossible HTTP 308 Range offset {confirmed_next} for chunk {start_byte}-{end_byte}/{total_size}"
+                                )
+                            uploaded_bytes = confirmed_next
+                            transfer_record.bytes_transferred = uploaded_bytes
+                            self.journal.record_transfer(transfer_record)
+                            break
                         else:
-                            synced_offset, _ = self._query_upload_progress(session_url, total_size)
-                            uploaded_bytes = max(uploaded_bytes + chunk_len, synced_offset)
+                            # range_hdr is empty/missing on status == 308
+                            synced_offset, final_res = self._query_upload_progress(session_url, total_size)
+                            if final_res is not None:
+                                transfer_record.bytes_transferred = total_size
+                                transfer_record.remote_file_id = final_res.get("id")
+                                self.journal.record_transfer(transfer_record)
+                                return final_res
+                            if synced_offset < 0:
+                                # Expired session sentinel -1
+                                existing_rec, session_url, uploaded_bytes = self._handle_expired_session(
+                                    filename, target_folder_id, total_size, local_md5, transfer_record
+                                )
+                                if existing_rec:
+                                    return existing_rec
+                                break
+                            if synced_offset > total_size or synced_offset > start_byte + chunk_len:
+                                raise DriveTransferError(f"Impossible reconciled upload offset {synced_offset}")
+                            if synced_offset > start_byte:
+                                uploaded_bytes = synced_offset
+                                transfer_record.bytes_transferred = uploaded_bytes
+                                self.journal.record_transfer(transfer_record)
+                                break
+                            else:
+                                uploaded_bytes = synced_offset
+                                transfer_record.bytes_transferred = uploaded_bytes
+                                self.journal.record_transfer(transfer_record)
+                                if attempt == self.max_retries:
+                                    raise DriveTransferError(
+                                        f"HTTP 308 missing Range header and server confirmed 0 new bytes after {self.max_retries} retries"
+                                    )
+                                time.sleep(chunk_backoff * (1.0 + random.uniform(0.1, 0.4)))
+                                chunk_backoff *= 2.0
+                                continue
 
-                        transfer_record.bytes_transferred = uploaded_bytes
-                        self.journal.record_transfer(transfer_record)
-                        break
                     elif status in (200, 201):
-                        res = json.loads(body.decode("utf-8"))
+                        try:
+                            res = json.loads(body.decode("utf-8"))
+                            if not isinstance(res, dict) or "id" not in res:
+                                raise ValueError("Missing 'id' or not a dictionary")
+                        except Exception as je:
+                            raise DriveTransferError(
+                                f"Invalid or incomplete JSON response on 200/201 upload completion: {_sanitize_drive_error(body, session_url)}"
+                            ) from je
                         transfer_record.bytes_transferred = total_size
                         transfer_record.remote_file_id = res.get("id")
                         self.journal.record_transfer(transfer_record)
                         return res
-                    elif status in (404, 410):
-                        transfer_record.resumable_session_url = None
-                        self.journal.record_transfer(transfer_record)
-                        # Check whether file was committed before session expired
-                        existing_after_expiry = self._find_file_in_folder(filename, target_folder_id)
-                        if existing_after_expiry and int(existing_after_expiry.get("size", -1)) == total_size:
-                            transfer_record.bytes_transferred = total_size
-                            transfer_record.remote_file_id = existing_after_expiry.get("id")
-                            self.journal.record_transfer(transfer_record)
-                            return existing_after_expiry
 
-                        # Re-initiate upload session
-                        session_url = self._initiate_resumable_upload(filename, target_folder_id, total_size)
-                        transfer_record.resumable_session_url = session_url
-                        uploaded_bytes = 0
-                        transfer_record.bytes_transferred = 0
-                        self.journal.record_transfer(transfer_record)
+                    elif status in (404, 410):
+                        existing_rec, session_url, uploaded_bytes = self._handle_expired_session(
+                            filename, target_folder_id, total_size, local_md5, transfer_record
+                        )
+                        if existing_rec:
+                            return existing_rec
                         break
+
+                    elif status == 401:
+                        if attempt < self.max_retries and self.credentials and self.credentials.refresh_token:
+                            token = self._refresh_access_token()
+                            continue
+                        raise DriveAuthenticationError(
+                            f"Resumable upload unauthorized (HTTP 401): {_sanitize_drive_error(body, session_url)}"
+                        )
+
+                    elif status == 403:
+                        body_text = body.decode("utf-8", errors="replace")
+                        if "rateLimitExceeded" in body_text or "userRateLimitExceeded" in body_text:
+                            if attempt == self.max_retries:
+                                error_msg = f"Resumable upload rate limit exceeded after {self.max_retries} retries: {_sanitize_drive_error(body, session_url)}"
+                                transfer_record.last_error = error_msg
+                                self.journal.record_transfer(transfer_record)
+                                raise DriveTransferError(error_msg)
+                            time.sleep(chunk_backoff * (1.0 + random.uniform(0.1, 0.4)))
+                            chunk_backoff *= 2.0
+                            continue
+                        elif "quotaExceeded" in body_text or "storageQuotaExceeded" in body_text:
+                            error_msg = f"Drive storage quota exceeded: {_sanitize_drive_error(body, session_url)}"
+                            transfer_record.last_error = error_msg
+                            self.journal.record_transfer(transfer_record)
+                            raise DriveQuotaExceededError(error_msg)
+                        else:
+                            error_msg = f"Drive access forbidden (403): {_sanitize_drive_error(body, session_url)}"
+                            transfer_record.last_error = error_msg
+                            self.journal.record_transfer(transfer_record)
+                            raise DriveAuthenticationError(error_msg)
+
                     elif status in (429, 500, 502, 503, 504):
                         if attempt == self.max_retries:
-                            error_msg = f"Resumable upload chunk failed after {self.max_retries} retries (HTTP {status}): {body.decode('utf-8', errors='replace')}"
+                            error_msg = f"Resumable upload chunk failed after {self.max_retries} retries (HTTP {status}): {_sanitize_drive_error(body, session_url)}"
                             transfer_record.last_error = error_msg
                             self.journal.record_transfer(transfer_record)
                             raise DriveTransferError(error_msg)
                         time.sleep(chunk_backoff * (1.0 + random.uniform(0.1, 0.4)))
                         chunk_backoff *= 2.0
-                        # Query upload progress to sync offset
                         synced_offset, final_res = self._query_upload_progress(session_url, total_size)
                         if final_res:
+                            transfer_record.bytes_transferred = total_size
+                            transfer_record.remote_file_id = final_res.get("id")
+                            self.journal.record_transfer(transfer_record)
                             return final_res
+                        if synced_offset == -1:
+                            existing_rec, session_url, uploaded_bytes = self._handle_expired_session(
+                                filename, target_folder_id, total_size, local_md5, transfer_record
+                            )
+                            if existing_rec:
+                                return existing_rec
+                            break
                         if synced_offset > uploaded_bytes:
                             uploaded_bytes = synced_offset
+                            transfer_record.bytes_transferred = uploaded_bytes
+                            self.journal.record_transfer(transfer_record)
                             break
                         continue
+
                     else:
-                        error_msg = f"Resumable upload chunk failed (HTTP {status}): {body.decode('utf-8', errors='replace')}"
+                        error_msg = f"Resumable upload chunk failed (HTTP {status}): {_sanitize_drive_error(body, session_url)}"
                         transfer_record.last_error = error_msg
                         self.journal.record_transfer(transfer_record)
                         raise DriveTransferError(error_msg)
 
         # If zero-byte file or final query
         if total_size == 0:
+            token = self._ensure_token()
             hdrs = {
                 "content-range": "bytes */0",
                 "content-length": "0",
+                "authorization": f"Bearer {token}",
             }
             status, _, body = self.http_client.request("PUT", session_url, headers=hdrs)
             if status in (200, 201):
-                res = json.loads(body.decode("utf-8"))
+                try:
+                    res = json.loads(body.decode("utf-8"))
+                    if not isinstance(res, dict) or "id" not in res:
+                        raise ValueError("Missing 'id' or not a dictionary")
+                except Exception as je:
+                    raise DriveTransferError(
+                        f"Invalid or incomplete JSON response on zero-byte upload completion: {_sanitize_drive_error(body, session_url)}"
+                    ) from je
                 transfer_record.bytes_transferred = 0
                 transfer_record.remote_file_id = res.get("id")
                 self.journal.record_transfer(transfer_record)
@@ -681,6 +996,22 @@ class GoogleDriveArtifactStore:
                 status=TransferStatus.LOCAL_STAGED.value,
             )
             self.journal.record_transfer(record)
+        else:
+            if (record.sha256 and record.sha256.lower() != local_sha256.lower()) or record.size_bytes != size_bytes:
+                record = TransferRecord(
+                    transfer_id=transfer_id,
+                    project_id=project_id,
+                    run_id=run_id,
+                    artifact_id=artifact_id,
+                    local_path=str(src),
+                    target_rel_path=rel_path,
+                    size_bytes=size_bytes,
+                    sha256=local_sha256,
+                    md5=local_md5,
+                    status=TransferStatus.LOCAL_STAGED.value,
+                    resumable_session_url=None,
+                )
+                self.journal.record_transfer(record)
 
         # Transition: LOCAL_STAGED -> LOCAL_VERIFIED -> UPLOAD_PENDING -> UPLOADING
         if record.status == TransferStatus.LOCAL_STAGED.value:
@@ -692,6 +1023,11 @@ class GoogleDriveArtifactStore:
             self.journal.record_transfer(record)
 
         if record.status in (TransferStatus.UPLOAD_PENDING.value, TransferStatus.RETRY_PENDING.value):
+            record.transition_to(TransferStatus.UPLOADING)
+            self.journal.record_transfer(record)
+        elif record.status == TransferStatus.UPLOAD_FAILED.value:
+            record.transition_to(TransferStatus.RETRY_PENDING)
+            self.journal.record_transfer(record)
             record.transition_to(TransferStatus.UPLOADING)
             self.journal.record_transfer(record)
 
@@ -733,19 +1069,64 @@ class GoogleDriveArtifactStore:
                     details={"local_size": size_bytes, "remote_size": remote_size},
                 )
 
-            if remote_md5 and remote_md5.lower() != local_md5.lower():
-                raise DriveIntegrityError(
-                    f"Drive MD5 mismatch: local {local_md5}, remote {remote_md5}",
-                    details={"local_md5": local_md5, "remote_md5": remote_md5},
-                )
+            if remote_md5:
+                if remote_md5.lower() != local_md5.lower():
+                    raise DriveIntegrityError(
+                        f"Drive MD5 mismatch: local {local_md5}, remote {remote_md5}",
+                        details={"local_md5": local_md5, "remote_md5": remote_md5},
+                    )
+            else:
+                # remote_md5 is STILL missing/empty after querying metadata
+                # Perform content readback verification
+                readback_url = f"https://www.googleapis.com/drive/v3/files/{remote_id}?alt=media"
+                tmp_readback = self.staging_dir / f".readback_{remote_id}_{uuid.uuid4().hex[:8]}.tmp"
+                try:
+                    if hasattr(self.http_client, "stream_download"):
+                        rb_status, _, rb_bytes = self.http_client.stream_download(
+                            readback_url,
+                            tmp_readback,
+                            headers={"authorization": f"Bearer {self._ensure_token()}"},
+                        )
+                        if rb_status != 200:
+                            raise DriveIntegrityError(
+                                f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
+                            )
+                        rb_sha256 = compute_file_sha256(tmp_readback)
+                    else:
+                        rb_status, _, rb_body = self._request_with_retry("GET", readback_url)
+                        if rb_status != 200:
+                            raise DriveIntegrityError(
+                                f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
+                            )
+                        rb_bytes = len(rb_body)
+                        rb_sha256 = hashlib.sha256(rb_body).hexdigest()
+
+                    if rb_bytes != size_bytes or rb_sha256.lower() != local_sha256.lower():
+                        raise DriveIntegrityError(
+                            f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
+                        )
+                except DriveIntegrityError:
+                    raise
+                except Exception as rbe:
+                    raise DriveIntegrityError(
+                        f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
+                    ) from rbe
+                finally:
+                    if tmp_readback.exists():
+                        try:
+                            tmp_readback.unlink()
+                        except OSError:
+                            pass
 
             # Step 3: DRIVE_VERIFIED -> PUBLISHED
-            record.transition_to(TransferStatus.DRIVE_VERIFIED)
-            self.journal.record_transfer(record)
+            if record.status != TransferStatus.PUBLISHED.value and record.status != TransferStatus.DRIVE_VERIFIED.value:
+                record.transition_to(TransferStatus.DRIVE_VERIFIED)
+                self.journal.record_transfer(record)
 
-            record.transition_to(TransferStatus.PUBLISHED)
-            record.remote_file_id = remote_id
-            self.journal.record_transfer(record)
+            if record.status != TransferStatus.PUBLISHED.value:
+                record.transition_to(TransferStatus.PUBLISHED)
+                record.remote_file_id = remote_id
+                self.journal.record_transfer(record)
 
             stored = StoredArtifact(
                 artifact_id=artifact_id,
@@ -800,16 +1181,19 @@ class GoogleDriveArtifactStore:
 
         except Exception as e:
             record.retry_count += 1
+            sanitized_err = _sanitize_drive_error(str(e))
             if record.retry_count <= record.max_retries:
                 try:
-                    record.transition_to(TransferStatus.RETRY_PENDING, error_message=str(e))
+                    record.transition_to(TransferStatus.RETRY_PENDING, error_message=sanitized_err)
                 except Exception:
                     record.status = TransferStatus.RETRY_PENDING.value
+                    record.last_error = sanitized_err
             else:
                 try:
-                    record.transition_to(TransferStatus.UPLOAD_FAILED, error_message=str(e))
+                    record.transition_to(TransferStatus.UPLOAD_FAILED, error_message=sanitized_err)
                 except Exception:
                     record.status = TransferStatus.UPLOAD_FAILED.value
+                    record.last_error = sanitized_err
             self.journal.record_transfer(record)
             raise
 
