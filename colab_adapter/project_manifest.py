@@ -357,6 +357,9 @@ def plan_project(spec: ProjectSpec) -> Dict[str, Any]:
     validate_manifest(spec)
     files = discover_project_files(spec)
     total_bytes = sum(f[1] for f in files)
+    manifest_digest = hashlib.sha256(
+        json.dumps([(f[0], f[1], f[2]) for f in files], sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
     return {
         "schema_version": spec.schema_version,
@@ -373,7 +376,9 @@ def plan_project(spec: ProjectSpec) -> Dict[str, Any]:
         "artifacts_local_dir": str(spec.artifacts_local_dir),
         "delete_remote": spec.delete_remote,
         "files_count": len(files),
+        "total_files": len(files),
         "total_bytes": total_bytes,
+        "manifest_digest": manifest_digest,
         "files": [
             {"path": f[0], "size": f[1], "sha256": f[2]}
             for f in files
