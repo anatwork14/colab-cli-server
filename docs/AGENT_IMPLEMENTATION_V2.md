@@ -27,6 +27,7 @@ The current codebase already handles interactive one-shot/stateful jobs, registr
 - **Worker B — transport:** M1/M3 upstream compatibility probe, official CLI transport, optional SSH-over-WebSocket adapter. Files primarily transports/* and test_transport_*.py. Never provision live session.
 - **Worker C — sync engine:** M4 file index/content hashes, remote staging, delta plan and fallback transport. Files primarily workspace_index.py, workspace.py, test_sync_*.py; integrates A and B contracts.
 - **Worker D — lifecycle/observability:** M5/M6 project session manager, artifact output metadata, safe reuse/cleanup and metrics. Files project_sessions.py, artifacts.py, test_session_*.py.
+- **Worker F — monitoring dashboard:** M8 account snapshot collector and ledger, trainer event ingestion, read-only REST/SSE, React/Vite responsive UI, authenticated remote access design and adversarial offline tests. Own monitor/*, web/*, tests/test_monitor_* and docs/MONITORING_DASHBOARD_V2.md; do not create cloud sessions or public endpoints.
 - **Worker E — QA/integration:** adversarial fixtures, package import compatibility, offline E2E, upgrade/migration docs, README updates. Files primarily tests, examples, docs. Coordinate collisions.
 - Worker parallelism only when API decisions from M1 are frozen and file ownership is non-overlapping; each worker reports evidence to manager. Avoid spawning all workers to edit provider.py and cli.py simultaneously.
 
@@ -61,6 +62,14 @@ The current codebase already handles interactive one-shot/stateful jobs, registr
 - Update all docs, CLI help and agent skill. Run Python 3.8+ regression and CI on 3.12/3.13.
 - Only when owner separately authorizes: propose a **minimal** bounded live SSH/Colab test with specific GPU, unit/time ceiling, expected artifacts and cleanup. Stop and audit sessions.
 
+### Step 6: M8 — secure training and account compute monitor
+- Follow [MONITORING_DASHBOARD_V2.md](MONITORING_DASHBOARD_V2.md). Freeze AccountSample/RunEvent schemas and source freshness semantics first; account CU is aggregated and does not provide prior all-time billing or per-job charges.
+- Implement read-only `colab usage`/`colab sessions` poller with private append-only JSONL snapshots, configurable bounded cadence/backoff, collector errors and data gaps. No allocating calls in any collector or dashboard test.
+- Implement actual training telemetry emitted by owned jobs (epoch/step/loss/eval/checkpoint/heartbeat) and optional GPU samples from already approved runtimes only. Charts never invent metrics, progress or ETA.
+- Build responsive overview/training/run details/compute/sessions/history/health UI; private authenticated REST/SSE with safe cursors, pagination and redaction.
+- Bind loopback by default. Operator configures approved VPN/HTTPS+identity gateway before any cross-device access. Never expose Google OAuth, HTTP run/stop/SSH or agent self-approval.
+- Update progress.md, milestones.md G8 and expected results Q19–Q31 with actual offline evidence. Independent reviewer audits account-history truthfulness, private data, remote access auth and zero-allocation test proof.
+
 ## Pull-request rules and artifact update discipline
 
 - Use branch per milestone: feat/v2-m1-contract, feat/v2-m2-manifest, etc.; base on latest main after the planning PR is merged, or on explicitly documented integration branch if not merged yet.
@@ -84,6 +93,8 @@ The current codebase already handles interactive one-shot/stateful jobs, registr
 - Host Python 3.8 import, CI 3.12/3.13, all original 43 tests remain green?
 - Remote GPU remains separated from local CUDA; no local driver edits?
 - Live cost, sessions and verification tiers accurately distinguished from offline mocks?
+- Account balance snapshots distinguished from historical spend and individual job charges?
+- Remote dashboard gated by authenticated HTTPS/VPN with 0 client-side OAuth and no control endpoints?
 
 ## Definition of delivery
 
