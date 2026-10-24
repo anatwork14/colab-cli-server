@@ -52,3 +52,12 @@ Mandatory V2 constraints:
 - Keep the standard-library wrapper compatible with Python >=3.8 and Google's CLI separately installed with Python >=3.12. Do not modify unrelated local GPU workloads.
 - Preserve V1 API, registry/session ownership, locking, tracking and tests. Work in small feature branches/PRs, update progress.md and milestones.md with evidence, do not auto-merge/deploy.
 - Do not report feature completion from mocks as proof of live remote performance. Distinguish planned, offline proven and owner-approved live proven results.
+
+### V2 M8 monitor guardrails
+
+- The initial monitor is strictly **READ ONLY**: no HTTP endpoints capable of remote Colab run/new/stop/SSH, arbitrary shell or bypassing approval. Agents must not publish a control interface.
+- Account polling may invoke only approved **read-only** CLI usage/session inspection at a bounded interval with backoff; it must not create/retain Colab runtimes or request GPU metrics by SSH.
+- Keep account-wide CU balance, rate and assignment counts separate from managed job metrics; neither per-job billing nor lifetime history prior to monitoring installation may be invented.
+- Train loss/epoch/step/progress/checkpoint and optional GPU samples require actual instrumented run events. Missing values are unavailable, never guessed.
+- Host monitoring on Ubuntu at loopback by default. Remote access from any computer requires explicit operator-approved authenticated TLS/identity proxy or VPN. Never expose tokens or project logs to unauthenticated browsers, raw public ports or client-side storage.
+- Read [docs/MONITORING_DASHBOARD_V2.md](docs/MONITORING_DASHBOARD_V2.md) and meet milestone M8 / gate G8 / Q19–Q31. Offline mock development only without separate deployment consent.
