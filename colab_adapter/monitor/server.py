@@ -2,7 +2,7 @@
 
 Guarantees:
 - Loopback binding by default (127.0.0.1); refuses public interfaces unless explicit (Q28).
-- Strict token authentication via Bearer header or ?token= param; 401 on unauthorized (Q26).
+- Strict authentication via Authorization Bearer header or verified reverse-proxy identity; 401 on unauthorized (Q26).
 - Strictly read-only: POST/PUT/DELETE return 405 Method Not Allowed (Q29).
 - SSE event stream with cursor resume (Q27).
 - Deep credential redaction in all responses (Q31).

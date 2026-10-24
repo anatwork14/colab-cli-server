@@ -27,7 +27,7 @@ from .errors import (
     UnmanagedSessionError,
 )
 from .project_manifest import ProjectSpec
-from .provider import ColabProcessLock, ManagedSessionRegistry
+from .provider import ApprovalRequiredError, ColabProcessLock, ManagedSessionRegistry
 from .transports.base import BaseTransport
 from .transports.official_cli import OfficialCliTransport
 
@@ -183,11 +183,13 @@ class ProjectSessionManager:
         transport: Optional[BaseTransport] = None,
         colab_binary: Optional[str] = None,
         run_cmd_fn: Optional[Callable[..., subprocess.CompletedProcess]] = None,
+        require_approval: bool = False,
     ):
         self.registry = registry or ManagedSessionRegistry()
         self.lock = lock or ColabProcessLock()
         self.colab_binary = colab_binary or "colab"
         self._run_cmd = run_cmd_fn or subprocess.run
+        self.require_approval = require_approval
         self.transport = transport or OfficialCliTransport(
             registry=self.registry,
             cli_path=self.colab_binary,
@@ -247,7 +249,16 @@ class ProjectSessionManager:
         project_id = getattr(spec, "project_id", None) or f"proj-{spec.name}"
         gpu = getattr(spec, "gpu", "T4")
 
-        # 1. Check if reusable active session exists
+        # 1. Enforce explicit approval gate if enabled
+        if self.require_approval:
+            expected_prefix = f"ALLOCATE {gpu}"
+            if not approval_token or not approval_token.startswith(expected_prefix):
+                raise ApprovalRequiredError(
+                    f"Explicit approval token required to allocate {gpu} GPU. "
+                    f"Expected token starting with '{expected_prefix}', got '{approval_token}'."
+                )
+
+        # 2. Check if reusable active session exists
         if reuse_active:
             existing = self.get_active_session_for_project(project_id)
             if existing is not None:
@@ -442,6 +453,10 @@ class ProjectSessionManager:
             info = all_managed.get(session_id, {})
             session = ProjectSession.from_dict(info) if info else None
             return self._stop_locked(session_id, session)
+
+    def close_session(self, session_id: str) -> bool:
+        """Safely close, stop and tear down a managed project session (alias for stop)."""
+        return self.stop(session_id)
 
     def status(self, session_id: str) -> Dict[str, Any]:
         """Return status and lease details for a managed session."""

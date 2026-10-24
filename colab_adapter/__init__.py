@@ -29,6 +29,7 @@ from .errors import (
     UpstreamCliError,
     UpstreamCliNotFoundError,
     AutoAllocationBlockedError,
+    SshAutoAllocationRiskError,
     ManifestValidationError,
     WorkspaceSyncError,
     ArtifactValidationError,
@@ -52,9 +53,11 @@ from .capability import (
     CapabilityProbe,
     CliCapabilities,
     SshSafetyGuard,
+    probe_cli_capabilities,
 )
 from .transports import (
     BaseTransport,
+    GuardedSshTransport,
     OfficialCliTransport,
     SshProxyTransport,
 )
@@ -76,9 +79,11 @@ from .telemetry import (
 )
 from .project_manifest import (
     ProjectSpec,
+    create_execution_plan,
     discover_project_files,
     init_project,
     load_manifest,
+    load_project_manifest,
     plan_project,
     validate_manifest,
 )
@@ -134,6 +139,7 @@ __all__ = [
     "UpstreamCliError",
     "UpstreamCliNotFoundError",
     "AutoAllocationBlockedError",
+    "SshAutoAllocationRiskError",
     "ManifestValidationError",
     "WorkspaceSyncError",
     "ArtifactValidationError",
@@ -147,19 +153,23 @@ __all__ = [
     "LeaseExpiredError",
     "InvalidStateTransitionError",
     "CapabilityProbe",
+    "probe_cli_capabilities",
     "CliCapabilities",
     "SshSafetyGuard",
     "BaseTransport",
     "OfficialCliTransport",
     "SshProxyTransport",
+    "GuardedSshTransport",
     "SyncDelta",
     "WorkspaceSyncEngine",
     "compute_sync_delta",
     # V2 Project Manifest
     "ProjectSpec",
     "load_manifest",
+    "load_project_manifest",
     "validate_manifest",
     "plan_project",
+    "create_execution_plan",
     "init_project",
     "discover_project_files",
     # V2 Project Sessions (M5)

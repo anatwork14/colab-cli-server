@@ -300,7 +300,11 @@ def discover_project_files(spec: ProjectSpec) -> List[Tuple[str, int, str]]:
             file_rel = f"{rel_dir}/{fname}" if rel_dir else fname
             full_path = current_path / fname
 
-            # 1. Symlink escape check
+            # 1. Check exclusions first (excluded files/symlinks do not trigger errors)
+            if is_path_excluded(file_rel, spec.exclude):
+                continue
+
+            # 2. Symlink escape check for included files
             if full_path.is_symlink():
                 target = full_path.resolve()
                 try:
@@ -317,13 +321,11 @@ def discover_project_files(spec: ProjectSpec) -> List[Tuple[str, int, str]]:
                     # Dangling symlink
                     continue
 
-            # 2. Check regular file
+            # 3. Check regular file
             if not full_path.is_file():
                 continue
 
-            # 3. Check exclusions and inclusions
-            if is_path_excluded(file_rel, spec.exclude):
-                continue
+            # 4. Check inclusions
             if not is_path_included(file_rel, spec.include):
                 continue
 
@@ -427,3 +429,7 @@ def init_project(target_dir: Union[str, Path], name: Optional[str] = None) -> Pa
 
     manifest_file.write_text(json.dumps(template, indent=2), encoding="utf-8")
     return manifest_file
+
+
+load_project_manifest = load_manifest
+create_execution_plan = plan_project

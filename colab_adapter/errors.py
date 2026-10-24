@@ -79,6 +79,11 @@ class AutoAllocationBlockedError(ColabV2Error):
     pass
 
 
+class SshAutoAllocationRiskError(AutoAllocationBlockedError):
+    """Raised specifically when an SSH operation risks auto-allocating a Colab VM (e.g. TOCTOU session disappearance)."""
+    pass
+
+
 class ManifestValidationError(ColabV2Error, InvalidJobSpecError):
     """Raised when project manifest fails schema, path traversal, or safety checks."""
     pass

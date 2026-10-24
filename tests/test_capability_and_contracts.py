@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -12,6 +13,7 @@ from colab_adapter.capability import (
     CliCapabilities,
     SshSafetyGuard,
     _strip_ansi,
+    probe_cli_capabilities,
 )
 from colab_adapter.errors import (
     ArtifactValidationError,
@@ -19,6 +21,7 @@ from colab_adapter.errors import (
     ColabV2Error,
     ManifestValidationError,
     SessionNotFoundError,
+    SshAutoAllocationRiskError,
     SshHandshakeError,
     TransportError,
     TransportUnavailableError,
@@ -300,6 +303,131 @@ Usage: colab ssh [OPTIONS]
                 mock_auto_create_b.called,
                 "Verified invariant: omitting '-s' NEVER calls _auto_create_session!"
             )
+
+    def test_cli_capabilities_available_commands_immutable_tuple(self):
+        """Verify CliCapabilities converts available_commands to immutable tuple, preventing .append()."""
+        caps = CliCapabilities(
+            cli_path="/usr/bin/colab",
+            version="1.0.0",
+            available_commands=["download", "exec", "new", "run", "ssh"],
+            supports_ssh=True,
+            supports_ssh_proxy_mode=True,
+            supports_upload=True,
+            supports_download=True,
+            supports_exec=True,
+            supports_sessions=True,
+            supports_usage=True,
+        )
+        self.assertIsInstance(caps.available_commands, tuple)
+        self.assertEqual(caps.available_commands, ("download", "exec", "new", "run", "ssh"))
+        with self.assertRaises(AttributeError):
+            caps.available_commands.append("unauthorized_command")
+
+    def test_probe_cli_capabilities_strips_ansi(self):
+        """Verify probe_cli_capabilities strips ANSI escape codes from rich terminal output."""
+        def fake_run(cmd, **kwargs):
+            res = MagicMock()
+            res.returncode = 0
+            if "version" in cmd:
+                res.stdout = "\x1b[32;1mVersion: 0.8.0\x1b[0m\n"
+            elif "--help" in cmd and "ssh" not in cmd:
+                res.stdout = "\x1b[1mColab CLI\x1b[0m\n╭─ \x1b[34mCommands\x1b[0m ─╮\n│ \x1b[33mupload\x1b[0m   Upload file │\n│ \x1b[33mexec\x1b[0m     Exec code   │\n│ \x1b[33mssh\x1b[0m      SSH bridge  │\n╰─────────────╯\n"
+            elif "ssh" in cmd and "--help" in cmd:
+                res.stdout = "\x1b[36m--proxy-mode\x1b[0m"
+            else:
+                res.stdout = ""
+            return res
+
+        with patch("os.path.isfile", return_value=True), patch("subprocess.run", side_effect=fake_run):
+            caps = probe_cli_capabilities(cli_path="/usr/bin/colab")
+            self.assertEqual(caps.version, "0.8.0")
+            self.assertIn("upload", caps.available_commands)
+            self.assertIn("exec", caps.available_commands)
+            for cmd_name in caps.available_commands:
+                self.assertNotIn("\x1b", cmd_name, f"Command '{cmd_name}' contains ANSI escape sequence")
+            self.assertTrue(caps.supports_ssh_proxy_mode)
+
+    def test_prepare_isolated_ssh_config_permissions_and_invariants(self):
+        """Verify prepare_isolated_ssh_config creates a 0700 private directory, 0600 sessions.json with only target session, and copies auth config."""
+        session_id = "test-isolated-session-789"
+        self.registry.register(
+            session_id=session_id,
+            job_id="job-isolated-1",
+            gpu="T4",
+            project_name="proj-isolated",
+        )
+        session_data = {"name": session_id, "endpoint": "https://colab.google.com/session/789", "token": "tok789"}
+        Path(self.config_path).write_text(
+            json.dumps({session_id: session_data, "other-session": {"name": "other-session"}}),
+            encoding="utf-8",
+        )
+        # Create non-session settings.json in same dir as config
+        settings_path = Path(self.config_path).parent / "settings.json"
+        settings_path.write_text(json.dumps({"theme": "dark", "client_version": "1.0.0"}), encoding="utf-8")
+
+        guard = SshSafetyGuard(
+            registry=self.registry,
+            colab_config_path=self.config_path,
+            allow_ssh=True,
+            cli_path="/usr/bin/colab",
+        )
+
+        iso_dir = guard.prepare_isolated_ssh_config(session_id)
+        self.assertTrue(iso_dir.is_dir())
+
+        # Check directory permissions: 0700
+        dir_mode = stat.S_IMODE(os.stat(iso_dir).st_mode)
+        self.assertEqual(dir_mode, 0o700, f"Expected 0700 permissions on isolated directory, got {oct(dir_mode)}")
+
+        # Check sessions.json existence and 0600 permissions
+        sessions_json = iso_dir / "sessions.json"
+        self.assertTrue(sessions_json.is_file())
+        file_mode = stat.S_IMODE(os.stat(sessions_json).st_mode)
+        self.assertEqual(file_mode, 0o600, f"Expected 0600 permissions on sessions.json, got {oct(file_mode)}")
+
+        # Check contents: ONLY target session
+        content = json.loads(sessions_json.read_text(encoding="utf-8"))
+        self.assertEqual(list(content.keys()), [session_id])
+        self.assertNotIn("other-session", content)
+
+        # Check non-session config copied safely
+        iso_settings = iso_dir / "settings.json"
+        self.assertTrue(iso_settings.is_file())
+        self.assertEqual(stat.S_IMODE(os.stat(iso_settings).st_mode), 0o600)
+
+    def test_session_disappearance_immediately_after_preflight_blocks_with_zero_allocation(self):
+        """Verify TOCTOU race: if session disappears from local store immediately after preflight, invocation fails closed with SshAutoAllocationRiskError and zero allocations."""
+        session_id = "toctou-target-session"
+        self.registry.register(
+            session_id=session_id,
+            job_id="job-toctou",
+            gpu="T4",
+            project_name="proj-toctou",
+        )
+        session_data = {"name": session_id, "endpoint": "https://colab.google.com/session/toctou"}
+        Path(self.config_path).write_text(
+            json.dumps({session_id: session_data}),
+            encoding="utf-8",
+        )
+
+        guard = SshSafetyGuard(
+            registry=self.registry,
+            colab_config_path=self.config_path,
+            allow_ssh=True,
+            cli_path="/usr/bin/colab",
+        )
+
+        # Preflight check passes
+        guard.check_ssh_allowed_for_session(session_id)
+
+        # Adversarial race: session file is pruned right after preflight check
+        Path(self.config_path).write_text(json.dumps({}), encoding="utf-8")
+
+        # Invocation must detect session disappearance immediately and fail closed
+        with self.assertRaises(SshAutoAllocationRiskError) as ctx:
+            guard.build_safe_ssh_proxy_invocation(session_id, isolated_dir=tempfile.mkdtemp(dir=self.tmp_dir))
+        self.assertIn("CRITICAL SAFETY VIOLATION PREVENTED", str(ctx.exception))
+
 
 
 if __name__ == "__main__":
