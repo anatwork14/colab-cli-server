@@ -26,7 +26,7 @@ Make the official [googlecolab/google-colab-cli](https://github.com/googlecolab/
 - **Phase C — authenticate (human handoff):** Explain `bash scripts/authenticate.sh`; the user completes login. Confirm only success/failure and scopes/identity if needed; redact everything credential-bearing.
 - **Phase D — dry run (free):** `python3 -m unittest discover -s tests -v`, `python3 colab_server.py doctor`, and `python3 colab_server.py plan --gpu T4 --script examples/gpu_probe.py`. These must not allocate VMs.
 - **Phase E — live probe (optional):** Ask which GPU/runtime and whether compute use is approved. A human runs `python3 colab_server.py run --gpu T4 --script examples/gpu_probe.py` and types the exact consent phrase. Check `colab --auth=oauth2 sessions` afterward and clean up any orphan.
-- **Phase F — application integration:** Add a provider adapter to the consuming system, outside this reusable public repository. Emit job ID, requested hardware, timestamps, outcomes and artifact paths; keep credentials private. Place human approval in an independent protected control plane before creating billable runtimes.
+- **Phase F — application integration:** Use the modular adapter in `colab_adapter` (documented in [docs/ADAPTER.md](docs/ADAPTER.md)). It enforces cross-process locking, input tampering checks, and session registry ownership. Place human approval in an independent protected control plane or separately protected executor before creating billable runtimes. Never automatically stop unrelated user sessions.
 
 ## Completion / acceptance criteria
 

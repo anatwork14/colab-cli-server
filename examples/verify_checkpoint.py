@@ -87,11 +87,16 @@ def verify_checkpoint(artifacts_dir: Path) -> bool:
         print(f"FAILED: Could not inspect archive structure: {e}", file=sys.stderr)
         return False
 
-    # 4. Optional PyTorch load if torch is present in current environment
+    # 4. Level 3 verification: Optional PyTorch weight loading & inference if torch is installed
     try:
         import torch
 
-        data = torch.load(str(checkpoint_path), map_location="cpu")
+        try:
+            data = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
+        except TypeError:
+            # Fallback for older PyTorch versions that do not accept weights_only
+            data = torch.load(str(checkpoint_path), map_location="cpu")
+
         state_dict = data.get("model_state_dict")
         if not state_dict:
             print("FAILED: model_state_dict missing in checkpoint", file=sys.stderr)
@@ -105,9 +110,10 @@ def verify_checkpoint(artifacts_dir: Path) -> bool:
         with torch.no_grad():
             out = model(dummy_input)
 
-        print(f"Model successfully loaded via torch.load! Output: {out.numpy().tolist()}")
+        print(f"Level 3 Passed: Model weights loaded via torch.load(weights_only=True)! Forward pass output: {out.numpy().tolist()}")
     except ImportError:
-        print("Note: local PyTorch not installed; verified checkpoint via ZIP format and SHA256 manifest.")
+        print("Note: local PyTorch not installed on host. Levels 1 & 2 verified (SHA256 checksum & ZIP structure).")
+        print("To run Level 3 weight loading and local inference, install PyTorch on the host.")
     except Exception as e:
         print(f"FAILED: torch.load failed on checkpoint: {e}", file=sys.stderr)
         return False

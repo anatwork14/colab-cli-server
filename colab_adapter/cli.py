@@ -77,10 +77,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Colab CLI installed:       {status['cli_installed']}")
         print(f"uv installed:              {status['uv_installed']}")
         print(f"Python version:            {status['python_version']}")
-        print(f"Local GPU available:       {status['local_gpu_available']}")
-        print(f"OAuth token present:       {status['oauth_token_present']}")
+        print(f"Auth mode:                 {status['auth_mode']}")
+        print(f"Credentials present:       {status['credentials_present']}")
         print(f"Authenticated with Colab:  {status['authenticated']}")
-        print(f"Active Colab sessions:     {len(status['active_sessions'])}")
+        print(f"Local GPU available:       {status['local_gpu_available']}")
+        print(f"Active managed sessions:   {len(status['active_sessions'])}")
+        print(f"Unmanaged user sessions:   {len(status['unmanaged_sessions'])}")
         if status.get("error"):
             print(f"Status Note:               {status['error']}")
         return 0 if status["cli_installed"] else 1
@@ -90,11 +92,15 @@ def main(argv: list[str] | None = None) -> int:
         if not avail["authenticated"]:
             print(f"Error: {avail.get('error') or 'Not authenticated'}", file=sys.stderr)
             return 1
-        print("Active Colab sessions:")
+        print("Active managed Colab sessions:")
         for s in avail["active_sessions"]:
             print(f" - {s}")
         if not avail["active_sessions"]:
             print(" (None)")
+        if avail["unmanaged_sessions"]:
+            print("Unmanaged user sessions (unaffected by adapter):")
+            for s in avail["unmanaged_sessions"]:
+                print(f" - {s}")
         return 0
 
     elif args.command == "usage":

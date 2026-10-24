@@ -2,28 +2,29 @@
 
 ## Overview
 
-The `colab_adapter` package provides a reusable, modular Python adapter and CLI tool to integrate the official Google Colab CLI as an additional remote GPU compute backend for Linux/macOS servers and AI research agents.
+The `colab_adapter` package provides a reusable, production-hardened Python adapter and CLI tool to integrate Google's official Colab CLI (`google-colab-cli` v0.7.5+) as an additional remote GPU compute backend for developer workstations, servers, and AI research agents.
 
-It implements the `ColabGPUProvider` interface with structured experiment logging (`ExperimentTracker`), non-sensitive metadata tracking, and a human approval gate.
+It implements `ColabGPUProvider`, `ManagedSessionRegistry`, `ColabProcessLock`, and structured experiment logging (`ExperimentTracker`).
 
 ---
 
-## Architecture
+## Architecture & Control Flow
 
 ```text
                Research Agent / Researcher
                            │
        ┌───────────────────┴───────────────────┐
        │   ColabGPUProvider (Adapter Layer)    │
-       │   - prepare_job() [No cloud cost]     │
-       │   - approve_job_interactive()         │
-       │   - submit_job() [Verified execution] │
-       │   - reconcile_stale_sessions()        │
+       │   - Cross-process file locking        │
+       │   - Session ownership registry        │
+       │   - Input tampering verification      │
+       │   - Subprocess timeout guards         │
+       │   - Error preservation & logging      │
        └───────────────────┬───────────────────┘
                            │
                  Subprocess Invocation
                            │
-            Official google-colab-cli (v0.7.5+)
+            Official google-colab-cli (OAuth2 / ADC)
                            │
                   Google Cloud Colab VM
                (Tesla T4, L4, A100, H100)
@@ -31,39 +32,44 @@ It implements the `ColabGPUProvider` interface with structured experiment loggin
 
 ---
 
-## Key Features
+## Core Principles & Reliability Features
 
-1. **Strict Separation of Planning and Provisioning:**
-   `prepare_job(spec)` validates inputs, scripts, and GPU availability, producing a preview plan and unique approval nonce without allocating any cloud VM or consuming compute units.
+1. **Session Ownership & Protection of Unrelated Work:**
+   The adapter maintains a local registry (`~/.colab_experiments/managed_sessions.json`) tracking only sessions provisioned by itself.
+   - `cleanup()` and `reconcile_stale_sessions()` strictly terminate only registered managed sessions.
+   - Unmanaged user sessions on the account are detected, reported, and left completely untouched.
 
-2. **Concurrency & Resource Controls:**
-   - Single active managed Colab session limit (`_max_active_sessions = 1`).
-   - Duplicate submission prevention.
-   - Guaranteed session teardown in `finally` blocks.
+2. **Approval Architecture & Tamper Resistance:**
+   - At planning time (`prepare_job`), the adapter computes a cryptographic fingerprint of all job inputs (script content SHA256, requirements SHA256, dataset hashes, GPU, timeout).
+   - At submission time (`submit_job`), all assets on disk are re-hashed. Any modification between approval and execution triggers `JobTamperedError`.
+   - **Security Boundary:** The interactive terminal prompt (`ALLOCATE <GPU> <NONCE>`) is a human safeguard. In environments with autonomous agents sharing the same OS account, in-process nonces do not form a cryptographic sandbox. A **separately protected approval executor** running under an independent OS user or container with an out-of-band authorization channel must be used for untrusted autonomy.
 
-3. **Output & Artifact Verification:**
-   Upstream `colab exec` may exit with status 0 even when remote Python tracebacks occur. `ColabGPUProvider` explicitly checks stdout/stderr for traceback patterns, verifies expected checkpoint files exist and are non-empty, and downloads them safely.
+3. **Cross-Process Concurrency Protection:**
+   Uses non-blocking `fcntl.flock` on `~/.colab_experiments/colab_gpu.lock`.
+   Concurrent submissions across multiple processes fail immediately with `DuplicateAllocationError`, preventing accidental duplicate billing.
 
-4. **Disk-Space Pre-Check:**
-   Verifies that the target filesystem has sufficient free space (minimum 500 MB) before downloading remote checkpoints to avoid host disk exhaustion.
+4. **Deep Credential Sanitization:**
+   `ExperimentTracker` recursively applies regular expression scrubbers across all logged fields, paths, and tracebacks, redacting:
+   - Google OAuth authorization codes (`4/0A...`)
+   - Google OAuth Bearer / access tokens (`ya29....`)
+   - GitHub and generic API tokens (`ghp_...`, `ey...`)
+   - PEM private keys
+   - URL query secrets (`?code=...`, `&token=...`)
+   All log files (`experiments.jsonl`, `managed_sessions.json`, `colab_gpu.lock`) are enforced with private `0600` permissions.
 
-5. **Subprocess Timeout Guard:**
-   Wraps all CLI operations in explicit timeouts to prevent local processes from hanging indefinitely on network or remote deadlocks.
+5. **Error Preservation in `finally` Handlers:**
+   Primary execution errors (e.g. remote tracebacks, CUDA errors, missing files) are never masked by subsequent cleanup or usage-query failures. Cleanup and usage errors are captured as distinct fields in experiment metadata, and the primary exception is preserved.
 
-6. **Non-Sensitive Structured Logging:**
-   `ExperimentTracker` logs job lifecycle records into portable JSONL (`~/.colab_experiments/experiments.jsonl`), automatically stripping and redacting any potential credential keys.
+6. **Subprocess Timeout Guards:**
+   Subprocess calls have explicit wall-clock timeouts (`spec.timeout + 180s`) to ensure local processes never hang indefinitely if the remote kernel or network deadlocks.
 
----
+7. **Dual Authentication Support:**
+   Supports both `auth_mode="oauth2"` (validating `~/.config/colab-cli/token.json`) and `auth_mode="adc"` (Application Default Credentials via `GOOGLE_APPLICATION_CREDENTIALS` or `gcloud`).
 
-## Security Model & Boundary Notes
-
-> [!IMPORTANT]
-> **Usability Safeguard vs. Security Boundary:**
-> The interactive terminal prompt (`ALLOCATE <GPU> <NONCE>`) ensures human awareness and consent before any billable cloud compute is provisioned.
->
-> However, if an autonomous AI agent executes under the **same operating-system account** as the user, it inherently has access to the user's files and shell. Therefore, an in-process confirmation check is a safeguard against unintended invocation—not a cryptographic security boundary against malicious or compromised code running in the same OS identity.
->
-> For strict isolation of untrusted agents, run the agent in a restricted environment (container or separate OS user) communicating with a **separately protected executor** that manages Colab credentials and requires external out-of-band authorization.
+8. **Multi-Tier Checkpoint Verification:**
+   - **Level 1 (Integrity):** SHA256 checksum and JSON manifest validation.
+   - **Level 2 (Structure):** PyTorch ZIP format and file header inspection (`data.pkl`, format version).
+   - **Level 3 (Inference):** Full weight loading via `torch.load(weights_only=True)` and forward-pass inference when PyTorch is installed locally.
 
 ---
 
@@ -72,34 +78,40 @@ It implements the `ColabGPUProvider` interface with structured experiment loggin
 ```python
 from colab_adapter import ColabGPUProvider, JobSpec
 
-provider = ColabGPUProvider()
+# Initialize provider (supports oauth2 or adc)
+provider = ColabGPUProvider(auth_mode="oauth2")
 
 # 1. Read-only environment inspection
 status = provider.check_availability()
-print("Authenticated:", status["authenticated"])
+print(f"Authenticated: {status['authenticated']}")
+print(f"Active managed sessions: {status['active_sessions']}")
+print(f"Unmanaged user sessions: {status['unmanaged_sessions']}")
 
-# 2. Prepare stateful multi-step training job
+# 2. Prepare stateful multi-step training job (NO cloud compute allocated)
 spec = JobSpec(
-    project_name="image-classification",
+    project_name="arc-training",
     script_path="examples/train_model.py",
     gpu="T4",
     input_files={"examples/synthetic_data.csv": "/content/synthetic_data.csv"},
     expected_outputs=["/content/model_checkpoint.pt", "/content/status.json"],
     output_download_dir="./artifacts",
-    timeout=600.0,
+    timeout=300.0,
     stateful=True,
 )
 prepared = provider.prepare_job(spec)
 
-# 3. Interactive human authorization
+# 3. Interactive human authorization (in terminal)
 approved = provider.approve_job_interactive(prepared)
 
-# 4. Execute job with guaranteed cleanup
+# 4. Execute job with cross-process locking, artifact verification, and guaranteed cleanup
 result = provider.submit_job(approved)
 if result.success:
-    print("Downloaded checkpoints:", result.output_files)
+    print(f"Downloaded checkpoints: {result.output_files}")
 else:
-    print("Execution failed:", result.error)
+    print(f"Execution failed: {result.error}")
+
+# 5. Stale session reconciliation (stops only stale managed sessions)
+reconciled = provider.reconcile_stale_sessions(auto_stop=True)
 ```
 
 ---
@@ -109,7 +121,7 @@ else:
 The package includes `colab-adapter` (or `python3 -m colab_adapter.cli`):
 
 ```bash
-# Diagnostics and status
+# Diagnostics and status (shows managed vs unmanaged sessions)
 colab-adapter doctor
 colab-adapter usage
 colab-adapter sessions
@@ -120,9 +132,9 @@ colab-adapter plan --script examples/train_model.py --gpu T4
 # Execute with terminal approval
 colab-adapter run --script examples/train_model.py --gpu T4
 
-# View experiment history
+# View experiment history (secrets redacted)
 colab-adapter history --limit 10
 
-# Terminate session
+# Safely terminate a managed session
 colab-adapter stop <session_id>
 ```

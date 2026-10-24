@@ -1,16 +1,63 @@
 """Structured experiment logger for Colab GPU jobs.
 
 Maintains non-sensitive metadata in JSON/JSONL format.
-Ensures secrets, tokens, and authorization credentials are never logged.
+Ensures secrets, tokens, authorization credentials, and sensitive output
+are deeply sanitized and redacted from persisted logs.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Regex patterns for detecting and redacting credentials in any string
+SENSITIVE_PATTERNS = [
+    # Google OAuth authorization code (e.g. 4/0AXl...)
+    (re.compile(r"4/[0-9a-zA-Z_\-]{20,}"), "[REDACTED_OAUTH_CODE]"),
+    # Google OAuth Bearer / access token (ya29....)
+    (re.compile(r"ya29\.[0-9a-zA-Z_\-]+"), "[REDACTED_GOOGLE_TOKEN]"),
+    # GitHub / generic API tokens
+    (re.compile(r"gh[pousr]_[0-9a-zA-Z]{20,}"), "[REDACTED_GITHUB_TOKEN]"),
+    # JWT tokens
+    (re.compile(r"ey[A-Za-z0-9_\-]{15,}\.ey[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]+"), "[REDACTED_JWT]"),
+    # PEM Private Keys
+    (re.compile(r"-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+ PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
+    # URL query parameters containing credentials
+    (re.compile(r"([?&](?:code|token|key|secret|password|access_token)=)[^&\s]+"), r"\1[REDACTED_PARAM]"),
+    # Key-value secret assignments in text or tracebacks
+    (re.compile(r"(?i)(?:token|secret|password|api_key|access_token|auth)\s*[:=]\s*['\"]?([a-zA-Z0-9_\-]{8,})['\"]?"), "[REDACTED_SECRET]"),
+]
+
+
+def sanitize_text(text: Optional[str]) -> Optional[str]:
+    """Recursively scrub known sensitive patterns from text."""
+    if not text:
+        return text
+    sanitized = text
+    for pattern, replacement in SENSITIVE_PATTERNS:
+        sanitized = pattern.sub(replacement, sanitized)
+    return sanitized
+
+
+def sanitize_data(data: Any) -> Any:
+    """Recursively sanitize strings, dictionaries, and lists."""
+    if isinstance(data, str):
+        return sanitize_text(data)
+    elif isinstance(data, dict):
+        cleaned = {}
+        for k, v in data.items():
+            # If the key itself looks like a secret field, redact its value entirely
+            if any(s in k.lower() for s in ("token", "auth", "secret", "password", "key", "credential")):
+                cleaned[k] = "[REDACTED]"
+            else:
+                cleaned[k] = sanitize_data(v)
+        return cleaned
+    elif isinstance(data, list):
+        return [sanitize_data(item) for item in data]
+    return data
 
 
 @dataclass
@@ -29,17 +76,15 @@ class ExperimentMetadata:
     success: bool
     error_summary: Optional[str]
     cleanup_status: str  # CLEANED, RUNTIME_STOPPED, FAILED, ORPHANED, NOT_APPLICABLE
-    compute_units_before: Optional[str]
-    compute_units_after: Optional[str]
+    cleanup_error: Optional[str] = None
+    usage_error: Optional[str] = None
+    compute_units_before: Optional[str] = None
+    compute_units_after: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        # Extra safety check: redact any sensitive key if accidentally present
-        sensitive_keys = {"token", "auth", "secret", "password", "key", "credential"}
-        for k in list(d.keys()):
-            if any(s in k.lower() for s in sensitive_keys):
-                d[k] = "[REDACTED]"
-        return d
+        # Deeply sanitize all fields
+        return sanitize_data(d)
 
 
 class ExperimentTracker:
@@ -48,7 +93,7 @@ class ExperimentTracker:
             log_dir = Path.home() / ".colab_experiments"
         self.log_dir = Path(log_dir).expanduser().resolve()
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        # Ensure private permissions
+        # Ensure private directory permissions (0700)
         try:
             os.chmod(self.log_dir, 0o700)
         except OSError:
@@ -57,9 +102,20 @@ class ExperimentTracker:
 
     def record_job(self, meta: ExperimentMetadata) -> None:
         data = meta.to_dict()
-        line = json.dumps(data, ensure_ascii=False)
-        with open(self.jsonl_path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        line = json.dumps(data, ensure_ascii=False) + "\n"
+
+        # Write with strict 0600 permissions
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(str(self.jsonl_path), flags, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
 
     def list_jobs(self, limit: int = 50) -> List[Dict[str, Any]]:
         if not self.jsonl_path.exists():
