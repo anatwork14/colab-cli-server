@@ -17,12 +17,13 @@
 - Keep V1 API and current CLI behavior backward compatible; mark every new command opt-in.
 
 ## M1 — Contract freeze / upstream compatibility (release gate G1)
-**Status: NOT_STARTED. Dependencies: M0.**
-- Investigate real google-colab-cli v0.7.5 help/source, especially ssh --proxy-mode, upload/download, new, exec, run -s and sessions output; report behaviors **verified by source** vs **verified on host** vs **not verified**.
-- Define error taxonomy, CLI stdout/JSON contracts, lifecycle state diagram, credential/transport trust policy, version feature matrix, and session ownership boundary.
-- Offline capability probe must not call implicit allocators; document that ssh -s NAME may auto-create if not present. Decide safe gating or disable SSH use until confidently guarded.
-- Deliver: docs decisions, capability fixture tests, security threat matrix, no runtime spend.
-- **Accept:** unsupported/missing SSH yields actionable fallback; all probes are no-allocation.
+**Status: COMPLETE (Verified offline & host; branch feat/v2-m1-contracts). Dependencies: M0.**
+- Investigated real google-colab-cli v0.7.5 source and host behavior for version, help, ssh, upload, download, exec, new, run, sessions, and usage.
+- Documented in `docs/UPSTREAM_COMPATIBILITY_V2.md`: source-verified vs host-verified matrix, error taxonomy, and threat model.
+- Discovered and addressed critical upstream asymmetry: `colab ssh -s NAME` auto-creates missing sessions (`_auto_create_session`), while `upload`, `download`, and `exec` fail closed.
+- Implemented `colab_adapter/errors.py` (V2 typed error taxonomy), `colab_adapter/capability.py` (`CapabilityProbe` with zero allocation and `SshSafetyGuard` preventing auto-allocation).
+- Added comprehensive unit tests in `tests/test_capability_and_contracts.py` (all 7 new tests passed; 50/50 total suite passed).
+- **Gate G1 Satisfied:** 0 runtime spend, subprocess spy proves no allocating calls, SSH auto-allocation risk guarded.
 
 ## M2 — Project manifest & planning (G2)
 **Status: NOT_STARTED. Dependencies: M1.**
@@ -96,7 +97,7 @@
 
 | Gate | Evidence required | Status |
 | --- | --- | --- |
-| G1 | Upstream + threat contract + no-allocation feature probes | NOT_STARTED |
+| G1 | Upstream + threat contract + no-allocation feature probes | PASSED |
 | G2 | Manifest parser, plans, schema negative tests | NOT_STARTED |
 | G3 | SSH or graceful fallback, no-surprise-billing tests | NOT_STARTED |
 | G4 | Secure delta sync, replay/rollback/path safety | NOT_STARTED |

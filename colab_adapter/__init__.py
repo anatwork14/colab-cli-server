@@ -24,6 +24,26 @@ from .provider import (
     UnsupportedGPUError,
 )
 from .tracker import ExperimentMetadata, ExperimentTracker
+from .errors import (
+    ColabV2Error,
+    UpstreamCliError,
+    UpstreamCliNotFoundError,
+    AutoAllocationBlockedError,
+    ManifestValidationError,
+    WorkspaceSyncError,
+    ArtifactValidationError,
+    TransportError,
+    TransportUnavailableError,
+    SessionNotFoundError,
+    UnmanagedSessionError,
+    SessionAllocationRequiredError,
+    SshHandshakeError,
+)
+from .capability import (
+    CapabilityProbe,
+    CliCapabilities,
+    SshSafetyGuard,
+)
 
 __all__ = [
     "ColabGPUProvider",
@@ -50,4 +70,21 @@ __all__ = [
     "RegistryCorruptedError",
     "ColabProcessLock",
     "ManagedSessionRegistry",
+    # V2 additions
+    "ColabV2Error",
+    "UpstreamCliError",
+    "UpstreamCliNotFoundError",
+    "AutoAllocationBlockedError",
+    "ManifestValidationError",
+    "WorkspaceSyncError",
+    "ArtifactValidationError",
+    "TransportError",
+    "TransportUnavailableError",
+    "SessionNotFoundError",
+    "UnmanagedSessionError",
+    "SessionAllocationRequiredError",
+    "SshHandshakeError",
+    "CapabilityProbe",
+    "CliCapabilities",
+    "SshSafetyGuard",
 ]

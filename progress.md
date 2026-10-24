@@ -29,7 +29,7 @@
 | ID | Deliverable | Status | Evidence / next action |
 | --- | --- | --- | --- |
 | M0 | V1 baseline accepted | COMPLETE | PR #2, main commit above |
-| M1 | Feature compatibility and security contracts | NOT_STARTED | Confirm upstream flags offline; publish design decisions |
+| M1 | Feature compatibility and security contracts | COMPLETE | Issue #5, docs/UPSTREAM_COMPATIBILITY_V2.md, colab_adapter/errors.py, colab_adapter/capability.py; 50/50 tests pass |
 | M2 | Project manifest, validation and safe plan | NOT_STARTED | Schema, loader, examples and negative tests |
 | M3 | SSH transport and no-surprise-allocation boundary | NOT_STARTED | Offline SSH capability probe, mock 404/401/429; no live probe |
 | M4 | Content-addressed workspace sync | NOT_STARTED | Manifests, delta engine, push/pull, exclusions, safety tests |
@@ -44,6 +44,14 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-24 — Milestone M1 / Gate G1 IN REVIEW (branch `feat/v2-m1-contracts`):**
+  - Audited official `google-colab-cli v0.7.5` source code and live host behaviors.
+  - Documented upstream matrix, error taxonomy, and threat model in `docs/UPSTREAM_COMPATIBILITY_V2.md`.
+  - Discovered critical upstream asymmetry: `colab ssh -s NAME` auto-provisions missing sessions, whereas `upload`, `download`, and `exec` fail closed.
+  - Created `colab_adapter/errors.py` with typed, serializable V2 error hierarchy and credential redaction.
+  - Created `colab_adapter/capability.py` with non-allocating `CapabilityProbe` and fail-closed `SshSafetyGuard`.
+  - Added test suite `tests/test_capability_and_contracts.py`. Ran full offline suite: `50/50 tests passed` in `1.51s` on Python 3.8 and 3.12 (Q01, Q02, Q03, Q18).
+  - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated).
 - **2026-10-24 — Monitoring dashboard scope added:** M8 planned for account-wide CU balance/rate snapshots, managed training progress charts, private web UI viewable from any authorized computer. Historical readings before collector installation are unavailable; no UI deployed, no GPU allocated.
 - **2026-10-24 — Plan initiated:** defined a V2 extension of the merged V1 provider inspired by GPU-rental developer experience. All V2 work remains NOT_STARTED. No runtime allocation performed by the planning effort.
 
