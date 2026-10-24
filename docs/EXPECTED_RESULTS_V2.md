@@ -47,6 +47,26 @@
 
 No live test may be conducted just because this document exists. User-approved exact GPU, number of runs, time cap, and acceptable compute consumption must be recorded before execution. Never display account tokens, authorization codes, private remote paths, or proprietary datasets in artifacts.
 
+## M8 dashboard acceptance matrix (G8 — targets, NOT actual results)
+
+| ID | Offline or approved fixture | Expected behavior |
+| --- | --- | --- |
+| Q19 | Poller with subprocess spies | Only read-only `usage`/`sessions`; zero `new/run/ssh` allocation |
+| Q20 | 1,440 synthetic minute snapshots | Timestamp/order/freshness correct; no dropped account samples |
+| Q21 | Repeat an event after process restart | No duplicate event in computed run history |
+| Q22 | Simulated CU increases/top-ups/adjustments | No negative consumption or invented billable CU total |
+| Q23 | Balance decrease while external account sessions exist | Usage labeled account-wide/unattributed, not per managed job |
+| Q24 | First collector run with no earlier history | Explicit monitoring-since date; prior lifetime usage unknown |
+| Q25 | Simulated 401/403/429/timeout/stale CLI usage | Error visible, bounded backoff, prior data marked stale |
+| Q26 | Two concurrent browser clients and SSE reconnect | Consistent safe event cursor, no duplicate logical events |
+| Q27 | Unauthenticated HTTP, SSE or export | Access rejected; no project names/metrics/balance disclosed |
+| Q28 | Seeded OAuth token, SSH key, secret and sensitive log | All redacted/blocked from response, download and browser logs |
+| Q29 | Job with no train steps, progress total or GPU samples | Shows unavailable/indeterminate; no invented values |
+| Q30 | 100 synthetic runs + paginated logs | Bounded response, memory and disk retention behavior |
+| Q31 | Authorized cross-device HTTPS/VPN access smoke | Two browser clients can view mock UI; raw web port not exposed publicly |
+
+All Q19–Q30 are offline/mock tests. Q31 requires separate operator consent and access setup, not cloud GPU usage. No monitoring data older than the initial account snapshot may be invented. Upstream CLI's `usage` source reports current balance, aggregate CU/h and assignment count, not detailed transactions.
+
 ## Measurable developer experience
 
 - Proposed workflow: project init/validate/plan -> explicit approval -> up -> sync -> exec -> artifacts -> stop.
