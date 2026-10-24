@@ -42,6 +42,18 @@ from .transfer import TransferJournal, TransferRecord, TransferStatus
 DEFAULT_CHUNK_SIZE = 1024 * 1024  # 1 MiB chunks (multiple of 256 KiB)
 DEFAULT_DRIVE_ROOT_FOLDER = "Colab-Research"
 
+_SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+
+
+def _validate_safe_id(name: str, field: str = "identifier") -> str:
+    if not name or not isinstance(name, str) or not _SAFE_ID_PATTERN.match(name) or ".." in name or "/" in name or "\\" in name:
+        raise ArtifactValidationError(
+            f"Invalid {field} '{name}': contains illegal characters or path traversal sequence.",
+            details={field: str(name)},
+        )
+    return name
+
+
 
 @dataclass
 class DriveCredentials:
@@ -82,11 +94,15 @@ class DriveCredentials:
         if not p.is_file():
             raise DriveAuthenticationError(f"Drive credentials file not found: {p}")
         try:
+            mode = p.stat().st_mode
+            if mode & (stat.S_IRWXG | stat.S_IRWXO):
+                os.chmod(p, stat.S_IRUSR | stat.S_IWUSR)
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return cls(**data)
         except Exception as e:
             raise DriveAuthenticationError(f"Failed to read Drive credentials: {e}") from e
+
 
 
 class DriveHttpClient(Protocol):
@@ -147,7 +163,10 @@ class GoogleDriveArtifactStore:
         self.root_folder_name = root_folder_name
         self.staging_dir = Path(local_staging_dir).resolve()
         self.staging_dir.mkdir(parents=True, exist_ok=True)
+        if chunk_size <= 0 or chunk_size % (256 * 1024) != 0:
+            raise ValueError(f"chunk_size must be a positive multiple of 256 KiB (262144 bytes), got {chunk_size}")
         self.chunk_size = chunk_size
+
         self.max_retries = max_retries
         self.initial_backoff_sec = initial_backoff_sec
         self.http_client = http_client or StandardDriveHttpClient()
@@ -332,7 +351,13 @@ class GoogleDriveArtifactStore:
         """Resolve full hierarchical Drive folder path:
         Colab-Research -> projects -> <project-id> -> runs -> <run-id> [-> <subfolder>]
         """
+        _validate_safe_id(project_id, "project_id")
+        _validate_safe_id(run_id, "run_id")
+        if subfolder:
+            _validate_safe_id(subfolder, "subfolder")
+
         root_id = self._find_or_create_folder(self.root_folder_name, parent_id=None)
+
         projects_id = self._find_or_create_folder("projects", parent_id=root_id)
         proj_id = self._find_or_create_folder(project_id, parent_id=projects_id)
         runs_id = self._find_or_create_folder("runs", parent_id=proj_id)
@@ -375,8 +400,8 @@ class GoogleDriveArtifactStore:
             raise DriveTransferError(f"Drive API did not return Location header for resumable upload of '{filename}'")
         return location
 
-    def _query_upload_progress(self, session_url: str, total_size: int) -> int:
-        """Query Drive for how many bytes have been received in a resumable session."""
+    def _query_upload_progress(self, session_url: str, total_size: int) -> Tuple[int, Optional[Dict[str, Any]]]:
+        """Query Drive for received byte offset or completed upload response."""
         hdrs = {
             "content-range": f"bytes */{total_size}",
             "content-length": "0",
@@ -388,11 +413,17 @@ class GoogleDriveArtifactStore:
                 # range format: "bytes=0-1048575"
                 m = re.search(r"bytes=0-(\d+)", range_hdr)
                 if m:
-                    return int(m.group(1)) + 1
-            return 0
+                    return int(m.group(1)) + 1, None
+            return 0, None
         elif status in (200, 201):
-            return total_size
-        return 0
+            try:
+                res = json.loads(body.decode("utf-8"))
+                return total_size, res
+            except Exception:
+                return total_size, {}
+        elif status in (404, 410):
+            return 0, None
+        return 0, None
 
     def upload_file_resumable(
         self,
@@ -413,13 +444,18 @@ class GoogleDriveArtifactStore:
 
         uploaded_bytes = 0
         if transfer_record.bytes_transferred > 0:
-            uploaded_bytes = self._query_upload_progress(session_url, total_size)
+            uploaded_bytes, completed_meta = self._query_upload_progress(session_url, total_size)
+            if completed_meta:
+                transfer_record.bytes_transferred = total_size
+                transfer_record.remote_file_id = completed_meta.get("id")
+                self.journal.record_transfer(transfer_record)
+                return completed_meta
             transfer_record.bytes_transferred = uploaded_bytes
             self.journal.record_transfer(transfer_record)
 
         with open(src, "rb") as f:
-            f.seek(uploaded_bytes)
             while uploaded_bytes < total_size:
+                f.seek(uploaded_bytes)
                 chunk = f.read(self.chunk_size)
                 if not chunk:
                     break
@@ -434,36 +470,70 @@ class GoogleDriveArtifactStore:
                     "content-type": "application/octet-stream",
                 }
 
-                status, resp_headers, body = self.http_client.request("PUT", session_url, headers=hdrs, data=chunk)
+                chunk_backoff = self.initial_backoff_sec
+                for attempt in range(self.max_retries + 1):
+                    try:
+                        status, resp_headers, body = self.http_client.request("PUT", session_url, headers=hdrs, data=chunk)
+                    except Exception as ce:
+                        if attempt == self.max_retries:
+                            raise DriveTransferError(f"Chunk upload network failure after {self.max_retries} retries: {ce}") from ce
+                        time.sleep(chunk_backoff * (1.0 + random.uniform(0.1, 0.4)))
+                        chunk_backoff *= 2.0
+                        continue
 
-                if status == 308:
-                    uploaded_bytes += chunk_len
-                    transfer_record.bytes_transferred = uploaded_bytes
-                    self.journal.record_transfer(transfer_record)
-                elif status in (200, 201):
-                    # Finished upload
-                    res = json.loads(body.decode("utf-8"))
-                    transfer_record.bytes_transferred = total_size
-                    transfer_record.remote_file_id = res.get("id")
-                    self.journal.record_transfer(transfer_record)
-                    return res
-                else:
-                    error_msg = f"Resumable upload chunk failed (HTTP {status}): {body.decode('utf-8', errors='replace')}"
-                    transfer_record.last_error = error_msg
-                    self.journal.record_transfer(transfer_record)
-                    raise DriveTransferError(error_msg)
+                    if status == 308:
+                        uploaded_bytes += chunk_len
+                        transfer_record.bytes_transferred = uploaded_bytes
+                        self.journal.record_transfer(transfer_record)
+                        break
+                    elif status in (200, 201):
+                        res = json.loads(body.decode("utf-8"))
+                        transfer_record.bytes_transferred = total_size
+                        transfer_record.remote_file_id = res.get("id")
+                        self.journal.record_transfer(transfer_record)
+                        return res
+                    elif status in (404, 410):
+                        transfer_record.resumable_session_url = None
+                        self.journal.record_transfer(transfer_record)
+                        raise DriveTransferError(f"Resumable upload session expired or missing on Google Drive (HTTP {status})")
+                    elif status in (429, 500, 502, 503, 504):
+                        if attempt == self.max_retries:
+                            error_msg = f"Resumable upload chunk failed after {self.max_retries} retries (HTTP {status}): {body.decode('utf-8', errors='replace')}"
+                            transfer_record.last_error = error_msg
+                            self.journal.record_transfer(transfer_record)
+                            raise DriveTransferError(error_msg)
+                        time.sleep(chunk_backoff * (1.0 + random.uniform(0.1, 0.4)))
+                        chunk_backoff *= 2.0
+                        # Query upload progress to sync offset
+                        synced_offset, final_res = self._query_upload_progress(session_url, total_size)
+                        if final_res:
+                            return final_res
+                        if synced_offset > uploaded_bytes:
+                            uploaded_bytes = synced_offset
+                            break
+                        continue
+                    else:
+                        error_msg = f"Resumable upload chunk failed (HTTP {status}): {body.decode('utf-8', errors='replace')}"
+                        transfer_record.last_error = error_msg
+                        self.journal.record_transfer(transfer_record)
+                        raise DriveTransferError(error_msg)
 
         # If zero-byte file or final query
         if total_size == 0:
             hdrs = {
-                "content-range": f"bytes */0",
+                "content-range": "bytes */0",
                 "content-length": "0",
             }
             status, _, body = self.http_client.request("PUT", session_url, headers=hdrs)
             if status in (200, 201):
-                return json.loads(body.decode("utf-8"))
+                res = json.loads(body.decode("utf-8"))
+                transfer_record.bytes_transferred = 0
+                transfer_record.remote_file_id = res.get("id")
+                self.journal.record_transfer(transfer_record)
+                return res
 
         raise DriveTransferError(f"Upload completed without final 200/201 response for '{filename}'")
+
 
     def publish(
         self,

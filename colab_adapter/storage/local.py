@@ -6,6 +6,7 @@ manifest updates, and multi-tier checksum verification.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -14,6 +15,18 @@ from typing import Any, Dict, List, Optional, Union
 from ..errors import ArtifactNotFoundError, ArtifactValidationError
 from .base import ArtifactStore, ArtifactType, StoredArtifact, _utc_now_iso
 from .manifest import PublicationManifest, compute_file_md5, compute_file_sha256
+
+_SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+
+
+def _validate_safe_id(name: str, field: str = "identifier") -> str:
+    if not name or not isinstance(name, str) or not _SAFE_ID_PATTERN.match(name) or ".." in name or "/" in name or "\\" in name:
+        raise ArtifactValidationError(
+            f"Invalid {field} '{name}': contains illegal characters or path traversal sequence.",
+            details={field: str(name)},
+        )
+    return name
+
 
 
 class LocalArtifactStore:
@@ -28,9 +41,16 @@ class LocalArtifactStore:
         return "local"
 
     def _get_run_dir(self, project_id: str, run_id: str) -> Path:
-        run_dir = self.root_dir / "projects" / project_id / "runs" / run_id
+        _validate_safe_id(project_id, "project_id")
+        _validate_safe_id(run_id, "run_id")
+        run_dir = (self.root_dir / "projects" / project_id / "runs" / run_id).resolve()
+        try:
+            run_dir.relative_to(self.root_dir)
+        except ValueError:
+            raise ArtifactValidationError("Path traversal escape detected.")
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
+
 
     def _get_manifest_path(self, project_id: str, run_id: str) -> Path:
         return self._get_run_dir(project_id, run_id) / "manifest.json"
@@ -126,7 +146,17 @@ class LocalArtifactStore:
                 details={"artifact_id": artifact_id},
             )
 
+        stored_path = Path(meta.path).resolve()
+        try:
+            stored_path.relative_to(self.root_dir)
+        except ValueError:
+            raise ArtifactValidationError(
+                f"Path traversal escape detected in artifact path: {stored_path}",
+                details={"artifact_id": artifact_id, "path": str(stored_path)},
+            )
+
         dest = Path(destination).resolve()
+
         if dest.is_dir():
             dest = dest / Path(meta.path).name
 

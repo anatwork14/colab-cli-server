@@ -271,24 +271,28 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if not expected_token:
             return True  # Auth disabled (for local-only test mode)
 
+        import hmac
+        expected_bytes = expected_token.encode("utf-8")
+
         # Check Authorization header: Bearer <token>
         auth_header = self.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
-            if token == expected_token:
+            if hmac.compare_digest(token.encode("utf-8"), expected_bytes):
                 return True
 
         # Check X-API-Token header
         api_token = self.headers.get("X-API-Token", "")
-        if api_token == expected_token:
+        if api_token and hmac.compare_digest(api_token.encode("utf-8"), expected_bytes):
             return True
 
         # Check query parameters (?token=...)
         token_params = query_params.get("token", [])
-        if token_params and token_params[0] == expected_token:
+        if token_params and hmac.compare_digest(token_params[0].encode("utf-8"), expected_bytes):
             return True
 
         return False
+
 
     def _send_json(self, data: Any, status: int = 200) -> None:
         sanitized = sanitize_data(data)
@@ -542,8 +546,18 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
     def _handle_run_detail(self, path: str) -> None:
         parts = path.strip("/").split("/")
         # Path format: api/v1/runs/{run_id} or api/v1/runs/{run_id}/{sub_resource}
+        if len(parts) < 4:
+            self._send_json({"error": "Invalid run endpoint"}, status=400)
+            return
         run_id = parts[3]
+        if not re.match(r"^[a-zA-Z0-9_\-\.]+$", run_id) or ".." in run_id:
+            self._send_json(
+                {"error": "Invalid run_id", "message": "Identifier contains illegal characters or path traversal."},
+                status=400,
+            )
+            return
         events = self.server.telemetry.get_events(run_id=run_id)
+
 
         artifacts_root = getattr(self.server, "artifacts_dir", Path("./artifacts").resolve())
         manifest_data: Optional[Dict[str, Any]] = None
@@ -695,6 +709,11 @@ class MonitorServer(ThreadingHTTPServer):
                 f"Security violation: Monitor server attempted to bind to external interface '{host}'. "
                 "Only loopback (127.0.0.1) is permitted unless allow_external=True is explicitly set."
             )
+        if allow_external and not auth_token:
+            raise ValueError(
+                "Security violation: Monitor server allow_external=True requires a non-empty auth_token."
+            )
+
         super().__init__((host, port), MonitorRequestHandler)
         self.collector = collector
         self.registry = registry

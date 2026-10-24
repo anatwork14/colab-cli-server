@@ -13,6 +13,8 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import re
+import secrets
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -26,6 +28,19 @@ from .errors import (
     SessionNotFoundError,
     UnmanagedSessionError,
 )
+
+_SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+
+
+def _validate_safe_id(name: str, field_name: str = "identifier") -> str:
+    """Validate that identifier contains only alphanumeric, dash, dot, or underscore."""
+    if not name or not isinstance(name, str) or not _SAFE_ID_PATTERN.match(name) or ".." in name or "/" in name or "\\" in name:
+        raise ColabV2Error(
+            f"Invalid {field_name} '{name}': contains illegal characters or path traversal sequence.",
+            details={field_name: str(name)},
+        )
+    return name
+
 from .project_sessions import ProjectSession, ProjectSessionManager, ProjectSessionState
 from .provider import ManagedSessionRegistry
 from .storage.base import ArtifactStore, StoredArtifact, _utc_now_iso
@@ -61,7 +76,14 @@ class WorkspaceBroker:
         self.session_manager = session_manager
         self.telemetry = telemetry
         self.storage = storage
-        self.auth_tokens = set(auth_tokens or ["local-dev-token"])
+
+        if auth_tokens:
+            self.auth_tokens = set(auth_tokens)
+        else:
+            generated = secrets.token_urlsafe(32)
+            self.auth_tokens = {generated}
+
+        self.primary_token = next(iter(self.auth_tokens))
         self.artifacts_dir = Path(artifacts_dir).resolve()
 
         self._clients: Dict[str, ClientAttachSession] = {}
@@ -70,10 +92,11 @@ class WorkspaceBroker:
 
     def verify_token(self, token: Optional[str]) -> bool:
         """Verify client bearer token against authorized set with constant-time compare."""
-        if not token:
+        if not token or not isinstance(token, str):
             return False
+        token_bytes = token.encode("utf-8")
         for auth_token in self.auth_tokens:
-            if hmac.compare_digest(token, auth_token):
+            if hmac.compare_digest(token_bytes, auth_token.encode("utf-8")):
                 return True
         return False
 
@@ -89,8 +112,11 @@ class WorkspaceBroker:
     ) -> List[Dict[str, Any]]:
         """List all known active and historical runs."""
         self.authenticate_client(token)
+        if project_id:
+            _validate_safe_id(project_id, "project_id")
 
         runs: Dict[str, Dict[str, Any]] = {}
+
 
         # 1. Active runs from managed registry
         all_managed = self.registry.get_all_managed()
@@ -145,6 +171,7 @@ class WorkspaceBroker:
 
     def _find_historical_manifest(self, run_id: str) -> Optional[PublicationManifest]:
         """Find publication manifest for a historical run if on disk."""
+        _validate_safe_id(run_id, "run_id")
         proj_base = self.artifacts_dir / "projects"
         if not proj_base.is_dir():
             return None
@@ -170,6 +197,9 @@ class WorkspaceBroker:
         CRITICAL: Never provisions, triggers, or allocates a Colab VM.
         """
         self.authenticate_client(token)
+        _validate_safe_id(run_id, "run_id")
+        _validate_safe_id(client_id, "client_id")
+
 
         # Check managed session registry
         all_managed = self.registry.get_all_managed()
@@ -267,6 +297,10 @@ class WorkspaceBroker:
     ) -> List[Dict[str, Any]]:
         """Fetch list of verified local and Drive-published artifacts."""
         self.authenticate_client(token)
+        _validate_safe_id(run_id, "run_id")
+        if project_id:
+            _validate_safe_id(project_id, "project_id")
+
 
         results: List[Dict[str, Any]] = []
 

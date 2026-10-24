@@ -76,11 +76,6 @@ class MockDriveHttpClient:
         if self.quota_exceeded:
             return 403, {}, b'{"error": {"errors": [{"reason": "storageQuotaExceeded", "message": "Drive quota full"}]}}'
 
-        # Check transient server error simulation
-        if self.fail_next_n_chunks > 0:
-            self.fail_next_n_chunks -= 1
-            return 503, {}, b'{"error": {"message": "Backend Error"}}'
-
         # 2. Folder lookup or creation (files?q=...)
         if "drive/v3/files?q=" in url and method == "GET":
             # Return empty list to force creation or match
@@ -105,10 +100,15 @@ class MockDriveHttpClient:
 
             # Query progress (bytes */total)
             if "*/" in content_range:
-                if self.simulate_resume_interruption:
+                if self.simulate_resume_interruption or self.resumed_called:
                     self.resumed_called = True
                     return 308, {"range": "bytes=0-1048575"}, b""
                 return 308, {"range": "bytes=0-0"}, b""
+
+            # Fail next n chunk uploads
+            if self.fail_next_n_chunks > 0:
+                self.fail_next_n_chunks -= 1
+                return 503, {}, b'{"error": {"message": "Backend Error"}}'
 
             # Sending actual bytes
             if self.simulate_resume_interruption and not self.resumed_called:
@@ -199,10 +199,16 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
         data = b"Y" * (3 * 1024 * 1024)  # 3 MiB
         file_path.write_bytes(data)
 
-        # Enable simulated interruption on first attempt
+        # Pre-resolve folders so failure only happens during chunk upload
+        self.store.resolve_target_folder_id("my_project", "run_102", "checkpoints")
+
+        # Set max_retries=1 and fail so first upload attempt exhausts retries
+        self.store.max_retries = 1
+        self.mock_client.fail_next_n_chunks = 5
         self.mock_client.simulate_resume_interruption = True
 
-        # First attempt should fail transiently
+
+        # First attempt should fail transiently after retries
         with self.assertRaises(DriveTransferError):
             self.store.publish(
                 source=file_path,
@@ -215,6 +221,10 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
         record = self.store.journal.list_transfers(project_id="my_project", run_id="run_102")[0]
         self.assertEqual(record.status, "RETRY_PENDING")
 
+        # Clear simulated errors for second attempt
+        self.mock_client.fail_next_n_chunks = 0
+        self.store.max_retries = 5
+
         # Second publish call resumes from recorded session
         stored = self.store.publish(
             source=file_path,
@@ -224,6 +234,7 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
         )
         self.assertEqual(stored.size_bytes, len(data))
         self.assertEqual(self.store.journal.get_transfer(record.transfer_id).status, "PUBLISHED")
+
 
     def test_transient_error_retry_with_backoff(self):
         """Test transient HTTP 503 is retried automatically."""

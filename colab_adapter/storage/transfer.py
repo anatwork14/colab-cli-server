@@ -10,11 +10,18 @@ import json
 import os
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 
 from ..errors import InvalidStateTransitionError
 from .base import _utc_now_iso
@@ -105,14 +112,38 @@ class TransferRecord:
 
 
 class TransferJournal:
-    """Persistent, thread-safe store for transfer records."""
+    """Persistent, cross-process and thread-safe store for transfer records."""
 
     def __init__(self, journal_path: Union[str, Path]):
         self.path = Path(journal_path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self.lock_path = self.path.with_suffix(".lock")
+        self._thread_lock = threading.Lock()
         if not self.path.exists():
-            self._write_records({})
+            with self._acquire_locks():
+                if not self.path.exists():
+                    self._write_records({})
+
+    @contextmanager
+    def _acquire_locks(self):
+        """Cross-thread and cross-process file lock guard."""
+        with self._thread_lock:
+            lock_fd = None
+            if fcntl is not None:
+                try:
+                    lock_fd = os.open(str(self.lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                except (OSError, AttributeError):
+                    lock_fd = None
+            try:
+                yield
+            finally:
+                if lock_fd is not None:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                        os.close(lock_fd)
+                    except OSError:
+                        pass
 
     def _read_records(self) -> Dict[str, Dict[str, Any]]:
         try:
@@ -131,15 +162,15 @@ class TransferJournal:
         os.replace(str(tmp), str(self.path))
 
     def record_transfer(self, record: TransferRecord) -> None:
-        """Create or update a transfer record."""
-        with self._lock:
+        """Create or update a transfer record under lock."""
+        with self._acquire_locks():
             data = self._read_records()
             data[record.transfer_id] = record.to_dict()
             self._write_records(data)
 
     def get_transfer(self, transfer_id: str) -> Optional[TransferRecord]:
-        """Fetch transfer record by ID."""
-        with self._lock:
+        """Fetch transfer record by ID under lock."""
+        with self._acquire_locks():
             data = self._read_records()
             raw = data.get(transfer_id)
             if not raw:
@@ -152,8 +183,8 @@ class TransferJournal:
         run_id: Optional[str] = None,
         status: Optional[TransferStatus] = None,
     ) -> List[TransferRecord]:
-        """List transfers matching optional filters."""
-        with self._lock:
+        """List transfers matching optional filters under lock."""
+        with self._acquire_locks():
             data = self._read_records()
             results = []
             for raw in data.values():
@@ -168,8 +199,8 @@ class TransferJournal:
             return results
 
     def get_pending_transfers(self) -> List[TransferRecord]:
-        """Get all transfers that need to be processed or resumed."""
-        with self._lock:
+        """Get all transfers that need to be processed or resumed under lock."""
+        with self._acquire_locks():
             data = self._read_records()
             results = []
             for raw in data.values():
@@ -182,3 +213,4 @@ class TransferJournal:
                 ):
                     results.append(rec)
             return results
+
