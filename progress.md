@@ -30,7 +30,7 @@
 | --- | --- | --- | --- |
 | M0 | V1 baseline accepted | COMPLETE | PR #2, main commit above |
 | M1 | Feature compatibility and security contracts | COMPLETE | Issue #5, docs/UPSTREAM_COMPATIBILITY_V2.md, colab_adapter/errors.py, colab_adapter/capability.py; 55/55 tests pass |
-| M2 | Project manifest, validation and safe plan | NOT_STARTED | Schema, loader, examples and negative tests |
+| M2 | Project manifest, validation and safe plan | COMPLETE | Issue #6, colab_adapter/project_manifest.py, tests/test_project_manifest.py; 63/63 tests pass |
 | M3 | SSH transport and no-surprise-allocation boundary | NOT_STARTED | Offline SSH capability probe, mock 404/401/429; no live probe |
 | M4 | Content-addressed workspace sync | NOT_STARTED | Manifests, delta engine, push/pull, exclusions, safety tests |
 | M5 | Attach/update/execute/stop lifecycle | NOT_STARTED | Approved transitions, session-aware CLI and recovery |
@@ -44,6 +44,13 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-24 — Milestone M2 / Gate G2 COMPLETE (branch `feat/v2-m2-manifest`):**
+  - Implemented typed `ProjectSpec` in `colab_adapter/project_manifest.py` supporting schema_version 1, entrypoints, dependencies, arguments, accelerators, timeouts, and artifact declarations.
+  - Built robust manifest parser supporting stdlib JSON natively and PyYAML optionally.
+  - Implemented security validations: path canonicalization, path traversal rejection, symlink escape checks, and mandatory secret exclusions (`.git/**`, `.venv/**`, `.env*`, `*token*`, `*.pem`, `*.key`).
+  - Implemented `plan_project`: 100% offline file discovery, chunked SHA256 hashing, and transfer byte estimations without invoking subprocesses.
+  - Created test suite `tests/test_project_manifest.py` (8 tests). Full suite: **63 tests passed** in `3.58s` on Python 3.8 and `4.29s` on Python 3.12 (Q01, Q02, Q03, Q07, Q17).
+  - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated).
 - **2026-10-24 — Milestone M1 / Gate G1 COMPLETE (branch `feat/v2-m1-contracts`):**
   - Audited official `google-colab-cli v0.7.5` source code and live host behaviors.
   - Documented upstream matrix, error taxonomy, and threat model in `docs/UPSTREAM_COMPATIBILITY_V2.md`.

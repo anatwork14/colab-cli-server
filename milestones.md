@@ -27,12 +27,13 @@
 - **Gate G1 Satisfied:** 0 runtime spend, subprocess spy proves no allocating calls, SSH auto-allocation risk guarded and tested against TOCTOU.
 
 ## M2 — Project manifest & planning (G2)
-**Status: NOT_STARTED. Dependencies: M1.**
-- Introduce versioned manifest (e.g., colab.yaml) with project root, entrypoint, selected GPU, requirements, excludes, inputs/outputs, remote workspace, timeout and explicit session retention policy.
-- YAML requires optional dependency or strictly documented small format. A JSON manifest alternative is acceptable to preserve no-sudo/stdlib compatibility; DO NOT implement an unsafe home-grown YAML parser.
-- Manifest parser validates schema, relative roots, allowed runtime paths, symlink escapes, collisions, duplicate remote destinations, missing inputs, resource caps and credential files; stores schema_version.
-- Proposed CLI: project init, project validate, project plan --json; local-only dry-run by default.
-- **Accept:** example single-file and multi-module PyTorch project plans; invalid paths/symlinks/secrets rejected; no CLI allocation calls.
+**Status: COMPLETE (branch feat/v2-m2-manifest). Dependencies: M1.**
+- Introduced typed versioned `ProjectSpec` (schema_version 1) supporting root, entrypoint, GPU selection, execution timeout, session retention policy, dependencies, includes/excludes, and artifact destinations.
+- Supports native JSON manifest parsing with stdlib Python; optionally supports PyYAML when available. Fails closed with actionable error if YAML requested without PyYAML.
+- Comprehensive security validation: canonicalizes paths, strictly rejects path traversal (`..`), denies absolute paths in entrypoint/requirements/artifacts, detects and blocks symlink escapes pointing outside project root, and enforces mandatory exclusion of secrets (`.git/**`, `.venv/**`, `.env*`, `*token*`, `*.pem`, `*.key`, `__pycache__/**`).
+- Implemented `plan_project`: 100% offline file discovery, SHA256 file hashing, and transfer byte estimation without allocating cloud VMs or invoking subprocesses.
+- Added comprehensive unit and security test suite in `tests/test_project_manifest.py` (8 tests). Full suite: 63 tests passing.
+- **Gate G2 Satisfied:** Multi-module PyTorch project planned offline; path traversal and symlink escapes rejected; 0 allocating calls.
 
 ## M3 — SSH transport feasibility & safety (G3)
 **Status: NOT_STARTED. Dependencies: M1; parallelizable with M2.**
@@ -99,7 +100,7 @@
 | Gate | Evidence required | Status |
 | --- | --- | --- |
 | G1 | Upstream + threat contract + no-allocation feature probes | PASSED |
-| G2 | Manifest parser, plans, schema negative tests | NOT_STARTED |
+| G2 | Manifest parser, plans, schema negative tests | PASSED |
 | G3 | SSH or graceful fallback, no-surprise-billing tests | NOT_STARTED |
 | G4 | Secure delta sync, replay/rollback/path safety | NOT_STARTED |
 | G5 | Human approved lifecycle, state invariants, reuse | NOT_STARTED |

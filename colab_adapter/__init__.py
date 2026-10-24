@@ -44,6 +44,14 @@ from .capability import (
     CliCapabilities,
     SshSafetyGuard,
 )
+from .project_manifest import (
+    ProjectSpec,
+    discover_project_files,
+    init_project,
+    load_manifest,
+    plan_project,
+    validate_manifest,
+)
 
 __all__ = [
     "ColabGPUProvider",
@@ -87,4 +95,11 @@ __all__ = [
     "CapabilityProbe",
     "CliCapabilities",
     "SshSafetyGuard",
+    # V2 Project Manifest
+    "ProjectSpec",
+    "load_manifest",
+    "validate_manifest",
+    "plan_project",
+    "init_project",
+    "discover_project_files",
 ]
