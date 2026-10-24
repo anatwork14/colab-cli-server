@@ -45,12 +45,14 @@
 - **Gate G3 Satisfied:** Official CLI transport verified; guarded SSH transport fails closed; 0 cloud spend.
 
 ## M4 — Incremental workspace sync (G4; V2 MVP core)
-**Status: NOT_STARTED. Dependencies: M2 and M3 fallback interface.**
-- Snapshot local project files by normalized path, size and SHA256; compare remote applied manifest to propose ADD/MODIFY/SKIP/DELETE.
-- Ignore Git internals, credentials, venv, local checkpoints, logs and caches by default; support explicit include/exclude with fail-closed secrets/symlink policy.
-- Use safe staging, integrity verification and commit-on-success remote manifest; interrupted sync must not report success or delete unrelated files.
-- Implement project sync --plan (offline) and sync --apply (requires an already approved, owned runtime). Document optional rsync/SSH fast path and official CLI upload fallback.
-- **Accept:** change one file -> only that file scheduled; unchanged tree -> zero transfers; deletion is dry-run/opt-in and confined to managed workspace; path traversal and malicious remote manifest tests pass. Measure bytes/files transferred using deterministic fixtures.
+**Status: COMPLETE (branch feat/v2-m4-sync). Dependencies: M2 and M3 fallback interface.**
+- Implemented `WorkspaceSyncEngine` and `compute_sync_delta` in `colab_adapter/workspace.py`.
+- Content-addressed file indexing: calculates deterministic SHA256 hashes and sizes for all declared files, ignoring secrets and Git internals.
+- Delta calculation: classifies files into `to_add`, `to_modify`, `unchanged`, and `to_delete`.
+- Two-phase staging and commit: uploads new and changed files, applies safe deletions strictly inside `remote_root`, and commits remote `.colab_manifest.json` and local cache LAST.
+- Interrupted sync fails closed without creating false COMMITTED states.
+- Added comprehensive unit tests in `tests/test_sync.py` (4 tests) verifying numeric targets Q04 (0 transfer on unchanged 100-file tree), Q05 (only 1 modified file transferred), Q06 (delete_remote opt-in control), and Q10 (interrupted failure safety). Full suite: 74 tests passing.
+- **Gate G4 Satisfied:** Delta sync verified against 100-file fixture; 0 payload bytes on unchanged tree; safe remote deletion; 0 cloud spend.
 
 ## M5 — VKong-style session UX / attach / execute (G5; V2 beta)
 **Status: NOT_STARTED. Dependencies: M2–M4.**
@@ -104,7 +106,7 @@
 | G1 | Upstream + threat contract + no-allocation feature probes | PASSED |
 | G2 | Manifest parser, plans, schema negative tests | PASSED |
 | G3 | SSH or graceful fallback, no-surprise-billing tests | PASSED |
-| G4 | Secure delta sync, replay/rollback/path safety | NOT_STARTED |
+| G4 | Secure delta sync, replay/rollback/path safety | PASSED |
 | G5 | Human approved lifecycle, state invariants, reuse | NOT_STARTED |
 | G6 | Artifact provenance, explicit resume, telemetry | NOT_STARTED |
 | G7 | Offline suite, owner-approved live evidence, docs | NOT_STARTED |

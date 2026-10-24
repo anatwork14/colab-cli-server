@@ -49,6 +49,11 @@ from .transports import (
     OfficialCliTransport,
     SshProxyTransport,
 )
+from .workspace import (
+    SyncDelta,
+    WorkspaceSyncEngine,
+    compute_sync_delta,
+)
 from .project_manifest import (
     ProjectSpec,
     discover_project_files,
@@ -103,6 +108,9 @@ __all__ = [
     "BaseTransport",
     "OfficialCliTransport",
     "SshProxyTransport",
+    "SyncDelta",
+    "WorkspaceSyncEngine",
+    "compute_sync_delta",
     # V2 Project Manifest
     "ProjectSpec",
     "load_manifest",

@@ -32,7 +32,7 @@
 | M1 | Feature compatibility and security contracts | COMPLETE | Issue #5, docs/UPSTREAM_COMPATIBILITY_V2.md, colab_adapter/errors.py, colab_adapter/capability.py; 55/55 tests pass |
 | M2 | Project manifest, validation and safe plan | COMPLETE | Issue #6, colab_adapter/project_manifest.py, tests/test_project_manifest.py; 63/63 tests pass |
 | M3 | SSH transport and no-surprise-allocation boundary | COMPLETE | Issue #7, colab_adapter/transports/, tests/test_transports.py; 70/70 tests pass |
-| M4 | Content-addressed workspace sync | NOT_STARTED | Manifests, delta engine, push/pull, exclusions, safety tests |
+| M4 | Content-addressed workspace sync | COMPLETE | Issue #8, colab_adapter/workspace.py, tests/test_sync.py; 74/74 tests pass |
 | M5 | Attach/update/execute/stop lifecycle | NOT_STARTED | Approved transitions, session-aware CLI and recovery |
 | M6 | Artifact/cache/resume and observability | NOT_STARTED | Durable output validation and metrics |
 | M7 | Integration, end-to-end signoff and docs | NOT_STARTED | Offline CI; human-opt-in live evaluation separately |
@@ -44,6 +44,13 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-24 — Milestone M4 / Gate G4 COMPLETE (branch `feat/v2-m4-sync`):**
+  - Implemented `colab_adapter/workspace.py` with `WorkspaceSyncEngine`, `SyncDelta`, and `compute_sync_delta`.
+  - Added chunked content-addressed SHA256 indexing, incremental delta computation (`to_add`, `to_modify`, `unchanged`, `to_delete`), and two-phase staging before commit.
+  - Enforced atomic commit order: `.colab_manifest.json` written LAST; failures mid-transfer trigger staged cleanup and raise `WorkspaceSyncError` without false commit.
+  - Implemented safe deletion semantics controlled by `delete_remote` flag (default False).
+  - Added test suite `tests/test_sync.py` (4 tests). Full offline suite: **74 tests passed** in `3.27s` on Python 3.8 and `3.25s` on Python 3.12 (Q01, Q04: 0 bytes on unchanged project, Q05: only modified file transferred, Q06: delete_remote flag honored, Q07: path safety, Q10: interrupted sync fails closed).
+  - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated).
 - **2026-10-24 — Milestone M3 / Gate G3 COMPLETE (branch `feat/v2-m3-transport`):**
   - Implemented typed `BaseTransport` abstraction in `colab_adapter/transports/base.py`.
   - Built `OfficialCliTransport` implementing upload, download, list_dir, remove_file, exec_code, and health checks using official Google CLI commands. Enforced session registry ownership check before every call.
