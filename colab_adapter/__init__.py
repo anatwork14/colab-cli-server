@@ -19,6 +19,7 @@ from .provider import (
     ManagedSessionRegistry,
     PreparedJob,
     PythonVersionError,
+    RegistryCorruptedError,
     RemoteExecutionError,
     UnsupportedGPUError,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "RemoteExecutionError",
     "ArtifactMissingError",
     "CleanupError",
+    "RegistryCorruptedError",
     "ColabProcessLock",
     "ManagedSessionRegistry",
 ]

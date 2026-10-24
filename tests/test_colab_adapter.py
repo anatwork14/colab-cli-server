@@ -27,6 +27,7 @@ Tests all failure modes, session ownership, tamper resistance, and security cont
 from __future__ import annotations
 
 import io
+import json
 import os
 import subprocess
 import tempfile
@@ -52,6 +53,7 @@ from colab_adapter.provider import (
     ManagedSessionRegistry,
     PreparedJob,
     PythonVersionError,
+    RegistryCorruptedError,
     RemoteExecutionError,
     UnsupportedGPUError,
     check_disk_space,
@@ -748,6 +750,169 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
         with mock.patch.dict("sys.modules", {"torch": mock_torch}):
             ok = verify_checkpoint(chk_dir)
             self.assertFalse(ok)
+
+    # 30. Concurrent reconcile does NOT stop actively provisioning session
+    def test_concurrent_reconcile_does_not_stop_actively_provisioning_session(self):
+        # Context 1: Actively provisioning job registered with current PID
+        active_session = "in-flight-prov-1"
+        self.registry.register(active_session, "job-prov-1", "T4", "proj", pid=os.getpid())
+
+        cli_output = f"[{active_session}] endpoint-1 | Hardware: T4 | Shape: STANDARD | Variant: GPU\n"
+
+        # Context 1 holds the execution lock (simulating submit_job in-flight)
+        provider1_lock = self.lock
+        self.assertTrue(provider1_lock.acquire(blocking=False))
+
+        try:
+            # Context 2: Independent provider/process calling reconcile_stale_sessions
+            provider2 = ColabGPUProvider(
+                cli_executable="/usr/local/bin/colab",
+                tracker=self.tracker,
+                registry=self.registry,
+                lock=ColabProcessLock(lock_path=self.base_dir / "test.lock"),
+            )
+
+            with mock.patch.object(provider2, "_check_auth_credentials", return_value=(True, None)):
+                with mock.patch.object(provider2, "_run_cli") as mock_cli:
+                    def side_effect(cmd_args, *args, **kwargs):
+                        if cmd_args[0] == "sessions":
+                            return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout=cli_output, stderr="")
+                        elif cmd_args[0] == "stop":
+                            return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="Stopped", stderr="")
+                        return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="", stderr="")
+
+                    mock_cli.side_effect = side_effect
+
+                    # Context 2 runs reconcile_stale_sessions(auto_stop=True)
+                    res = provider2.reconcile_stale_sessions(auto_stop=True, stale_provisioning_timeout=300.0)
+
+                    # Actively provisioning session must NOT be in stale_managed
+                    self.assertNotIn(active_session, res["stale_managed"])
+                    self.assertEqual(res["stopped"], [])
+
+                    # colab stop must NEVER have been called on in-flight session
+                    stop_calls = [c for c in mock_cli.call_args_list if c[0][0][0] == "stop"]
+                    self.assertEqual(len(stop_calls), 0)
+
+                    # Session remains PROVISIONING in registry
+                    self.assertEqual(self.registry.get_all_managed()[active_session]["state"], "PROVISIONING")
+        finally:
+            provider1_lock.release()
+
+    # 31. Reconcile stops abandoned provisioning session (dead PID or expired lease)
+    def test_reconcile_stale_sessions_stops_abandoned_provisioning_session(self):
+        abandoned_session = "abandoned-prov-1"
+        # Register with dead/nonexistent PID
+        self.registry.register(abandoned_session, "job-dead-1", "T4", "proj", pid=9999999)
+
+        cli_output = f"[{abandoned_session}] endpoint-1 | Hardware: T4 | Shape: STANDARD | Variant: GPU\n"
+
+        with mock.patch.object(self.provider, "_check_auth_credentials", return_value=(True, None)):
+            with mock.patch.object(self.provider, "_run_cli") as mock_cli:
+                def side_effect(cmd_args, *args, **kwargs):
+                    if cmd_args[0] == "sessions":
+                        return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout=cli_output, stderr="")
+                    elif cmd_args[0] == "stop":
+                        return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="Stopped", stderr="")
+                    return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="", stderr="")
+
+                mock_cli.side_effect = side_effect
+
+                res = self.provider.reconcile_stale_sessions(auto_stop=True)
+                self.assertIn(abandoned_session, res["stale_managed"])
+                self.assertIn(abandoned_session, res["stopped"])
+
+                # Registry updated to TERMINATED
+                self.assertEqual(self.registry.get_all_managed()[abandoned_session]["state"], "TERMINATED")
+
+    # 32. Registry atomic write and corruption recovery from backup
+    def test_registry_atomic_write_and_corruption_recovery_from_backup(self):
+        reg_path = self.base_dir / "recovery_test_sessions.json"
+        reg = ManagedSessionRegistry(registry_path=reg_path)
+
+        # Register two sessions so .bak is created
+        reg.register("sess-1", "job-1", "T4", "proj")
+        reg.register("sess-2", "job-2", "T4", "proj")
+        self.assertTrue(reg_path.exists())
+        self.assertTrue(reg.bak_path.exists())
+
+        # Corrupt the main registry file with malformed JSON
+        reg_path.write_text('{"sess-1": {"state": "PROVISIONING", incomplete_json', encoding="utf-8")
+
+        # Invalidate in-memory cache to force reading from disk
+        reg._in_memory_cache = None
+
+        # Reading registry should archive corrupt file, recover from .bak, and succeed
+        self.assertTrue(reg.is_managed("sess-1"))
+        self.assertTrue(reg.is_managed("sess-2"))
+
+        # Verify a .corrupt.<timestamp> file was created
+        corrupt_files = list(self.base_dir.glob("recovery_test_sessions.json.corrupt.*"))
+        self.assertTrue(len(corrupt_files) > 0)
+
+        # Verify main registry file was healed with valid JSON
+        with open(reg_path, "r", encoding="utf-8") as f:
+            healed = json.load(f)
+        self.assertIn("sess-1", healed)
+        self.assertIn("sess-2", healed)
+
+    # 33. Registry unrecoverable corruption fails closed
+    def test_registry_unrecoverable_corruption_fails_closed(self):
+        reg_path = self.base_dir / "fail_closed_sessions.json"
+        reg = ManagedSessionRegistry(registry_path=reg_path)
+
+        # Write corrupt content without any backup
+        reg_path.write_text("{corrupt garbage", encoding="utf-8")
+        if reg.bak_path.exists():
+            reg.bak_path.unlink()
+        reg._in_memory_cache = None
+
+        # Fail closed: must raise RegistryCorruptedError and NEVER return empty dict
+        with self.assertRaises(RegistryCorruptedError) as ctx:
+            reg.get_all_managed()
+        self.assertIn("is corrupted and could not be recovered", str(ctx.exception))
+
+        # is_managed also fails closed
+        with self.assertRaises(RegistryCorruptedError):
+            reg.is_managed("some-session")
+
+    # 34. Concurrent registry updates serialization
+    def test_concurrent_registry_updates(self):
+        import threading
+        reg_path = self.base_dir / "concurrent_sessions.json"
+        reg = ManagedSessionRegistry(registry_path=reg_path)
+
+        num_threads = 8
+        items_per_thread = 10
+        errors = []
+
+        def worker(thread_idx: int):
+            try:
+                # Use a separate registry instance pointing to the same file path to test inter-instance flock
+                local_reg = ManagedSessionRegistry(registry_path=reg_path)
+                for i in range(items_per_thread):
+                    session_id = f"sess-t{thread_idx}-{i}"
+                    local_reg.register(session_id, f"job-{thread_idx}-{i}", "T4", "proj")
+                    local_reg.update_state(session_id, "ACTIVE")
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(errors), 0, f"Errors in concurrent workers: {errors}")
+
+        all_sessions = reg.get_all_managed()
+        expected_total = num_threads * items_per_thread
+        self.assertEqual(len(all_sessions), expected_total)
+        for thread_idx in range(num_threads):
+            for i in range(items_per_thread):
+                s_id = f"sess-t{thread_idx}-{i}"
+                self.assertIn(s_id, all_sessions)
+                self.assertEqual(all_sessions[s_id]["state"], "ACTIVE")
 
 
 if __name__ == "__main__":

@@ -36,8 +36,10 @@ It implements `ColabGPUProvider`, `ManagedSessionRegistry`, `ColabProcessLock`, 
 
 1. **Session Ownership & Protection of Unrelated Work:**
    The adapter maintains a local registry (`~/.colab_experiments/managed_sessions.json`) tracking only sessions provisioned by itself.
+   - `ManagedSessionRegistry` uses write-to-temp, `fsync`, atomic `os.replace`, and serialization across threads and processes via `fcntl.flock`. It maintains an automatic `.bak` backup on every successful write. Corrupted JSON triggers an archival of the corrupted payload and recovery from backup; if unrecoverable, it fails closed (raising `RegistryCorruptedError`) rather than silently discarding session ownership.
    - `cancel_job(session_id)` immediately refuses requests for sessions not registered as managed by this adapter, returning `False` without invoking remote termination.
    - One-shot jobs (`stateful=False`) are pre-registered with deterministic IDs passed explicitly via `colab run -s <session_id>`. If the local subprocess times out or is interrupted, the adapter explicitly attempts cleanup of the registered session.
+   - `reconcile_stale_sessions(auto_stop=True)` never terminates actively provisioning or in-flight sessions: it verifies owning process liveness (`pid`), enforces a bounded provisioning age threshold, and synchronizes with the GPU execution lock to avoid stopping in-flight allocations.
    - `cleanup()` and `reconcile_stale_sessions()` strictly terminate only registered managed sessions.
    - Unmanaged user sessions on the account are detected, reported, and left completely untouched.
 

@@ -16,6 +16,7 @@ Key Safety & Reliability Controls:
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -91,6 +92,25 @@ class DiskSpaceError(ColabProviderError):
 
 class CleanupError(ColabProviderError):
     """Raised when runtime teardown fails."""
+
+
+class RegistryCorruptedError(ColabProviderError):
+    """Raised when managed session registry is corrupted and cannot be safely recovered."""
+
+
+def is_process_running(pid: Optional[int]) -> bool:
+    """Check if process with given PID is currently active on the host."""
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 def check_disk_space(target_path: Path, min_free_mb: int = 500) -> None:
@@ -183,72 +203,191 @@ class ColabProcessLock:
 
 
 class ManagedSessionRegistry:
-    """Registry tracking Colab sessions created by this adapter.
+    """Crash-safe, atomic, and serialized registry tracking Colab sessions created by this adapter.
 
     Guarantees that the adapter only manages, monitors, and cleans up its own sessions,
     never interfering with unrelated user sessions on the same account.
+    All disk mutations are serialized via flock and thread locks, written to a temporary
+    file with fsync, and committed via atomic os.replace.
+    Maintains a recoverable .bak backup on every write. If a corrupt JSON payload is detected,
+    it archives the corrupted copy, attempts recovery from backup, and fails closed
+    (raising RegistryCorruptedError) instead of silently discarding ownership.
     """
+
+    _path_locks: Dict[Path, threading.Lock] = {}
+    _path_locks_guard = threading.Lock()
 
     def __init__(self, registry_path: Optional[Path] = None):
         if registry_path is None:
             registry_path = Path.home() / ".colab_experiments" / "managed_sessions.json"
         self.registry_path = Path(registry_path)
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        self.bak_path = self.registry_path.with_suffix(".bak")
+        self._lock_path = self.registry_path.with_name(self.registry_path.name + ".lock")
+        self._thread_lock = self._get_thread_lock(self._lock_path)
+        self._in_memory_cache: Optional[Dict[str, Any]] = None
 
-    def _read(self) -> Dict[str, Any]:
+    @classmethod
+    def _get_thread_lock(cls, path: Path) -> threading.Lock:
+        with cls._path_locks_guard:
+            resolved = path.resolve()
+            if resolved not in cls._path_locks:
+                cls._path_locks[resolved] = threading.Lock()
+            return cls._path_locks[resolved]
+
+    @contextlib.contextmanager
+    def _lock(self):
+        """Acquire both thread lock and non-reentrant process file lock for read-modify-write serialization."""
+        with self._thread_lock:
+            fd = os.open(str(self._lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _archive_corrupt_file(self) -> Path:
+        ts = int(time.time() * 1000)
+        corrupt_path = self.registry_path.with_name(f"{self.registry_path.name}.corrupt.{ts}")
+        try:
+            if self.registry_path.exists():
+                shutil.copy2(str(self.registry_path), str(corrupt_path))
+        except OSError:
+            pass
+        return corrupt_path
+
+    def _read_locked(self) -> Dict[str, Any]:
+        """Read registry while lock is held, with automatic recovery from backup on corruption."""
         if not self.registry_path.exists():
+            if self.bak_path.exists():
+                try:
+                    with open(self.bak_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        self._in_memory_cache = data
+                        return dict(data)
+                except (json.JSONDecodeError, OSError):
+                    pass
             return {}
+
         try:
             with open(self.registry_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {}
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise json.JSONDecodeError("Registry root must be a JSON object", "", 0)
+            self._in_memory_cache = data
+            return dict(data)
+        except (json.JSONDecodeError, OSError) as e:
+            corrupt_path = self._archive_corrupt_file()
+            print(
+                f"WARNING: Corrupted registry detected at {self.registry_path}: {e}. "
+                f"Archived corrupted copy to {corrupt_path}. Attempting recovery from backup...",
+                file=sys.stderr,
+            )
 
-    def _write(self, data: Dict[str, Any]) -> None:
+            # 1. Try to recover from .bak file
+            if self.bak_path.exists():
+                try:
+                    with open(self.bak_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        print(f"Successfully recovered {len(data)} sessions from {self.bak_path}.", file=sys.stderr)
+                        self._atomic_write_locked(data)
+                        self._in_memory_cache = data
+                        return dict(data)
+                except (json.JSONDecodeError, OSError) as be:
+                    print(f"Backup file {self.bak_path} also unreadable: {be}", file=sys.stderr)
+
+            # 2. Try to recover from in-memory cache if available in this process
+            if self._in_memory_cache is not None:
+                print("Recovering registry state from in-memory cache.", file=sys.stderr)
+                self._atomic_write_locked(self._in_memory_cache)
+                return dict(self._in_memory_cache)
+
+            # 3. Fail closed: do NOT silently discard ownership
+            raise RegistryCorruptedError(
+                f"Managed session registry at {self.registry_path} is corrupted and could not be recovered. "
+                f"A backup of the corrupted file was preserved at {corrupt_path}."
+            ) from e
+
+    def _atomic_write_locked(self, data: Dict[str, Any]) -> None:
+        """Write data to temporary file with fsync and atomically replace target while holding lock."""
+        tmp_path = self.registry_path.with_name(
+            f"{self.registry_path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{time.time()}"
+        )
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        fd = os.open(str(self.registry_path), flags, 0o600)
+        fd = os.open(str(tmp_path), flags, 0o600)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(str(tmp_path), str(self.registry_path))
+            try:
+                shutil.copy2(str(self.registry_path), str(self.bak_path))
+            except OSError:
+                pass
+            self._in_memory_cache = dict(data)
         except Exception:
             try:
-                os.close(fd)
+                if tmp_path.exists():
+                    tmp_path.unlink()
             except OSError:
                 pass
             raise
 
-    def register(self, session_id: str, job_id: str, gpu: str, project_name: str) -> None:
-        data = self._read()
-        data[session_id] = {
-            "session_id": session_id,
-            "job_id": job_id,
-            "gpu": gpu,
-            "project_name": project_name,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "state": "PROVISIONING",
-        }
-        self._write(data)
+    def register(
+        self,
+        session_id: str,
+        job_id: str,
+        gpu: str,
+        project_name: str,
+        pid: Optional[int] = None,
+    ) -> None:
+        with self._lock():
+            data = self._read_locked()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            data[session_id] = {
+                "session_id": session_id,
+                "job_id": job_id,
+                "gpu": gpu,
+                "project_name": project_name,
+                "pid": pid if pid is not None else os.getpid(),
+                "created_at": now_iso,
+                "updated_at": now_iso,
+                "state": "PROVISIONING",
+            }
+            self._atomic_write_locked(data)
 
     def update_state(self, session_id: str, state: str) -> None:
-        data = self._read()
-        if session_id in data:
-            data[session_id]["state"] = state
-            data[session_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
-            self._write(data)
+        with self._lock():
+            data = self._read_locked()
+            if session_id in data:
+                data[session_id]["state"] = state
+                data[session_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._atomic_write_locked(data)
 
     def is_managed(self, session_id: str) -> bool:
-        data = self._read()
-        return session_id in data
+        with self._lock():
+            data = self._read_locked()
+            return session_id in data
 
     def get_active_managed(self) -> List[str]:
-        data = self._read()
-        return [
-            s_id for s_id, info in data.items()
-            if info.get("state") in ("PROVISIONING", "ACTIVE", "INTERRUPTED", "NEEDS_RECONCILIATION")
-        ]
+        with self._lock():
+            data = self._read_locked()
+            return [
+                s_id for s_id, info in data.items()
+                if info.get("state") in ("PROVISIONING", "ACTIVE", "INTERRUPTED", "NEEDS_RECONCILIATION")
+            ]
 
     def get_all_managed(self) -> Dict[str, Any]:
-        return self._read()
+        with self._lock():
+            return self._read_locked()
 
 
 def parse_session_lines(output: str) -> List[Dict[str, str]]:
@@ -930,11 +1069,16 @@ class ColabGPUProvider:
 
         return {"stopped": stopped, "failed": failed, "unmanaged_ignored": unmanaged_ignored}
 
-    def reconcile_stale_sessions(self, auto_stop: bool = False) -> Dict[str, Any]:
+    def reconcile_stale_sessions(
+        self,
+        auto_stop: bool = False,
+        stale_provisioning_timeout: float = 300.0,
+    ) -> Dict[str, Any]:
         """Inspect and reconcile managed Colab sessions against tracked state.
 
         Only stops sessions registered to this adapter that are in stale states.
         Leaves unmanaged user sessions strictly untouched.
+        Never terminates an actively provisioning or in-flight allocation.
         """
         avail = self.check_availability()
         active_managed = avail.get("active_sessions", [])
@@ -942,22 +1086,67 @@ class ColabGPUProvider:
 
         stale_managed = []
         all_managed = self.registry.get_all_managed()
+        now = datetime.now(timezone.utc)
+
         for session_name in active_managed:
             info = all_managed.get(session_name, {})
-            # If state is PROVISIONING, INTERRUPTED, or NEEDS_RECONCILIATION, it is stale
-            if info.get("state") in ("PROVISIONING", "INTERRUPTED", "NEEDS_RECONCILIATION"):
+            state = info.get("state")
+            pid = info.get("pid")
+
+            owner_alive = is_process_running(pid) if pid else False
+
+            created_str = info.get("created_at")
+            updated_str = info.get("updated_at") or created_str
+            age_seconds = 0.0
+            if updated_str:
+                try:
+                    dt = datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
+                    age_seconds = (now - dt).total_seconds()
+                except Exception:
+                    age_seconds = 0.0
+
+            if state == "PROVISIONING":
+                # Safe lease/ownership check:
+                # If the owning process is still alive and has not exceeded the bounded provisioning
+                # threshold, it is actively in-flight. It must NEVER be treated as stale or stopped.
+                if owner_alive and age_seconds < stale_provisioning_timeout:
+                    continue
                 stale_managed.append(session_name)
+
+            elif state in ("INTERRUPTED", "NEEDS_RECONCILIATION"):
+                stale_managed.append(session_name)
+
+            elif state == "ACTIVE":
+                # If marked active but owner process died and timeout elapsed
+                if not owner_alive and age_seconds >= stale_provisioning_timeout:
+                    stale_managed.append(session_name)
 
         stopped = []
         failed = []
+        skipped_locked = []
+
         if auto_stop and stale_managed:
-            for session in stale_managed:
-                res = self._run_cli(["stop", "-s", session], timeout=60.0)
-                if res.returncode == 0:
-                    stopped.append(session)
-                    self.registry.update_state(session, "TERMINATED")
-                else:
-                    failed.append(session)
+            # Synchronize with execution lock so we never race with an active dispatch/allocation
+            if not self.lock.acquire(blocking=False):
+                return {
+                    "active_managed": active_managed,
+                    "stale_managed": stale_managed,
+                    "unmanaged_ignored": unmanaged,
+                    "stopped": [],
+                    "failed": [],
+                    "skipped_locked": stale_managed,
+                    "message": "Reconciliation auto_stop skipped: execution lock is currently held by an in-flight job.",
+                }
+            try:
+                for session in stale_managed:
+                    res = self._run_cli(["stop", "-s", session], timeout=60.0)
+                    if res.returncode == 0:
+                        stopped.append(session)
+                        self.registry.update_state(session, "TERMINATED")
+                    else:
+                        failed.append(session)
+            finally:
+                self.lock.release()
 
         return {
             "active_managed": active_managed,
@@ -965,4 +1154,5 @@ class ColabGPUProvider:
             "unmanaged_ignored": unmanaged,
             "stopped": stopped,
             "failed": failed,
+            "skipped_locked": skipped_locked,
         }
