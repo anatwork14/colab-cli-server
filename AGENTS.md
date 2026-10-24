@@ -40,3 +40,15 @@ Make the official [googlecolab/google-colab-cli](https://github.com/googlecolab/
 - Final report states what was verified locally, what was not tested against Colab, and whether a remote VM was used.
 
 See [agent setup steps](docs/AGENT_SETUP.md) and the [copyable prompt](docs/AGENT_SETUP_PROMPT.md).
+
+## V2 project workspace development (planned, not authorized deployment)
+
+Before beginning V2, read [progress.md](progress.md), [milestones.md](milestones.md), [docs/FEATURES_V2.md](docs/FEATURES_V2.md), [docs/ARCHITECTURE_V2.md](docs/ARCHITECTURE_V2.md), [docs/EXPECTED_RESULTS_V2.md](docs/EXPECTED_RESULTS_V2.md) and [docs/AGENT_IMPLEMENTATION_V2.md](docs/AGENT_IMPLEMENTATION_V2.md). The documents define milestone gates; they do not authorize GPU allocation.
+
+Mandatory V2 constraints:
+- Treat official Colab SSH-over-WebSocket as **optional and potentially auto-provisioning**, not a guaranteed no-allocation connection. An already-owned session preflight alone is insufficient protection against races; until a hard authorization/no-create boundary is established, fail closed or use official CLI file operations instead.
+- Planning, validation, local source hashing and dry-run diffs must be offline/no-allocation by construction. Runtime creation, retention or tests against live Colab always require explicit human approval. Never spoof a prompt or pass credentials through agents.
+- Sync only declared project files in a confined remote root, reject secrets and path escapes, and make remote deletion opt-in. Never copy all of the user's home directory or rewrite GPU drivers.
+- Keep the standard-library wrapper compatible with Python >=3.8 and Google's CLI separately installed with Python >=3.12. Do not modify unrelated local GPU workloads.
+- Preserve V1 API, registry/session ownership, locking, tracking and tests. Work in small feature branches/PRs, update progress.md and milestones.md with evidence, do not auto-merge/deploy.
+- Do not report feature completion from mocks as proof of live remote performance. Distinguish planned, offline proven and owner-approved live proven results.

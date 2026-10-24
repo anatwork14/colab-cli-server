@@ -149,3 +149,19 @@ Tests mock subprocesses and never contact Google or allocate a runtime. Contribu
 ## License and attribution
 
 This wrapper and its documentation are licensed under [MIT](LICENSE). Google's `google-colab-cli` is a separate upstream project governed by its own Apache-2.0 license and Colab service terms. No upstream code is vendored here.
+
+## V2 roadmap — VKong-inspired project workspaces (PLANNED)
+
+The merged V1 adapter runs individual Python scripts remotely and supports stateful input/output transfer. **V2 is a proposed, not yet implemented, project-centric workflow**: versioned project manifests, safe plans, incremental source synchronization, optional SSH-over-WebSocket to approved existing Colab sessions, attached execution, checkpoint continuity and structured observability.
+
+Colab will still execute on a separate temporary VM. This project does not provide local transparent CUDA forwarding, an always-on GPU, guaranteed GPU availability, or an endorsement/integration with VKong. Official Colab SSH can implicitly allocate a runtime; the V2 design must prevent unapproved allocation or disable that transport.
+
+**Implementation source of truth:**
+- [Progress ledger](progress.md) — existing vs planned work and evidence
+- [Milestones](milestones.md) — M0-M8 and release gates
+- [V2 features](docs/FEATURES_V2.md) — F01-F14, manifest and proposed CLI
+- [V2 architecture](docs/ARCHITECTURE_V2.md) — transport/registry/sync/approval threat model
+- [Expected results](docs/EXPECTED_RESULTS_V2.md) — measurable acceptance targets (not actual results)
+- [Agent implementation instructions](docs/AGENT_IMPLEMENTATION_V2.md) — worker ownership, PR process and safety
+
+**Do not run V2 example project commands yet:** they illustrate intended APIs and are not present in the installed CLI. Existing V1 commands documented above remain usable.
