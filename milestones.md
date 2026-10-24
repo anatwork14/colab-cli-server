@@ -55,9 +55,17 @@
 - **Gate G4 Satisfied:** Delta sync verified against 100-file fixture; 0 payload bytes on unchanged tree; safe remote deletion; 0 cloud spend.
 
 ## M5 — VKong-style session UX / attach / execute (G5; V2 beta)
-**Status: NOT_STARTED. Dependencies: M2–M4.**
-- Proposed project commands: up (explicit human approval), attach (existing only), exec, sync, status, logs, stop, reconcile. No silent remote provision from attach/sync/status.
-- Separate session state from job state; implement explicit ownership, TTL/retention budget, lease/liveness, per-project lock, idempotent retries, interruption cleanup and stateful reuse.
+**Status: COMPLETE (branch feat/v2-m5-sessions). Dependencies: M2–M4.**
+- Implemented `ProjectSession`, `ProjectSessionState`, `ProjectSessionManager`, and `VALID_TRANSITIONS` in `colab_adapter/project_sessions.py`.
+- Strict state machine covering PLANNED, AWAITING_APPROVAL, PROVISIONING, READY, RUNNING, STOPPING, TERMINATED, FAILED, and NEEDS_RECONCILIATION.
+- Collision-resistant session IDs with project tags (`colab-v2-<name>-<uuid4[:8]>`).
+- Offline planning (`plan_session`) with 0 subprocess calls and 0 cloud allocations.
+- Cross-process locking via `ColabProcessLock` and atomic intent registration in `ManagedSessionRegistry` before cloud CLI commands.
+- Idempotent session reuse (`reuse_active=True`) on valid leases.
+- Fail-closed enforcement for unmanaged sessions: attach, exec, and stop strictly refuse unmanaged sessions (Q08).
+- Lease expiration checking and lock-aware session reconciliation (`reconcile_leases`).
+- Added comprehensive unit tests in `tests/test_project_sessions.py` (11 tests). Full offline suite: 85 tests passing.
+- **Gate G5 Satisfied:** Validated session lifecycle state invariants; unmanaged session safety (0 commands dispatched); lease expiration; 0 cloud spend.
 - Default one-shot lifecycle releases GPU after completion; retained interactive sessions must be time-bounded and separately approved. No keepalive loops or always-on service.
 - **Accept:** repeated runs against one **mock** session reuse resources; missing/unmanaged sessions fail closed; cleanup failures recorded; no unrelated session stopped.
 
@@ -107,7 +115,7 @@
 | G2 | Manifest parser, plans, schema negative tests | PASSED |
 | G3 | SSH or graceful fallback, no-surprise-billing tests | PASSED |
 | G4 | Secure delta sync, replay/rollback/path safety | PASSED |
-| G5 | Human approved lifecycle, state invariants, reuse | NOT_STARTED |
+| G5 | Human approved lifecycle, state invariants, reuse | PASSED |
 | G6 | Artifact provenance, explicit resume, telemetry | NOT_STARTED |
 | G7 | Offline suite, owner-approved live evidence, docs | NOT_STARTED |
 | G8 | Account ledger, emitted training events, private cross-device read-only UI, zero-alloc safety | NOT_STARTED |

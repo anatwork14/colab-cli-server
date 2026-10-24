@@ -7,7 +7,9 @@ Ensures sensitive credentials, authorization codes, and private keys are redacte
 import re
 from typing import Any, Dict, List, Optional, Union
 from .provider import (
+    AllocationError,
     ArtifactMissingError,
+    CleanupError,
     ColabProviderError,
     DependencyMissingError,
     InvalidJobSpecError,
@@ -131,3 +133,19 @@ class SshHandshakeError(TransportError):
             details["http_status"] = http_status
         super().__init__(message, details=details)
         self.http_status = http_status
+
+
+class ProjectSessionError(ColabV2Error):
+    """Base error for project session lifecycle operations."""
+    pass
+
+
+class LeaseExpiredError(ProjectSessionError):
+    """Raised when an operation targets a session whose approved lease duration has expired."""
+    pass
+
+
+class InvalidStateTransitionError(ProjectSessionError):
+    """Raised when an illegal state machine transition is attempted."""
+    pass
+

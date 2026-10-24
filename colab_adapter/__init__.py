@@ -38,6 +38,15 @@ from .errors import (
     UnmanagedSessionError,
     SessionAllocationRequiredError,
     SshHandshakeError,
+    ProjectSessionError,
+    LeaseExpiredError,
+    InvalidStateTransitionError,
+)
+from .project_sessions import (
+    ProjectSession,
+    ProjectSessionManager,
+    ProjectSessionState,
+    VALID_TRANSITIONS,
 )
 from .capability import (
     CapabilityProbe,
@@ -102,6 +111,9 @@ __all__ = [
     "UnmanagedSessionError",
     "SessionAllocationRequiredError",
     "SshHandshakeError",
+    "ProjectSessionError",
+    "LeaseExpiredError",
+    "InvalidStateTransitionError",
     "CapabilityProbe",
     "CliCapabilities",
     "SshSafetyGuard",
@@ -118,4 +130,9 @@ __all__ = [
     "plan_project",
     "init_project",
     "discover_project_files",
+    # V2 Project Sessions (M5)
+    "ProjectSession",
+    "ProjectSessionManager",
+    "ProjectSessionState",
+    "VALID_TRANSITIONS",
 ]
