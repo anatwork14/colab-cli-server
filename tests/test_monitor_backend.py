@@ -18,10 +18,13 @@ Verifies acceptance criteria Q19–Q31:
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
 import io
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -326,6 +329,329 @@ class TestMonitorBackend(unittest.TestCase):
             with urllib.request.urlopen(req) as resp:
                 body = resp.read().decode("utf-8")
                 self.assertNotIn(secret_token, body)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_trusted_proxy_missing_secret_raises_value_error(self):
+        """trusted_proxy=True without trusted_proxy_secret raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            start_monitor_server(
+                host="127.0.0.1",
+                port=0,
+                registry=self.registry,
+                trusted_proxy=True,
+                trusted_proxy_secret=None,
+            )
+        self.assertIn("requires a non-empty trusted_proxy_secret", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx2:
+            start_monitor_server(
+                host="127.0.0.1",
+                port=0,
+                registry=self.registry,
+                trusted_proxy=True,
+                trusted_proxy_secret="",
+            )
+        self.assertIn("requires a non-empty trusted_proxy_secret", str(ctx2.exception))
+
+    def test_allow_external_on_0000_require_tls_missing_certs_raises_value_error(self):
+        """allow_external=True on 0.0.0.0 with require_tls=True but without valid cert files raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            start_monitor_server(
+                host="0.0.0.0",
+                port=0,
+                allow_external=True,
+                auth_token="valid-token",
+                require_tls=True,
+                tls_certfile=None,
+                tls_keyfile=None,
+            )
+        self.assertIn("External binding over unencrypted HTTP", str(ctx.exception))
+        self.assertIn("Real TLS requires valid tls_certfile and tls_keyfile", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx2:
+            start_monitor_server(
+                host="0.0.0.0",
+                port=0,
+                allow_external=True,
+                auth_token="valid-token",
+                require_tls=True,
+                tls_certfile="/tmp/nonexistent_cert.pem",
+                tls_keyfile="/tmp/nonexistent_key.pem",
+            )
+        self.assertIn("External binding over unencrypted HTTP", str(ctx2.exception))
+        self.assertIn("Real TLS requires valid tls_certfile and tls_keyfile", str(ctx2.exception))
+
+    def test_trusted_proxy_mode_external_bind_without_real_tls_raises_value_error(self):
+        """trusted_proxy=True on external interface without real TLS raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            start_monitor_server(
+                host="0.0.0.0",
+                port=0,
+                allow_external=True,
+                trusted_proxy=True,
+                trusted_proxy_secret="secret123",
+            )
+        self.assertIn("trusted_proxy mode cannot bind to an unencrypted external interface", str(ctx.exception))
+
+    def test_trusted_proxy_direct_attacker_header_rejected_401(self):
+        """Direct client supplying X-Remote-User or X-Forwarded-User without valid secret/sig receives HTTP 401."""
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            registry=self.registry,
+            telemetry=self.telemetry,
+            collector=AccountUsageCollector(ledger_path=self.ledger_path),
+            trusted_proxy=True,
+            trusted_proxy_secret="valid-proxy-secret",
+        )
+        port = server.server_port
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            # 1. Attacker header without secret
+            req = urllib.request.Request(f"{base_url}/api/v1/summary", headers={"X-Remote-User": "attacker"})
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertEqual(ctx.exception.code, 401)
+
+            # 2. X-Forwarded-User admin without secret
+            req = urllib.request.Request(f"{base_url}/api/v1/summary", headers={"X-Forwarded-User": "admin"})
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertEqual(ctx.exception.code, 401)
+
+            # 3. Attacker with forged/wrong secret
+            req = urllib.request.Request(
+                f"{base_url}/api/v1/summary",
+                headers={"X-Remote-User": "attacker", "X-Proxy-Secret": "wrong-secret"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertEqual(ctx.exception.code, 401)
+
+            # 4. Attacker with invalid HMAC signature
+            req = urllib.request.Request(
+                f"{base_url}/api/v1/summary",
+                headers={"X-Remote-User": "attacker", "X-Proxy-Signature": "0000deadbeef"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertEqual(ctx.exception.code, 401)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_trusted_proxy_untrusted_peer_ip_rejected_401(self):
+        """Untrusted peer IP supplying X-Remote-User + secret is rejected with HTTP 401."""
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            registry=self.registry,
+            telemetry=self.telemetry,
+            collector=AccountUsageCollector(ledger_path=self.ledger_path),
+            trusted_proxy=True,
+            trusted_proxy_secret="valid-proxy-secret",
+            trusted_proxy_ips={"192.168.1.50"},  # 127.0.0.1 is untrusted
+        )
+        port = server.server_port
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            req = urllib.request.Request(
+                f"{base_url}/api/v1/summary",
+                headers={"X-Remote-User": "alice", "X-Proxy-Secret": "valid-proxy-secret"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertEqual(ctx.exception.code, 401)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_trusted_proxy_valid_loopback_proxy_request_succeeds(self):
+        """Valid loopback proxy request with X-Remote-User and secret or HMAC succeeds with HTTP 200."""
+        secret = "super-secret-proxy-token-42"
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            registry=self.registry,
+            telemetry=self.telemetry,
+            collector=AccountUsageCollector(ledger_path=self.ledger_path),
+            trusted_proxy=True,
+            trusted_proxy_secret=secret,
+            trusted_proxy_ips={"127.0.0.1", "::1"},
+        )
+        port = server.server_port
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            # 1. Via X-Proxy-Secret
+            req1 = urllib.request.Request(
+                f"{base_url}/api/v1/summary",
+                headers={"X-Remote-User": "alice", "X-Proxy-Secret": secret},
+            )
+            with urllib.request.urlopen(req1) as resp:
+                self.assertEqual(resp.status, 200)
+
+            # 2. Via X-Proxy-Signature HMAC-SHA256
+            user = "bob"
+            sig = hmac.new(secret.encode("utf-8"), user.encode("utf-8"), hashlib.sha256).hexdigest()
+            req2 = urllib.request.Request(
+                f"{base_url}/api/v1/summary",
+                headers={"X-Forwarded-User": user, "X-Proxy-Signature": sig},
+            )
+            with urllib.request.urlopen(req2) as resp:
+                self.assertEqual(resp.status, 200)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_all_endpoints_enforce_auth_and_reject_query_token(self):
+        """All endpoints enforce auth and reject ?token=."""
+        ev = self.telemetry.emit(event_type="run_started", epoch=0, step=0)
+        run_id = ev["run_id"]
+
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            registry=self.registry,
+            telemetry=self.telemetry,
+            collector=AccountUsageCollector(ledger_path=self.ledger_path),
+            auth_token=self.auth_token,
+        )
+        port = server.server_port
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        base_url = f"http://127.0.0.1:{port}"
+
+        endpoints = [
+            "/api/v1/summary",
+            f"/api/v1/runs/{run_id}",
+            "/api/v1/events/stream",
+            "/api/v1/export/compute.csv",
+        ]
+
+        try:
+            for ep in endpoints:
+                # 1. Unauthenticated -> 401
+                req_unauth = urllib.request.Request(f"{base_url}{ep}")
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req_unauth)
+                self.assertEqual(ctx.exception.code, 401, f"{ep} failed to enforce auth on unauthenticated request")
+
+                # 2. ?token= parameter strictly rejected -> 401
+                sep = "&" if "?" in ep else "?"
+                req_param = urllib.request.Request(f"{base_url}{ep}{sep}token={self.auth_token}")
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req_param)
+                self.assertEqual(ctx.exception.code, 401, f"{ep} allowed ?token= query parameter")
+
+                # 3. Bearer header -> 200
+                req_auth = urllib.request.Request(
+                    f"{base_url}{ep}",
+                    headers={"Authorization": f"Bearer {self.auth_token}"},
+                )
+                with urllib.request.urlopen(req_auth, timeout=5.0) as resp:
+                    self.assertEqual(resp.status, 200, f"{ep} failed on valid Bearer auth")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_real_tls_enforcement_and_https_serving(self):
+        """require_tls=True wraps socket with SSLContext and serves HTTPS."""
+        cert_path = Path(self.tmp_dir) / "cert.pem"
+        key_path = Path(self.tmp_dir) / "key.pem"
+        cmd = [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(key_path), "-out", str(cert_path),
+            "-days", "1", "-nodes", "-subj", "/CN=localhost",
+        ]
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            registry=self.registry,
+            telemetry=self.telemetry,
+            collector=AccountUsageCollector(ledger_path=self.ledger_path),
+            auth_token=self.auth_token,
+            require_tls=True,
+            tls_certfile=cert_path,
+            tls_keyfile=key_path,
+        )
+        port = server.server_port
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        base_url = f"https://127.0.0.1:{port}"
+        try:
+            req = urllib.request.Request(
+                f"{base_url}/api/v1/summary",
+                headers={"Authorization": f"Bearer {self.auth_token}"},
+            )
+            with urllib.request.urlopen(req, context=ssl_ctx) as resp:
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("monitoring_since", data)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_broker_token_verification_integration(self):
+        """Monitor server accepts Bearer and X-API-Token if verified by attached broker."""
+        mock_broker = MagicMock()
+        mock_broker.verify_token.side_effect = lambda t: t == "valid-broker-token"
+
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            registry=self.registry,
+            telemetry=self.telemetry,
+            collector=AccountUsageCollector(ledger_path=self.ledger_path),
+            broker=mock_broker,
+        )
+        port = server.server_port
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            # 1. Bearer header with broker token -> 200
+            req = urllib.request.Request(
+                f"{base_url}/api/v1/summary",
+                headers={"Authorization": "Bearer valid-broker-token"},
+            )
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+
+            # 2. X-API-Token header with broker token -> 200
+            req2 = urllib.request.Request(
+                f"{base_url}/api/v1/summary",
+                headers={"X-API-Token": "valid-broker-token"},
+            )
+            with urllib.request.urlopen(req2) as resp:
+                self.assertEqual(resp.status, 200)
+
+            # 3. Invalid broker token -> 401
+            req3 = urllib.request.Request(
+                f"{base_url}/api/v1/summary",
+                headers={"Authorization": "Bearer invalid-token"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req3)
+            self.assertEqual(ctx.exception.code, 401)
         finally:
             server.shutdown()
             server.server_close()

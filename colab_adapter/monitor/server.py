@@ -11,16 +11,20 @@ Guarantees:
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
 import io
 import json
 import os
+import re
+import ssl
 import threading
 import time
 import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from ..provider import ManagedSessionRegistry
 from ..telemetry import TelemetryEmitter
@@ -28,7 +32,10 @@ from ..tracker import sanitize_data
 from .collector import AccountUsageCollector
 from .schemas import HealthStatus, MonitoringSummary, RunSummary, _iso_now
 
-_EMBEDDED_HTML_DASHBOARD = """<!DOCTYPE html>
+try:
+    from .ui import DASHBOARD_HTML as _EMBEDDED_HTML_DASHBOARD
+except ImportError:
+    _EMBEDDED_HTML_DASHBOARD = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -296,31 +303,61 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
     def _is_authenticated(self, query_params: Dict[str, List[str]]) -> bool:
         """Validate credentials from Authorization header, X-API-Token, or trusted gateway."""
-        expected_token = self.server.auth_token
+        expected_token = getattr(self.server, "auth_token", None)
         trusted_proxy = getattr(self.server, "trusted_proxy", False)
+        broker = getattr(self.server, "broker", None)
 
         # 1. Trusted reverse proxy gateway principal validation
         if trusted_proxy:
-            remote_user = self.headers.get("X-Remote-User") or self.headers.get("X-Forwarded-User")
-            if remote_user:
-                return True
+            client_ip = self.client_address[0] if self.client_address else ""
+            trusted_ips = getattr(self.server, "trusted_proxy_ips", None) or {"127.0.0.1", "::1"}
+            proxy_secret = getattr(self.server, "trusted_proxy_secret", None)
 
-        if not expected_token:
-            return True  # Auth disabled (for local-only test mode)
+            proxy_secret_hdr = self.headers.get("X-Proxy-Secret", "")
+            proxy_sig_hdr = self.headers.get("X-Proxy-Signature", "")
+            remote_user = (self.headers.get("X-Remote-User") or self.headers.get("X-Forwarded-User") or "").strip()
 
-        import hmac
-        expected_bytes = expected_token.encode("utf-8")
+            if (
+                client_ip in trusted_ips
+                and proxy_secret
+                and remote_user
+                and re.match(r"^[a-zA-Z0-9_.@-]{1,128}$", remote_user)
+            ):
+                secret_bytes = proxy_secret.encode("utf-8")
+                secret_valid = bool(
+                    proxy_secret_hdr
+                    and hmac.compare_digest(proxy_secret_hdr.encode("utf-8"), secret_bytes)
+                )
+                sig_valid = bool(
+                    proxy_sig_hdr
+                    and hmac.compare_digest(
+                        proxy_sig_hdr.lower(),
+                        hmac.new(secret_bytes, remote_user.encode("utf-8"), hashlib.sha256).hexdigest().lower(),
+                    )
+                )
+                if secret_valid or sig_valid:
+                    return True
 
-        # 2. Check Authorization header: Bearer <token>
+        # 2. Extract Bearer or X-API-Token header
+        token: Optional[str] = None
         auth_header = self.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
-            if hmac.compare_digest(token.encode("utf-8"), expected_bytes):
+        elif "X-API-Token" in self.headers:
+            token = self.headers.get("X-API-Token", "").strip()
+
+        # 3. Check broker verify_token
+        if token and broker and hasattr(broker, "verify_token"):
+            if broker.verify_token(token):
                 return True
 
-        # 3. Check X-API-Token header
-        api_token = self.headers.get("X-API-Token", "")
-        if api_token and hmac.compare_digest(api_token.encode("utf-8"), expected_bytes):
+        # 4. Check server auth_token
+        if token and expected_token:
+            if hmac.compare_digest(token.encode("utf-8"), expected_token.encode("utf-8")):
+                return True
+
+        # Auth disabled only when no auth mechanism was configured at all (for local-only test mode)
+        if not expected_token and not trusted_proxy and not broker:
             return True
 
         # Query parameter tokens (?token=...) are strictly rejected
@@ -371,7 +408,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
         # Serve static HTML/JS dashboard without token prompt on root if public, or check auth
         if path in ("/", "/index.html"):
-            body = _EMBEDDED_HTML_DASHBOARD.encode("utf-8")
+            dashboard_content = getattr(self.server, "dashboard_html", _EMBEDDED_HTML_DASHBOARD)
+            body = dashboard_content.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -736,8 +774,12 @@ class MonitorServer(ThreadingHTTPServer):
         allowed_origins: Optional[List[str]] = None,
         require_tls: bool = False,
         trusted_proxy: bool = False,
+        trusted_proxy_ips: Optional[Set[str]] = None,
+        trusted_proxy_secret: Optional[str] = None,
+        tls_certfile: Optional[Union[str, Path]] = None,
+        tls_keyfile: Optional[Union[str, Path]] = None,
+        dashboard_html: Optional[str] = None,
     ):
-
         host, port = server_address
         # Enforce loopback binding by default (Q28)
         if not allow_external and host not in ("127.0.0.1", "localhost", "::1"):
@@ -745,6 +787,13 @@ class MonitorServer(ThreadingHTTPServer):
                 f"Security violation: Monitor server attempted to bind to external interface '{host}'. "
                 "Only loopback (127.0.0.1) is permitted unless allow_external=True is explicitly set."
             )
+
+        if trusted_proxy:
+            if not trusted_proxy_secret or not isinstance(trusted_proxy_secret, str) or not trusted_proxy_secret.strip():
+                raise ValueError(
+                    "Security violation: trusted_proxy=True requires a non-empty trusted_proxy_secret to authenticate reverse-proxy identity headers."
+                )
+
         if allow_external:
             if not auth_token and not trusted_proxy:
                 raise ValueError(
@@ -755,8 +804,41 @@ class MonitorServer(ThreadingHTTPServer):
                     "Security violation: External binding over unencrypted HTTP without a trusted identity proxy is rejected. "
                     "Set require_tls=True or trusted_proxy=True."
                 )
+            if trusted_proxy and host not in ("127.0.0.1", "localhost", "::1"):
+                if not (tls_certfile and tls_keyfile):
+                    raise ValueError(
+                        "Security violation: trusted_proxy mode cannot bind to an unencrypted external interface; "
+                        "bind to loopback (127.0.0.1) behind the local reverse proxy or configure real TLS."
+                    )
+                if trusted_proxy_ips is None:
+                    raise ValueError(
+                        "Security violation: trusted_proxy mode on external interface requires explicit trusted_proxy_ips."
+                    )
+
+        if require_tls or (allow_external and host not in ("127.0.0.1", "localhost", "::1")):
+            cert_p = Path(tls_certfile) if tls_certfile else None
+            key_p = Path(tls_keyfile) if tls_keyfile else None
+            if not cert_p or not key_p or not cert_p.is_file() or not key_p.is_file():
+                if allow_external:
+                    raise ValueError(
+                        "Security violation: External binding over unencrypted HTTP without a trusted identity proxy is rejected. "
+                        "Real TLS requires valid tls_certfile and tls_keyfile."
+                    )
+                raise ValueError("Security violation: Real TLS requires valid tls_certfile and tls_keyfile.")
+        elif tls_certfile or tls_keyfile:
+            cert_p = Path(tls_certfile) if tls_certfile else None
+            key_p = Path(tls_keyfile) if tls_keyfile else None
+            if not cert_p or not key_p or not cert_p.is_file() or not key_p.is_file():
+                raise ValueError("Security violation: Real TLS requires valid tls_certfile and tls_keyfile.")
 
         super().__init__((host, port), MonitorRequestHandler)
+
+        if require_tls or (tls_certfile and tls_keyfile):
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context.load_cert_chain(certfile=str(tls_certfile), keyfile=str(tls_keyfile))
+            self.socket = context.wrap_socket(self.socket, server_side=True)
+
         self.collector = collector
         self.registry = registry
         self.telemetry = telemetry
@@ -765,6 +847,11 @@ class MonitorServer(ThreadingHTTPServer):
         self.allowed_origins = allowed_origins
         self.require_tls = require_tls
         self.trusted_proxy = trusted_proxy
+        self.trusted_proxy_ips = set(trusted_proxy_ips) if trusted_proxy_ips is not None else {"127.0.0.1", "::1"}
+        self.trusted_proxy_secret = trusted_proxy_secret
+        self.tls_certfile = tls_certfile
+        self.tls_keyfile = tls_keyfile
+        self.dashboard_html = dashboard_html or _EMBEDDED_HTML_DASHBOARD
         self.artifacts_dir = Path(artifacts_dir or "./artifacts").resolve()
         self.broker = broker
         self.start_time = time.time()
@@ -783,6 +870,11 @@ def start_monitor_server(
     allowed_origins: Optional[List[str]] = None,
     require_tls: bool = False,
     trusted_proxy: bool = False,
+    trusted_proxy_ips: Optional[Set[str]] = None,
+    trusted_proxy_secret: Optional[str] = None,
+    tls_certfile: Optional[Union[str, Path]] = None,
+    tls_keyfile: Optional[Union[str, Path]] = None,
+    dashboard_html: Optional[str] = None,
 ) -> MonitorServer:
     """Instantiate and start the MonitorServer."""
     col = collector or AccountUsageCollector()
@@ -801,6 +893,11 @@ def start_monitor_server(
         allowed_origins=allowed_origins,
         require_tls=require_tls,
         trusted_proxy=trusted_proxy,
+        trusted_proxy_ips=trusted_proxy_ips,
+        trusted_proxy_secret=trusted_proxy_secret,
+        tls_certfile=tls_certfile,
+        tls_keyfile=tls_keyfile,
+        dashboard_html=dashboard_html,
     )
     return server
 
