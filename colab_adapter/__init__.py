@@ -63,6 +63,17 @@ from .workspace import (
     WorkspaceSyncEngine,
     compute_sync_delta,
 )
+from .artifacts import (
+    ArtifactManifest,
+    ArtifactManager,
+    verify_local_artifact,
+)
+from .telemetry import (
+    TelemetryEmitter,
+    TelemetryEvent,
+    plan_resume_from_checkpoint,
+    record_interrupted_run,
+)
 from .project_manifest import (
     ProjectSpec,
     discover_project_files,
@@ -135,4 +146,12 @@ __all__ = [
     "ProjectSessionManager",
     "ProjectSessionState",
     "VALID_TRANSITIONS",
+    # V2 Artifacts and Telemetry (M6)
+    "ArtifactManifest",
+    "ArtifactManager",
+    "verify_local_artifact",
+    "TelemetryEmitter",
+    "TelemetryEvent",
+    "plan_resume_from_checkpoint",
+    "record_interrupted_run",
 ]

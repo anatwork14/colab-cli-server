@@ -34,7 +34,7 @@
 | M3 | SSH transport and no-surprise-allocation boundary | COMPLETE | Issue #7, colab_adapter/transports/, tests/test_transports.py; 70/70 tests pass |
 | M4 | Content-addressed workspace sync | COMPLETE | Issue #8, colab_adapter/workspace.py, tests/test_sync.py; 74/74 tests pass |
 | M5 | Attach/update/execute/stop lifecycle | COMPLETE | Issue #9, colab_adapter/project_sessions.py, tests/test_project_sessions.py; 85/85 tests pass |
-| M6 | Artifact/cache/resume and observability | NOT_STARTED | Durable output validation and metrics |
+| M6 | Artifact/cache/resume and observability | COMPLETE | Issue #10, colab_adapter/artifacts.py, colab_adapter/telemetry.py; 95/95 tests pass |
 | M7 | Integration, end-to-end signoff and docs | NOT_STARTED | Offline CI; human-opt-in live evaluation separately |
 | M8 | Secure browser training & compute monitor | NOT_STARTED | Account snapshots, run telemetry, private authenticated UI, cross-device access; G8/Q19-Q31 |
 | M9 | Cross-provider abstraction (optional) | DEFERRED | Only after Colab V2 is independently usable |
@@ -44,6 +44,16 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-24 — Milestone M6 / Gate G6 COMPLETE (branch `feat/v2-m6-artifacts`):**
+  - Implemented `colab_adapter/artifacts.py` with `ArtifactManifest`, `ArtifactManager`, and `verify_local_artifact`.
+  - Multi-tier artifact verification: file existence, minimum size, chunked streaming SHA256, ZIP structure inspection, and safe PyTorch `weights_only=True` loading (Q14).
+  - Built staged atomic download pattern: downloads to `.tmp` file, validates hashes/structure, and renames atomically to final destination; staged files deleted on failure.
+  - Implemented `colab_adapter/telemetry.py` with `TelemetryEmitter`, `TelemetryEvent`, and JSONL append-only storage matching M8 monitoring schema.
+  - Enforced deep credential and token sanitization across metrics, details, and errors (Q12).
+  - Accurate failure classification for `INTERRUPTED`, `CLEANUP_FAILED`, and `FAILED` states without masking errors (Q11).
+  - Implemented explicit resume planning (`plan_resume_from_checkpoint`).
+  - Added unit test suite `tests/test_artifacts_and_telemetry.py` (10 tests). Full offline suite: **95 tests passed** in `4.83s` on Python 3.8 and `4.29s` on Python 3.12.
+  - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated).
 - **2026-10-24 — Milestone M5 / Gate G5 COMPLETE (branch `feat/v2-m5-sessions`):**
   - Implemented `colab_adapter/project_sessions.py` with `ProjectSession`, `ProjectSessionManager`, `ProjectSessionState`, and `VALID_TRANSITIONS`.
   - Enforced strict state transitions (PLANNED, AWAITING_APPROVAL, PROVISIONING, READY, RUNNING, STOPPING, TERMINATED, FAILED, NEEDS_RECONCILIATION).

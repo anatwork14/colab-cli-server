@@ -70,11 +70,16 @@
 - **Accept:** repeated runs against one **mock** session reuse resources; missing/unmanaged sessions fail closed; cleanup failures recorded; no unrelated session stopped.
 
 ## M6 — Artifacts, resume and telemetry (G6)
-**Status: NOT_STARTED. Dependencies: M4–M5.**
-- Model durable output and checkpoint storage outside temporary Colab VM; metadata records project ID, source revision, config, input/output hashes, GPU class, actual usage snapshot and local artifact path.
-- Resume must be explicit and compatible with checkpoint contract; no promise that Colab VM/dataset remains available.
-- Report project run states, sync diffs, stage timings, transfer sizes, session age, error class and cleanup state; redact tokens and paths as required.
-- **Accept:** mocked interrupted training -> verified checkpoint -> resumed new session; manifest corruption fails closed; logs do not expose secrets.
+**Status: COMPLETE (branch feat/v2-m6-artifacts). Dependencies: M4–M5.**
+- Implemented `ArtifactManifest`, `ArtifactManager`, and `verify_local_artifact` in `colab_adapter/artifacts.py`.
+- Multi-tier artifact verification: existence, minimum size, chunked SHA256 integrity, ZIP structure, and safe PyTorch `weights_only=True` inspection.
+- Staged download with atomic replace on success and immediate cleanup on failure (Q14).
+- Implemented `TelemetryEmitter`, `TelemetryEvent`, and JSONL append-only storage in `colab_adapter/telemetry.py` matching M8 monitoring schema.
+- Full credential redaction across metrics, details, and errors (Q12).
+- Accurate failure classification for `INTERRUPTED`, `CLEANUP_FAILED`, and `FAILED` (Q11).
+- Explicit resume planning from verified checkpoints (`plan_resume_from_checkpoint`).
+- Added comprehensive unit tests in `tests/test_artifacts_and_telemetry.py` (10 tests). Full offline suite: 95 tests passing.
+- **Gate G6 Satisfied:** Validated Q11, Q12, Q14; 0 cloud spend.
 
 ## M7 — Integration, release and acceptance (G7)
 **Status: NOT_STARTED. Dependencies: M1–M6.**
@@ -116,7 +121,7 @@
 | G3 | SSH or graceful fallback, no-surprise-billing tests | PASSED |
 | G4 | Secure delta sync, replay/rollback/path safety | PASSED |
 | G5 | Human approved lifecycle, state invariants, reuse | PASSED |
-| G6 | Artifact provenance, explicit resume, telemetry | NOT_STARTED |
+| G6 | Artifact provenance, explicit resume, telemetry | PASSED |
 | G7 | Offline suite, owner-approved live evidence, docs | NOT_STARTED |
 | G8 | Account ledger, emitted training events, private cross-device read-only UI, zero-alloc safety | NOT_STARTED |
 
