@@ -142,7 +142,15 @@ Human approval covers the **operation** (GPU, expected resource usage, project r
 - Phase 3 (human-opt-in): live capability smoke on a specifically approved session; never run in CI.
 - Rollback: disabling V2 project commands leaves V1 provider, registry and credentials intact. Document migration and avoid overwriting existing host installs or GPU drivers.
 
-## 10. Open architectural decisions requiring M1 signoff
+## 10. Cross-device monitoring architecture (M8)
+
+The monitor is a **separate local Ubuntu process** and never runs inside a temporary Colab runtime. It collects read-only `colab usage` (account-wide CU balance, aggregate CU/h, active assignment count) and `colab sessions` at a bounded cadence, ingests opt-in structured events from owned training jobs, and stores append-only private local JSONL plus query snapshots.
+
+A responsive read-only SPA displays trends, per-project emitted training curves, logs, checkpoint status and session ownership through authenticated REST/SSE. The web server binds to localhost and requires an operator-approved VPN or TLS + authenticated access gateway to be accessed by other computers. No OAuth tokens in browser, no GPU allocation, no SSH bridging, no live session management or approvals exposed over HTTP.
+
+**Source caveat:** balance and rate are aggregated account-wide; a new monitor cannot reconstruct older spend or itemize charges per job. Missing training progress or GPU samples display unavailable. See [MONITORING_DASHBOARD_V2.md](MONITORING_DASHBOARD_V2.md) for UI, source contracts, deployment, authorization and testing.
+
+## 11. Open architectural decisions requiring M1 signoff
 
 1. YAML with optional tested parser versus JSON baseline.
 2. SSH transport no-auto-create enforceability (block SSH until confirmed; not a convenience assumption).
