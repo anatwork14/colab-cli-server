@@ -35,6 +35,15 @@ Today ColabGPUProvider can send a local script to a remote VM and can upload exp
 | F12 | MAY | Optional remote dependency cache | Reinstall only when manifest fingerprint changes; lifecycle scoped | Cache invalidates by hash |
 | F13 | LATER | Provider abstraction | Local/Colab/dedicated rented GPU contract with real provider-specific semantics | Separate design, no placeholder calls |
 | F14 | LATER | Watch mode | Debounced sync only while approved session active | Must not extend runtime implicitly |
+| F15 | MUST (M8) | Cross-device monitor | Responsive web UI served on local Ubuntu, accessible to authorized browsers | Secure HTTPS/VPN; loopback default |
+| F16 | MUST (M8) | Account CU snapshots | Read-only balance, aggregate CU/h, assignments, timestamp/freshness | No cloud allocation during collection |
+| F17 | MUST (M8) | Historical account ledger | Private timestamped snapshot archive from monitor start | Honest historical gaps and billing uncertainty |
+| F18 | MUST (M8) | Structured training events | Epoch/step/loss/accuracy/progress/checkpoint/log telemetry from managed jobs | No synthetic progress or per-job CU guesses |
+| F19 | MUST (M8) | Run details and charts | Responsive charts, status timeline, metrics/logs, artifacts, freshness | Cursor pagination, source labels, graceful empty states |
+| F20 | SHOULD (M8) | GPU monitoring | Optional in-session VRAM/utilization samples | Existing approved runtime only; no implicit start |
+| F21 | MUST (M8) | Read-only authenticated API | Summary, compute snapshots, sessions, runs, events, logs and export | No browser access to OAuth or remote commands |
+| F22 | SHOULD (M8) | Alerts and exports | Low balance, training failures, session warnings; CSV/JSON download | Explicit provenance, authorized access |
+| F23 | MUST (M8) | Collector safety and reliability | Fixed polling, retries/backoff, data retention, event deduplication | No live allocation, stale-source visibility |
 
 ## Proposed manifest contract (illustrative, not currently parsed)
 
@@ -119,6 +128,10 @@ The actual executable interface must enforce the approval contract **before** in
 - Host-side adapter must remain usable under Python 3.8; official google-colab-cli v0.7.x runs in an isolated supported Python >=3.12 tool environment.
 - Avoid installing local GPU/CUDA dependencies or breaking GTX 1080 Ti workloads.
 - Existing tracker data and registry must remain readable; migration is explicit, backed up and idempotent.
+
+## Monitoring dashboard extension
+
+The new M8 module is a **private Ubuntu-hosted web dashboard**, never a Colab VM webserver. It combines read-only account CU balance/rate/sessions snapshots with actual metrics emitted by managed training jobs. Account data is aggregate and **cannot reconstruct prior billing history or prove per-job charges**. Initial UI is strictly read-only and must use an approved authenticated access gateway/VPN before access from another computer. See [MONITORING_DASHBOARD_V2.md](MONITORING_DASHBOARD_V2.md).
 
 ## External references
 - Google upstream SSH design: https://github.com/googlecolab/google-colab-cli/blob/main/docs/06_ssh_access.md
