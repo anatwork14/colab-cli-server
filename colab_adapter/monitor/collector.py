@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from ..provider import parse_session_lines
+from ..tracker import sanitize_text
 from .schemas import AccountSample, _iso_now
 
 # Patterns for extracting compute units, rate, and active assignments from colab usage output
@@ -150,11 +151,12 @@ class AccountUsageCollector:
             if res.returncode != 0:
                 err_msg = (res.stderr or res.stdout or "").strip()
                 self._backoff_level = min(self._backoff_level + 1, 5)
+                sanitized_msg = sanitize_text(err_msg)
                 sample = AccountSample(
                     sample_id=sample_id,
                     observed_at=observed_at,
                     status="ERROR",
-                    error_message=f"Usage query failed: {err_msg}",
+                    error_message=f"Usage query failed: {sanitized_msg}",
                 )
             else:
                 self._backoff_level = 0
@@ -196,11 +198,12 @@ class AccountUsageCollector:
             )
         except Exception as e:
             self._backoff_level = min(self._backoff_level + 1, 5)
+            sanitized_err = sanitize_text(str(e))
             sample = AccountSample(
                 sample_id=sample_id,
                 observed_at=observed_at,
                 status="ERROR",
-                error_message=f"Collector exception: {e}",
+                error_message=f"Collector exception: {sanitized_err}",
             )
 
         self._record_sample(sample)

@@ -6,17 +6,21 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock
 
+from colab_adapter.artifacts import ArtifactManager
 from colab_adapter.errors import (
     ArtifactNotFoundError,
     ArtifactValidationError,
     InvalidStateTransitionError,
     JournalCorruptionError,
 )
+from colab_adapter.monitor.collector import AccountUsageCollector
 from colab_adapter.storage import (
     ArtifactType,
     LocalArtifactStore,
@@ -388,6 +392,88 @@ class TestStorageAbstraction(unittest.TestCase):
         self.assertEqual(safe_dict["metadata"]["x_api_token"], "[REDACTED]")
         self.assertEqual(safe_dict["metadata"]["run_name"], "normal_run")
         self.assertNotIn("SECRET_SESSION_123", str(safe_dict))
+
+    def test_download_and_verify_sanitizes_errors_and_cloud_enqueue_exceptions(self):
+        """ArtifactManager.download_and_verify sanitizes errors in exceptions and cloud enqueue failures."""
+        # 1. Transport error with seeded credentials
+        mock_transport = MagicMock()
+        mock_transport.download_file.side_effect = RuntimeError(
+            "Transport failure with access_token=ya29.secret_down_tok and client_secret=cs_secret_val"
+        )
+        manager = ArtifactManager(transport=mock_transport, local_dest_dir=self.artifacts_dir)
+
+        with self.assertRaises(ArtifactValidationError) as ctx:
+            manager.download_and_verify(
+                session_id="sess-sec-1",
+                remote_path="/content/secret_model.pt",
+            )
+
+        err_str = str(ctx.exception)
+        self.assertNotIn("secret_down_tok", err_str)
+        self.assertNotIn("cs_secret_val", err_str)
+        self.assertIn("[REDACTED]", err_str)
+        self.assertNotIn("secret_down_tok", ctx.exception.details.get("error", ""))
+
+        # 2. Cloud enqueue failure with seeded session URL
+        mock_transport_ok = MagicMock()
+        payload = b"VALID_LOCAL_ARTIFACT_CONTENT"
+        def fake_download(session_id, remote_path, local_path):
+            Path(local_path).write_bytes(payload)
+        mock_transport_ok.download_file.side_effect = fake_download
+
+        mock_worker = MagicMock()
+        mock_worker.enqueue.side_effect = RuntimeError(
+            "Cloud enqueue failed: https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&session_id=SECRET_CLOUD_SESSION"
+        )
+        manager_with_cloud = ArtifactManager(
+            transport=mock_transport_ok,
+            local_dest_dir=self.artifacts_dir,
+            upload_worker=mock_worker,
+        )
+
+        manifest = manager_with_cloud.download_and_verify(
+            session_id="sess-sec-2",
+            remote_path="/content/ckpt.pt",
+            enqueue_cloud=True,
+            project_id="p1",
+            run_id="r1",
+        )
+        self.assertEqual(manifest.drive_publication_status, "FAILED")
+        cloud_err = manifest.metadata.get("cloud_enqueue_error", "")
+        self.assertNotIn("SECRET_CLOUD_SESSION", cloud_err)
+        self.assertIn("[REDACTED_UPLOAD_SESSION_URL]", cloud_err)
+
+    def test_collector_poll_once_sanitizes_error_messages(self):
+        """AccountUsageCollector.poll_once sanitizes error messages from non-zero CLI return and exceptions."""
+        ledger_path = Path(self.test_dir) / "collector_ledger.jsonl"
+
+        # 1. Non-zero exit code with stderr containing secrets
+        def mock_run_with_secret(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="",
+                stderr="CLI failure: access_token=ya29.poll_access_secret and refresh_token=1//poll_ref_secret",
+            )
+
+        collector = AccountUsageCollector(ledger_path=ledger_path, run_cmd_fn=mock_run_with_secret)
+        sample = collector.poll_once()
+        self.assertEqual(sample.status, "ERROR")
+        self.assertIsNotNone(sample.error_message)
+        self.assertNotIn("poll_access_secret", sample.error_message)
+        self.assertNotIn("poll_ref_secret", sample.error_message)
+        self.assertIn("[REDACTED_SECRET]", sample.error_message)
+
+        # 2. Exception in runner with credentials
+        def mock_run_exception(cmd, **kwargs):
+            raise RuntimeError("Subprocess broken: proxy_secret=my_secret_proxy_val")
+
+        collector2 = AccountUsageCollector(ledger_path=ledger_path, run_cmd_fn=mock_run_exception)
+        sample2 = collector2.poll_once()
+        self.assertEqual(sample2.status, "ERROR")
+        self.assertIsNotNone(sample2.error_message)
+        self.assertNotIn("my_secret_proxy_val", sample2.error_message)
+        self.assertIn("[REDACTED_SECRET]", sample2.error_message)
 
 
 if __name__ == "__main__":
