@@ -11,18 +11,21 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .errors import (
     AutoAllocationBlockedError,
+    SshAutoAllocationRiskError,
     TransportUnavailableError,
     UnmanagedSessionError,
     UpstreamCliError,
     UpstreamCliNotFoundError,
 )
 from .provider import ManagedSessionRegistry
+from .tracker import sanitize_text
 
-_ANSI_REGEX = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
 def _strip_ansi(text: str) -> str:
@@ -45,10 +48,19 @@ class CliCapabilities:
     supports_sessions: bool
     supports_usage: bool
 
+    def __post_init__(self):
+        if not isinstance(self.available_commands, tuple):
+            object.__setattr__(self, "available_commands", tuple(self.available_commands))
+
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["available_commands"] = list(self.available_commands)
         return d
+
+
+def probe_cli_capabilities(cli_path: Optional[str] = None) -> CliCapabilities:
+    """Probe the CLI binary offline. Never calls run, new, or ssh."""
+    return CapabilityProbe(cli_path=cli_path).probe()
 
 
 class CapabilityProbe:
@@ -95,9 +107,12 @@ class CapabilityProbe:
             return _strip_ansi(res.stdout)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             stderr = _strip_ansi(getattr(e, "stderr", "") or "")
+            clean_stderr = sanitize_text(stderr)
+            clean_args = [sanitize_text(a) for a in args]
+            clean_msg = sanitize_text(str(e))
             raise UpstreamCliError(
-                f"Failed to invoke '{' '.join(args)}': {e}",
-                details={"args": args, "stderr": stderr},
+                f"Failed to invoke '{' '.join(clean_args)}': {clean_msg}",
+                details={"args": clean_args, "stderr": clean_stderr},
             )
 
     def _get_version(self) -> str:
@@ -187,12 +202,77 @@ class SshSafetyGuard:
 
         # Check colab-cli local session store file
         if not self._session_in_colab_cli_store(session_name):
-            raise AutoAllocationBlockedError(
+            raise SshAutoAllocationRiskError(
                 f"CRITICAL SAFETY VIOLATION PREVENTED: Session '{session_name}' is not found "
                 f"in colab-cli local store ({self.config_path}). Upstream 'colab ssh -s {session_name}' "
                 "would automatically provision a new Google Colab VM without authorization! "
                 "Operation blocked."
             )
+
+    def prepare_isolated_ssh_config(
+        self,
+        session_id: str,
+        dest_dir: Optional[Union[str, Path]] = None,
+    ) -> Path:
+        """Prepares an isolated, 0700 private directory containing only the verified session entry with 0600 permissions.
+
+        Invariants:
+        1. session_id must be registered in ManagedSessionRegistry AND present in upstream config.
+        2. Isolated directory has 0700 permissions; sessions.json has 0600 permissions.
+        3. Non-session auth config is copied/symlinked if present without exposing credentials.
+        4. Fails closed (UnmanagedSessionError / SshAutoAllocationRiskError) if session is missing or pruned.
+        """
+        if not self.registry.is_managed(session_id):
+            raise UnmanagedSessionError(
+                f"Refusing SSH transport for unmanaged session '{session_id}'. "
+                "The adapter only interacts with its own managed sessions."
+            )
+
+        if not self._session_in_colab_cli_store(session_id):
+            raise SshAutoAllocationRiskError(
+                f"CRITICAL SAFETY VIOLATION PREVENTED: Session '{session_id}' is not found "
+                f"in colab-cli local store ({self.config_path}). Upstream 'colab ssh -s {session_id}' "
+                "would automatically provision a new Google Colab VM without authorization! "
+                "Operation blocked."
+            )
+
+        session_entry = self._get_session_data(session_id)
+        if not session_entry:
+            raise SshAutoAllocationRiskError(
+                f"Session '{session_id}' data could not be retrieved from local store."
+            )
+
+        if dest_dir is None:
+            iso_dir = Path(tempfile.mkdtemp(prefix="colab_ssh_isolated_"))
+        else:
+            iso_dir = Path(dest_dir)
+            iso_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        # Enforce strict 0700 directory permissions
+        os.chmod(iso_dir, 0o700)
+
+        # Write single session store (sessions.json) with strict 0600 permissions
+        sessions_file = iso_dir / "sessions.json"
+        isolated_data = {session_id: session_entry}
+        sessions_file.write_text(json.dumps(isolated_data, indent=2), encoding="utf-8")
+        os.chmod(sessions_file, 0o600)
+
+        # Also write isolated_colab_session_{session_id}.json for backward compatibility
+        legacy_file = iso_dir / f"isolated_colab_session_{session_id}.json"
+        legacy_file.write_text(json.dumps(isolated_data, indent=2), encoding="utf-8")
+        os.chmod(legacy_file, 0o600)
+
+        # Copy non-session config (settings.json, client oauth) if present in upstream config dir
+        if self.config_path.parent.exists():
+            for extra_name in ("settings.json", "oauth_config.json", "application_default_credentials.json"):
+                src = self.config_path.parent / extra_name
+                if src.is_file():
+                    dst = iso_dir / extra_name
+                    if not dst.exists():
+                        shutil.copy2(src, dst)
+                        os.chmod(dst, 0o600)
+
+        return iso_dir
 
     def build_safe_ssh_proxy_invocation(
         self,
@@ -209,16 +289,26 @@ class SshSafetyGuard:
         """
         self.check_ssh_allowed_for_session(session_name)
 
-        session_entry = self._get_session_data(session_name)
-        if not session_entry:
-            raise AutoAllocationBlockedError(
-                f"Session '{session_name}' data could not be retrieved from local store."
+        # Prepare 0700 isolated directory with 0600 config
+        iso_dir = self.prepare_isolated_ssh_config(session_name, dest_dir=isolated_dir)
+
+        # Re-verify immediately before invocation to eliminate TOCTOU window:
+        # If session disappeared from upstream store right after preflight, fail closed!
+        if not self._session_in_colab_cli_store(session_name):
+            for f in iso_dir.glob("*.json"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            raise SshAutoAllocationRiskError(
+                f"TOCTOU RACE PREVENTED: Session '{session_name}' disappeared from local store "
+                f"({self.config_path}) right after preflight! Upstream execution blocked "
+                "to prevent surprise cloud VM auto-allocation."
             )
 
-        isolated_path = Path(isolated_dir) / f"isolated_colab_session_{session_name}.json"
-        # Write single session store
-        isolated_data = {session_name: session_entry}
-        isolated_path.write_text(json.dumps(isolated_data, indent=2), encoding="utf-8")
+        isolated_path = iso_dir / f"isolated_colab_session_{session_name}.json"
+        if not isolated_path.exists():
+            isolated_path = iso_dir / "sessions.json"
 
         # Command intentionally OMITS '-s NAME' to prevent upstream auto-creation!
         return [
