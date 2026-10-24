@@ -47,11 +47,6 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Dynamic in-memory guard for missing module imports in monitor server
-import colab_adapter.monitor.server
-if not hasattr(colab_adapter.monitor.server, "re"):
-    colab_adapter.monitor.server.re = re
-
 from colab_adapter.broker import WorkspaceBroker
 from colab_adapter.errors import (
     ArtifactValidationError,
@@ -248,6 +243,18 @@ class ByteAccurateDriveFaultServer:
 
         # 5. Chunk PUT or Status Query PUT
         if "session_id=" in url and method == "PUT":
+            cr = normalized_headers.get("content-range", "")
+            if "*/" in cr and self.hook_status_query_error is not None:
+                code = self.hook_status_query_error
+                if code == 401:
+                    return 401, {}, b'{"error": {"message": "Invalid Credentials"}}'
+                elif code == 403:
+                    return 403, {}, b'{"error": {"errors": [{"reason": "storageQuotaExceeded", "message": "Storage quota full"}]}}'
+                elif code == 429:
+                    return 429, {}, b'{"error": {"message": "Rate limit exceeded"}}'
+                else:
+                    return code, {}, b'{"error": {"message": "Backend Error"}}'
+
             m_sid = re.search(r"session_id=([^&]+)", url)
             sid = m_sid.group(1) if m_sid else ""
             if not sid or sid not in self.sessions:
@@ -258,21 +265,9 @@ class ByteAccurateDriveFaultServer:
             filename = info["filename"]
             folder_id = info["folder_id"]
             total_size = info["total_size"]
-            cr = normalized_headers.get("content-range", "")
 
             # 5a. Status progress query (Content-Range: bytes */total)
             if "*/" in cr:
-                if self.hook_status_query_error is not None:
-                    code = self.hook_status_query_error
-                    if code == 401:
-                        return 401, {}, b'{"error": {"message": "Invalid Credentials"}}'
-                    elif code == 403:
-                        return 403, {}, b'{"error": {"errors": [{"reason": "storageQuotaExceeded", "message": "Storage quota full"}]}}'
-                    elif code == 429:
-                        return 429, {}, b'{"error": {"message": "Rate limit exceeded"}}'
-                    else:
-                        return code, {}, b'{"error": {"message": "Backend Error"}}'
-
                 if self.hook_missing_308_range > 0:
                     self.hook_missing_308_range -= 1
                     return 308, {}, b""
@@ -357,6 +352,8 @@ class ByteAccurateDriveFaultServer:
                     "md5Checksum": hashlib.md5(comm).hexdigest(),
                     "parents": [folder_id],
                 }
+                if self.hook_omit_remote_md5:
+                    meta.pop("md5Checksum", None)
                 self.committed_files[fid] = meta
                 self.session_committed[sid] = True
                 return 200, {"content-type": "application/json"}, json.dumps(meta).encode("utf-8")
@@ -822,7 +819,7 @@ class TestSeededSecretNonDisclosure(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp(prefix="colab_qa_secrets_")
         self.addCleanup(lambda: shutil.rmtree(self.test_dir, ignore_errors=True))
         self.registry = ManagedSessionRegistry(registry_path=Path(self.test_dir) / "reg.json")
-        self.telemetry = TelemetryEmitter()
+        self.telemetry = TelemetryEmitter(ledger_path=Path(self.test_dir) / "telemetry_events.jsonl")
 
     def test_seeded_secret_non_disclosure_in_sanitize_text(self):
         """sanitize_text must redact seeded OAuth tokens, client secrets, and session URLs.

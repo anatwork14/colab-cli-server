@@ -114,4 +114,10 @@ For each claim, add a result row to progress.md:
 | **Q38** | Asynchronous worker recovery | Recovers pending tasks from journal across restart | Confirmed in `test_upload_worker.py` | PASS |
 | **Q39** | Multi-client read-only attach | 2 independent clients view same run; 0 VM allocation | Confirmed in `test_workspace_broker.py` | PASS |
 | **Q40** | Expired runtime discovery | Historical runs and Drive links discoverable after VM stop | Confirmed in `test_drive_and_broker_e2e.py` | PASS |
+| **Q41** | Trusted-proxy spoofing & peer IP check | Requires `trusted_proxy_secret`, peer IP whitelist, and HMAC/secret header | Confirmed in `test_monitor_backend.py` & `test_adversarial_security_and_fault_injection.py` | PASS |
+| **Q42** | Real TLS socket wrapping | Wraps socket with `ssl.SSLContext` (`TLSv1_2`+) and validates cert/key files | Confirmed in `test_monitor_backend.py` & `test_adversarial_security_and_fault_injection.py` | PASS |
+| **Q43** | Byte-accurate HTTP 308 Range validation | Partial Range, missing Range, and malformed/impossible Range handled without skipping bytes | Confirmed in `test_google_drive_store.py` & `test_adversarial_security_and_fault_injection.py` | PASS |
+| **Q44** | Same-name/same-size MD5 collision & readback | Rejects stale files with mismatched MD5; verifies content via `alt=media` readback if MD5 omitted | Confirmed in `test_google_drive_store.py` & `test_adversarial_security_and_fault_injection.py` | PASS |
+| **Q45** | Seeded secret non-disclosure audit | 0 seeded tokens/secrets/session URLs leaked across tracker, journal, collector, artifacts, or API | Confirmed in `test_adversarial_security_and_fault_injection.py` | PASS |
+| **Q46** | 13-stage end-to-end V2 + Drive pipeline | Full offline pipeline from manifest/plan through sync, telemetry, Drive publish, teardown & attach | Confirmed in `test_project_e2e.py` | PASS |
 

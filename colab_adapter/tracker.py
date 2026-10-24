@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 # Sensitive dictionary key substrings to scrub
 _SENSITIVE_KEYS = (
     "token",
+    "refresh",
     "auth",
     "secret",
     "password",
@@ -49,12 +50,16 @@ SENSITIVE_PATTERNS = [
     (re.compile(r"gh[pousr]_[0-9a-zA-Z]{20,}"), "[REDACTED_GITHUB_TOKEN]"),
     # JWT tokens
     (re.compile(r"ey[A-Za-z0-9_\-]{15,}\.ey[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]+"), "[REDACTED_JWT]"),
+    # Bearer authorization tokens (not already redacted)
+    (re.compile(r"(?i)(Bearer\s+)(?!\[REDACTED)[A-Za-z0-9._~+/=\-]+"), r"\1[REDACTED_TOKEN]"),
     # PEM Private Keys
     (re.compile(r"-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+ PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
     # URL query parameters containing credentials
     (re.compile(r"([?&](?:code|token|key|secret|password|access_token)=)[^&\s]+"), r"\1[REDACTED_PARAM]"),
     # Key-value secret assignments in text or tracebacks
     (re.compile(r"(?i)(?:token|secret|password|api_key|access_token|auth)\s*[:=]\s*['\"]?([a-zA-Z0-9_\-]{8,})['\"]?"), "[REDACTED_SECRET]"),
+    # Explicit seeded or labeled secret tokens in text
+    (re.compile(r"\bSECRET_[A-Z0-9_]{6,}\b"), "[REDACTED_SECRET]"),
 ]
 
 

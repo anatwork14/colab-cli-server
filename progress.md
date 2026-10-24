@@ -6,9 +6,9 @@
 
 - **V1: MERGED / verified on GitHub.** PR #2 squash-merged into main at commit 2bfd2194ad8259d785ca59935579eab6bdad052c. Human operator reported server synchronization and 43/43 offline tests on Python 3.8 and 3.12, OAuth diagnostics and no active sessions. The maintainer has not independently inspected the user's running server in this planning PR.
 - **V1 live evidence:** earlier explicitly approved Colab T4 one-shot and stateful E2E executions proved basic remote CUDA execution, input upload, artifact download, checksum/ZIP checks and teardown. These tests predate V2 and do **not** validate SSH, directory sync or new development workflows.
-- **Dashboard M8: PLANNED, not built.** The monitor will run on the Ubuntu host and use read-only official CLI account usage snapshots plus emitted run telemetry. Credentials never go to browser; HTTPS/VPN access must be separately configured.
-- **V2 planning: IN PROGRESS in plan/v2-project-workspaces.** The V2 requirements, architecture, milestones and expected-results gates are being drafted. **No V2 implementation, live SSH test, GPU rental or cost measurement is claimed.**
-- **Account safety:** NO cloud allocations, SSH auto-provision, Drive mount, paid API, GPU spend or unattended deployment authorized by these planning files.
+- **Dashboard M8: COMPLETE (Offline verified).** Full-stack monitor backend (`colab_adapter/monitor/server.py`, `collector.py`, `schemas.py`) and responsive embedded SPA (`colab_adapter/monitor/ui.py`) are implemented and verified offline with strict Bearer/trusted-proxy authentication, TLS enforcement, and deep secret redaction.
+- **V2 implementation: COMPLETE across M1–M8 and V2-Drive (`feat/v2-drive-workspaces`).** All V2 milestones (M1–M8) and Cross-Device Workspaces & Google Drive Durable Storage (Issue #21, PR #22) are implemented and verified offline (**218/218 tests passing on Python 3.12; 217/218 passed + 1 Python>=3.10 AST check skipped on Python 3.8**). **No live V2 SSH test, GPU rental, or live Google Drive API call has been executed.**
+- **Account safety:** NO cloud allocations, SSH auto-provision, Drive mount, paid API, GPU spend or unattended deployment authorized or executed during V2 development and testing.
 
 ## Baseline inventory (evidence from main)
 
@@ -36,8 +36,8 @@
 | M5 | Attach/update/execute/stop lifecycle | COMPLETE | Issue #9, colab_adapter/project_sessions.py, tests/test_project_sessions.py; 85/85 tests pass |
 | M6 | Artifact/cache/resume and observability | COMPLETE | Issue #10, colab_adapter/artifacts.py, colab_adapter/telemetry.py; 95/95 tests pass |
 | M7 | Integration, end-to-end signoff and docs | COMPLETE | Issue #11, colab_adapter/cli.py, tests/test_project_e2e.py; 111/111 tests pass |
-| M8 | Secure browser training & compute monitor | COMPLETE | Issue #12, colab_adapter/monitor/, tests/test_monitor_backend.py; 105/105 tests pass |
-| V2-Drive | Cross-Device Workspaces & Google Drive Artifacts | COMPLETE | Issue #21, colab_adapter/storage/, broker, reproducibility; 154/154 tests pass |
+| M8 | Secure browser training & compute monitor | COMPLETE | Issue #12, colab_adapter/monitor/, tests/test_monitor_backend.py, tests/test_dashboard_ui_integration.py; 218/218 suite pass |
+| V2-Drive | Cross-Device Workspaces & Google Drive Artifacts | COMPLETE | Issue #21, PR #22, colab_adapter/storage/, broker, reproducibility; 218/218 tests pass on Python 3.12 (217/218 + 1 skip on Python 3.8) |
 | M9 | Cross-provider abstraction (optional) | DEFERRED | Only after Colab V2 is independently usable |
 
 
@@ -46,6 +46,28 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-25 — V2 Complete Integration, Full-Stack UI, Drive Protocol Hardening & Adversarial QA (branch `feat/v2-drive-workspaces`):**
+  - **P0 Trusted-Proxy Authentication & Real TLS Socket Enforcement (`colab_adapter/monitor/server.py`, `colab_adapter/broker.py`)**:
+    - Resolved trusted-proxy header spoofing: enabling `trusted_proxy=True` now strictly requires a non-empty `trusted_proxy_secret` (raising `ValueError` / `BrokerAuthenticationError` if omitted), validates client peer IP against `trusted_proxy_ips` (default loopback `127.0.0.1`, `::1`), validates `X-Remote-User` / `X-Forwarded-User` against `^[a-zA-Z0-9_.@-]{1,128}$`, and verifies `X-Proxy-Secret` via `hmac.compare_digest` or `X-Proxy-Signature` via HMAC-SHA256.
+    - Enforced real TLS socket encryption: when `require_tls=True` (or `allow_external=True` on a non-loopback host without `trusted_proxy`), `MonitorServer` validates `tls_certfile` and `tls_keyfile` and wraps `self.socket` using `ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)` with `TLSVersion.TLSv1_2` minimum.
+  - **P1 Byte-Accurate Google Drive Resumable Upload & Authoritative Verification (`colab_adapter/storage/google_drive.py`)**:
+    - Eliminated unacknowledged byte skipping when HTTP 308 omits `Range`: strictly validates `Range` header via `^bytes=0-(\d+)$` and boundary checks (`0 < confirmed_next <= start_byte + chunk_len <= total_size`). When `Range` is absent on 308, reconciles progress via `_query_upload_progress` and retries unacknowledged bytes instead of advancing offset.
+    - Hardened `_query_upload_progress` to raise `DriveAuthenticationError` on 401 (after optional token refresh), `DriveQuotaExceededError` on 403 quota errors, `DriveTransferError` on 429/5xx after bounded exponential backoff, and return `-1` sentinel on 404/410 session expiry.
+    - Prevented same-name/same-size file collisions by matching both `expected_size` and `expected_md5` in `_find_file_in_folder` and resetting stale journal entries when local file size or SHA256 changes.
+    - Added `alt=media` streaming content readback verification fallback in `publish()` when Drive metadata omits `md5Checksum`, raising `DriveIntegrityError` if readback fails or SHA256/size mismatches.
+    - Added `_sanitize_drive_error` to scrub Bearer tokens, resumable session URLs (`session_id=`, `upload_id=`), and OAuth secrets across all Drive exceptions and journal error records.
+  - **P1 Storage Reliability, Worker Deduplication & Secret Redaction (`colab_adapter/storage/transfer.py`, `worker.py`, `tracker.py`, `collector.py`, `artifacts.py`)**:
+    - Updated `TransferRecord.to_dict(safe=True)` to deeply scrub `last_error` (`sanitize_text`) and `metadata` (`sanitize_data`) in addition to redacting `resumable_session_url`.
+    - Added in-flight/queued deduplication in `ArtifactUploadWorker.enqueue()` and pre-upload re-verification when local checkpoints are overwritten with new weights.
+    - Applied `sanitize_text` / `sanitize_data` across `AccountUsageCollector`, `ArtifactManager`, and `TelemetryEmitter`.
+  - **Full-Stack Monitoring Dashboard UI (`colab_adapter/monitor/ui.py`)**:
+    - Implemented complete responsive SPA dashboard in `colab_adapter/monitor/ui.py` with `sessionStorage` Bearer auth, Blob CSV export, Compute Units Balance & History SVG chart, Active Managed Sessions table, filterable Training Runs table, and Run Inspector (SVG Loss/Eval metrics chart, honest GPU utilization indicator, log viewer, and SHA256 Google Drive Artifacts table).
+  - **M1–M8 Platform Integration & 13-Stage End-to-End Pipeline (`colab_adapter/capability.py`, `tests/test_project_e2e.py`, `tests/test_adversarial_security_and_fault_injection.py`)**:
+    - Enforced `CliCapabilities` tuple immutability, `SshSafetyGuard.prepare_isolated_ssh_config` (`0700` dir, `0600` `sessions.json`), and pre-invocation TOCTOU verification raising `SshAutoAllocationRiskError`.
+    - Added 13-stage end-to-end integration test (`test_complete_v2_pipeline_with_drive_and_cross_device_monitor`) and 20-test adversarial security & byte-accurate fault-injection suite (`tests/test_adversarial_security_and_fault_injection.py`).
+    - Full offline test suite: **218/218 tests passing on Python 3.12** (0 failures, 0 errors, 0 skipped) and **217/218 passed + 1 skipped on Python 3.8** (0 failures, 0 errors).
+    - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive API calls made).
+    - **STATUS: READY_FOR_INDEPENDENT_REVIEW.**
 - **2026-10-24 — V2 Security Hardening & Resumable Recovery COMPLETE (branch `feat/v2-drive-workspaces`):**
   - **P0 Authentication & Remote Access Security**:
     - Completely removed browser authentication through `?token=` query parameters across all endpoints (`/api/v1/summary`, `/api/v1/runs`, `/api/v1/events/stream`, `/api/v1/export/compute.csv`).

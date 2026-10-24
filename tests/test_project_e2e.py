@@ -332,35 +332,41 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         external_symlink = pipeline_dir / "external_symlink.txt"
         os.symlink(str(external_secret), str(external_symlink))
 
-        # colab-project.yaml manifest
-        manifest_yaml = pipeline_dir / "colab-project.yaml"
-        manifest_yaml.write_text(
-            """schema_version: 1
-project:
-  name: e2e_research_v2
-  root: .
-runtime:
-  gpu: T4
-  timeout_seconds: 900.0
-  retain_session: false
-execution:
-  entrypoint: src/trainer.py
-  args: ["--config", "configs/base.yaml"]
-workspace:
-  remote_root: /content/colab-workspaces/e2e_research_v2
-  include: ["**/*"]
-  exclude: [".env*", "external_symlink*"]
-artifacts:
-  pull: ["checkpoints/model_final.pt"]
-  local_dir: artifacts
-""",
+        # colab-project.json manifest (stdlib JSON compatible across all Python versions)
+        manifest_file = pipeline_dir / "colab-project.json"
+        manifest_file.write_text(
+            json.dumps({
+                "schema_version": 1,
+                "project": {
+                    "name": "e2e_research_v2",
+                    "root": ".",
+                },
+                "runtime": {
+                    "gpu": "T4",
+                    "timeout_seconds": 900.0,
+                    "retain_session": False,
+                },
+                "execution": {
+                    "entrypoint": "src/trainer.py",
+                    "args": ["--config", "configs/base.yaml"],
+                },
+                "workspace": {
+                    "remote_root": "/content/colab-workspaces/e2e_research_v2",
+                    "include": ["**/*"],
+                    "exclude": [".env*", "external_symlink*"],
+                },
+                "artifacts": {
+                    "pull": ["checkpoints/model_final.pt"],
+                    "local_dir": "artifacts",
+                },
+            }, indent=2),
             encoding="utf-8",
         )
 
         # =====================================================================
         # Stage 2: Project manifest and plan
         # =====================================================================
-        spec = load_project_manifest(manifest_yaml)
+        spec = load_project_manifest(manifest_file)
         self.assertEqual(spec.name, "e2e_research_v2")
         self.assertEqual(spec.entrypoint, "src/trainer.py")
         self.assertEqual(spec.gpu, "T4")
@@ -374,7 +380,7 @@ artifacts:
         plan_paths = [f["path"] for f in plan["files"]]
         self.assertIn("src/trainer.py", plan_paths)
         self.assertIn("configs/base.yaml", plan_paths)
-        self.assertIn("colab-project.yaml", plan_paths)
+        self.assertIn("colab-project.json", plan_paths)
         self.assertNotIn(".env", plan_paths, "Secret .env must be excluded from execution plan")
         self.assertNotIn("external_symlink.txt", plan_paths, "External symlink must be excluded from plan")
 

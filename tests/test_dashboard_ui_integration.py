@@ -45,12 +45,6 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-import colab_adapter.monitor.server as server_mod
-
-# Ensure server module has 're' bound if missing from upstream imports
-if not hasattr(server_mod, "re") or server_mod.re is None:
-    server_mod.re = re
-
 from colab_adapter.monitor.collector import AccountSample, AccountUsageCollector
 from colab_adapter.monitor.schemas import _iso_now
 from colab_adapter.monitor.server import MonitorServer, start_monitor_server

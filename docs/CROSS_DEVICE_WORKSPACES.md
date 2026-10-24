@@ -72,6 +72,9 @@ All API endpoints strictly require authentication via `Authorization: Bearer <to
 ## Remote Access & Deployment Security
 
 1. **Loopback Default Binding**: The monitoring server binds to `127.0.0.1` by default.
-2. **Encrypted External Binding**: Binding to an external network interface (`allow_external=True`) strictly requires TLS/HTTPS encryption (`require_tls=True`) or a trusted reverse-proxy identity gateway (`trusted_proxy=True`). Raw unencrypted HTTP on external interfaces is rejected with `ValueError`.
+2. **Real TLS Socket Encryption & Verified Trusted Proxy**: Binding to an external network interface (`allow_external=True`) strictly requires either:
+   - Real TLS socket encryption (`require_tls=True`) with valid `tls_certfile` and `tls_keyfile` wrapped via `ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)` (`TLSv1.2`+), or
+   - A verified reverse-proxy identity gateway (`trusted_proxy=True`) configured with a non-empty `trusted_proxy_secret`, peer IP validation against `trusted_proxy_ips` (default `127.0.0.1`, `::1`), `X-Remote-User` format validation (`^[a-zA-Z0-9_.@-]{1,128}$`), and constant-time verification of `X-Proxy-Secret` or HMAC-SHA256 `X-Proxy-Signature`.
+   Raw unencrypted HTTP on external interfaces or `trusted_proxy=True` without a shared secret is rejected with `ValueError` / `BrokerAuthenticationError`.
 3. **Strict CORS Policy**: Wildcard CORS (`Access-Control-Allow-Origin: *`) is completely eliminated. The server restricts access to same-origin requests or explicitly configured allowed origins, sending `Vary: Origin`.
 4. **Persistent Credentials**: Broker tokens can be loaded from and persisted to a protected `tokens_file` with `0600` permissions (parent directory `0700`), ensuring authentication configuration survives service restarts.

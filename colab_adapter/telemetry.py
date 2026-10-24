@@ -142,7 +142,7 @@ class TelemetryEmitter:
                     try:
                         record = json.loads(line)
                         if run_id is None or record.get("run_id") == run_id:
-                            events.append(record)
+                            events.append(sanitize_data(record))
                     except json.JSONDecodeError:
                         continue
         return events

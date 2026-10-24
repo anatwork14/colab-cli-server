@@ -84,6 +84,7 @@ class TestSecurityAndResumableRecoveryRegressions(unittest.TestCase):
         port = server.server_address[1]
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
+        self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
 
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -119,6 +120,7 @@ class TestSecurityAndResumableRecoveryRegressions(unittest.TestCase):
         port = server.server_address[1]
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
+        self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
 
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)

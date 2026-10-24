@@ -196,11 +196,13 @@ All commands support `--json` for machine-readable output by autonomous agents a
 ### Training & Compute Monitor CLI Commands
 
 ```bash
-# Capture an immediate read-only account usage and session snapshot
-colab-adapter monitor snapshot
+# Start local authenticated monitoring server with web dashboard (loopback default)
+colab-adapter monitor --host 127.0.0.1 --port 8080 --auth-token <SECRET_TOKEN>
 
-# Start local authenticated monitoring server with web dashboard
-colab-adapter monitor server --host 127.0.0.1 --port 8765 --token <SECRET_TOKEN>
+# Start monitoring server with TLS encryption or behind a verified identity proxy
+colab-adapter monitor --host 0.0.0.0 --port 8443 --allow-external \
+  --auth-token <SECRET_TOKEN> --require-tls \
+  --tls-certfile /path/to/cert.pem --tls-keyfile /path/to/key.pem
 ```
 
 **Security & Account Protection:**

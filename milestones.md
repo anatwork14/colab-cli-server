@@ -1,6 +1,6 @@
 # Colab CLI Server V2 — Milestones & Release Gates
 
-> Status as of 2026-10-24: M0 COMPLETE; M1–M8 NOT_STARTED; M9 DEFERRED. Scope is interactive human-approved research workflows, NOT an unrestricted autonomous cloud provisioning platform. No deadline or engineering estimate is promised.
+> Status as of 2026-10-25: M0–M8 & V2-Drive COMPLETE (Offline verified; 218/218 tests passing on Python 3.12, 217/218 + 1 skip on Python 3.8); M9 DEFERRED. Scope is interactive human-approved research workflows, NOT an unrestricted autonomous cloud provisioning platform. No deadline or engineering estimate is promised.
 
 ## Definition of Done (applies to every milestone)
 
@@ -140,9 +140,9 @@
   - Added atomic TransferJournal writes (`0600` files, `0700` dirs, fsync) and safe corruption recovery.
   - Implemented in-process background retry scheduler for transient failures without worker restart.
   - Hardened reproducible source snapshots against symlinks and self-referential output archives.
-- Added comprehensive offline test suites in `tests/test_storage_abstraction.py`, `tests/test_google_drive_store.py`, `tests/test_reproducibility.py`, `tests/test_checkpoint_policy.py`, `tests/test_upload_worker.py`, `tests/test_workspace_broker.py`, `tests/test_drive_and_broker_e2e.py`, and `tests/test_v2_security_and_resumable_recovery.py`.
-- **Full test suite: 154 tests passing** (100% pass, 0 failures, 1 skipped).
-- **Gate G-Drive Satisfied:** 0 runtime spend, 0 cloud VMs allocated, 100% offline mocked verification. Live Drive validation pending user approval.
+- Added comprehensive offline test suites in `tests/test_storage_abstraction.py`, `tests/test_google_drive_store.py`, `tests/test_reproducibility.py`, `tests/test_checkpoint_policy.py`, `tests/test_upload_worker.py`, `tests/test_workspace_broker.py`, `tests/test_drive_and_broker_e2e.py`, `tests/test_v2_security_and_resumable_recovery.py`, `tests/test_dashboard_ui_integration.py`, and `tests/test_adversarial_security_and_fault_injection.py`.
+- **Full test suite: 218/218 tests passing on Python 3.12 (217/218 passed + 1 skipped on Python 3.8; 0 failures, 0 errors).**
+- **Gate G-Drive Satisfied:** 0 runtime spend, 0 cloud VMs allocated, 100% offline mocked verification including byte-accurate fault injection and adversarial security audits. Live Drive validation pending user approval.
 
 
 ## Development sequence and parallelism
