@@ -33,10 +33,13 @@ class ArtifactManifest:
     verified_at: str
     verification_level: int
     is_checkpoint: bool = False
+    drive_publication_status: Optional[str] = None
+    remote_file_id: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
 
 
 def compute_file_sha256(file_path: Union[str, Path], chunk_size: int = 65536) -> str:
@@ -153,10 +156,54 @@ def verify_local_artifact(
 class ArtifactManager:
     """Handles durable download, multi-tier verification, and atomic commit of remote artifacts."""
 
-    def __init__(self, transport: BaseTransport, local_dest_dir: Optional[Union[str, Path]] = None):
+    def __init__(
+        self,
+        transport: BaseTransport,
+        local_dest_dir: Optional[Union[str, Path]] = None,
+        cloud_store: Optional[Any] = None,
+        upload_worker: Optional[Any] = None,
+    ):
         self.transport = transport
         self.local_dest_dir = Path(local_dest_dir or "./artifacts").resolve()
         self.local_dest_dir.mkdir(parents=True, exist_ok=True)
+        self.cloud_store = cloud_store
+        self.upload_worker = upload_worker
+
+    def enqueue_cloud_publish(
+        self,
+        manifest: ArtifactManifest,
+        project_id: str,
+        run_id: str,
+        artifact_type: str = "checkpoint",
+    ) -> Optional[Any]:
+        """Enqueue verified artifact for background cloud publication."""
+        if not self.upload_worker and not self.cloud_store:
+            return None
+
+        if self.upload_worker:
+            record = self.upload_worker.enqueue(
+                local_path=manifest.abs_path,
+                project_id=project_id,
+                run_id=run_id,
+                artifact_type=artifact_type,
+                expected_sha256=manifest.sha256,
+                metadata={"verification_level": manifest.verification_level, "rel_path": manifest.rel_path},
+            )
+            manifest.drive_publication_status = record.status
+            return record
+        elif self.cloud_store:
+            stored = self.cloud_store.publish(
+                source=manifest.abs_path,
+                project_id=project_id,
+                run_id=run_id,
+                artifact_type=artifact_type,
+                expected_sha256=manifest.sha256,
+                metadata={"verification_level": manifest.verification_level},
+            )
+            manifest.drive_publication_status = "PUBLISHED"
+            manifest.remote_file_id = stored.remote_file_id
+            return stored
+        return None
 
     def download_and_verify(
         self,
@@ -166,6 +213,9 @@ class ArtifactManager:
         expected_sha256: Optional[str] = None,
         min_size_bytes: int = 1,
         is_checkpoint: bool = False,
+        enqueue_cloud: bool = False,
+        project_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> ArtifactManifest:
         """Download remote artifact to a staged temp file, verify it, and atomically commit."""
         filename = local_filename or Path(remote_path).name
@@ -192,6 +242,20 @@ class ArtifactManager:
             os.replace(str(staging_path), str(target_path))
             manifest.abs_path = str(target_path)
             manifest.rel_path = filename
+
+            if enqueue_cloud and project_id and run_id:
+                try:
+                    self.enqueue_cloud_publish(
+                        manifest=manifest,
+                        project_id=project_id,
+                        run_id=run_id,
+                        artifact_type="checkpoint" if is_checkpoint else "output",
+                    )
+                except Exception as ce:
+                    # Cloud enqueue failure must NEVER mask successful local verification
+                    manifest.drive_publication_status = "FAILED"
+                    manifest.metadata["cloud_enqueue_error"] = str(ce)
+
             return manifest
 
         except Exception as e:
@@ -207,3 +271,4 @@ class ArtifactManager:
                 f"Failed to retrieve or verify artifact '{remote_path}' from session '{session_id}': {e}",
                 details={"session_id": session_id, "remote_path": remote_path, "error": str(e)},
             ) from e
+

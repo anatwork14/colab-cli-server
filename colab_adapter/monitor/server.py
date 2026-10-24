@@ -182,16 +182,37 @@ _EMBEDDED_HTML_DASHBOARD = """<!DOCTYPE html>
           <th>Run ID</th>
           <th>Project</th>
           <th>Status</th>
+          <th>Latest Checkpoint</th>
+          <th>Drive Status</th>
           <th>Epoch / Step</th>
-          <th>Latest Loss</th>
           <th>Started</th>
         </tr>
       </thead>
       <tbody>
-        <tr><td colspan="6" style="text-align: center; color: var(--text-dim);">No training runs recorded</td></tr>
+        <tr><td colspan="7" style="text-align: center; color: var(--text-dim);">No training runs recorded</td></tr>
       </tbody>
     </table>
   </div>
+
+  <div class="section-title">Durable Artifacts & Google Drive Publication</div>
+  <div class="card" id="artifacts-card">
+    <table id="artifacts-table">
+      <thead>
+        <tr>
+          <th>Artifact</th>
+          <th>Type</th>
+          <th>Size</th>
+          <th>SHA256</th>
+          <th>Storage</th>
+          <th>Drive Status</th>
+        </tr>
+      </thead>
+      <tbody id="artifacts-tbody">
+        <tr><td colspan="6" style="text-align: center; color: var(--text-dim);">Select a run or wait for artifacts</td></tr>
+      </tbody>
+    </table>
+  </div>
+
 
   <script>
     const token = new URLSearchParams(window.location.search).get('token') || '';
@@ -455,21 +476,120 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             if ev.get("metrics"):
                 run["latest_metrics"].update(ev.get("metrics", {}))
 
+        # Enrich active runs and discover durable historical runs from disk
+        artifacts_root = getattr(self.server, "artifacts_dir", Path("./artifacts").resolve())
+        proj_base = artifacts_root / "projects"
+        if proj_base.is_dir():
+            target_dirs = [proj_base / proj_filter] if proj_filter else [d for d in proj_base.iterdir() if d.is_dir()]
+            for p_dir in target_dirs:
+                runs_dir = p_dir / "runs"
+                if not runs_dir.is_dir():
+                    continue
+                for r_dir in runs_dir.iterdir():
+                    if not r_dir.is_dir():
+                        continue
+                    r_id = r_dir.name
+                    if r_id not in runs_map:
+                        runs_map[r_id] = {
+                            "run_id": r_id,
+                            "project_id": p_dir.name,
+                            "status": "COMPLETED",
+                            "start_time": None,
+                            "completion_time": None,
+                            "latest_epoch": None,
+                            "latest_step": None,
+                            "latest_metrics": {},
+                            "checkpoint_count": 0,
+                        }
+
+                    # Read manifest if present
+                    m_path = r_dir / "manifest.json"
+                    if m_path.is_file():
+                        try:
+                            with open(m_path, "r", encoding="utf-8") as mf:
+                                m_data = json.load(mf)
+                            run = runs_map[r_id]
+                            if not run.get("start_time"):
+                                run["start_time"] = m_data.get("created_at")
+                            artifacts_dict = m_data.get("artifacts", {})
+                            for a_val in artifacts_dict.values():
+                                a_type = a_val.get("artifact_type")
+                                if a_type == "checkpoint":
+                                    run["checkpoint_count"] = max(run["checkpoint_count"], 1)
+                                    run["latest_checkpoint_name"] = Path(a_val.get("path", "")).name
+                                    run["latest_checkpoint_sha256"] = a_val.get("sha256")
+                                if a_val.get("storage_provider") == "google_drive" or a_val.get("remote_file_id"):
+                                    run["drive_publication_status"] = "PUBLISHED"
+                                    run["drive_file_id"] = a_val.get("remote_file_id")
+                                if a_type == "source_snapshot":
+                                    run["source_snapshot_available"] = True
+                        except Exception:
+                            pass
+
+        # Check session active status
+        all_managed = self.server.registry.get_all_managed()
+        active_session_ids = {s_id for s_id, s_info in all_managed.items() if s_info.get("state") in ("READY", "RUNNING", "ACTIVE")}
+
+        for r_id, run in runs_map.items():
+            run["is_runtime_active"] = r_id in active_session_ids
+            if "drive_publication_status" not in run:
+                run["drive_publication_status"] = "PENDING"
+            if "source_snapshot_available" not in run:
+                run["source_snapshot_available"] = False
+
         self._send_json(list(runs_map.values()))
 
     def _handle_run_detail(self, path: str) -> None:
         parts = path.strip("/").split("/")
-        # Path format: api/v1/runs/{run_id} or api/v1/runs/{run_id}/metrics or api/v1/runs/{run_id}/logs
+        # Path format: api/v1/runs/{run_id} or api/v1/runs/{run_id}/{sub_resource}
+        run_id = parts[3]
+        events = self.server.telemetry.get_events(run_id=run_id)
+
+        artifacts_root = getattr(self.server, "artifacts_dir", Path("./artifacts").resolve())
+        manifest_data: Optional[Dict[str, Any]] = None
+        proj_base = artifacts_root / "projects"
+        if proj_base.is_dir():
+            for p_dir in proj_base.iterdir():
+                m_candidate = p_dir / "runs" / run_id / "manifest.json"
+                if m_candidate.is_file():
+                    try:
+                        with open(m_candidate, "r", encoding="utf-8") as mf:
+                            manifest_data = json.load(mf)
+                        break
+                    except Exception:
+                        pass
+
         if len(parts) == 4:
-            run_id = parts[3]
-            events = self.server.telemetry.get_events(run_id=run_id)
-            if not events:
+            if not events and not manifest_data:
                 self._send_json({"error": "Run not found", "run_id": run_id}, status=404)
                 return
-            self._send_json({"run_id": run_id, "event_count": len(events), "events": events})
+            artifacts_list = list(manifest_data.get("artifacts", {}).values()) if manifest_data else []
+            self._send_json({
+                "run_id": run_id,
+                "event_count": len(events),
+                "artifacts_count": len(artifacts_list),
+                "artifacts": artifacts_list,
+                "events": events,
+            })
+        elif len(parts) == 5 and parts[4] == "artifacts":
+            artifacts_list = list(manifest_data.get("artifacts", {}).values()) if manifest_data else []
+            self._send_json({"run_id": run_id, "artifacts": artifacts_list})
+        elif len(parts) == 5 and parts[4] == "drive":
+            artifacts_list = list(manifest_data.get("artifacts", {}).values()) if manifest_data else []
+            drive_artifacts = [a for a in artifacts_list if a.get("storage_provider") == "google_drive" or a.get("remote_file_id")]
+            status_str = "PUBLISHED" if drive_artifacts else ("PENDING" if artifacts_list else "DISABLED")
+            self._send_json({
+                "run_id": run_id,
+                "drive_publication_status": status_str,
+                "published_count": len(drive_artifacts),
+                "artifacts": drive_artifacts,
+            })
+        elif len(parts) == 5 and parts[4] == "manifest":
+            if not manifest_data:
+                self._send_json({"error": "Manifest not found for run", "run_id": run_id}, status=404)
+                return
+            self._send_json(manifest_data)
         elif len(parts) == 5 and parts[4] == "metrics":
-            run_id = parts[3]
-            events = self.server.telemetry.get_events(run_id=run_id)
             points = [
                 {
                     "event_id": e.get("event_id"),
@@ -482,8 +602,6 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             ]
             self._send_json(points)
         elif len(parts) == 5 and parts[4] == "logs":
-            run_id = parts[3]
-            events = self.server.telemetry.get_events(run_id=run_id)
             logs = []
             for e in events:
                 if e.get("details", {}).get("log_line"):
@@ -491,6 +609,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"run_id": run_id, "logs": logs})
         else:
             self._send_json({"error": "Invalid run endpoint"}, status=404)
+
 
     def _handle_events_stream(self, query: Dict[str, List[str]]) -> None:
         """SSE event stream supporting cursor resume (?from_id=...) (Q27)."""
@@ -565,7 +684,10 @@ class MonitorServer(ThreadingHTTPServer):
         telemetry: TelemetryEmitter,
         auth_token: Optional[str] = None,
         allow_external: bool = False,
+        artifacts_dir: Optional[Union[str, Path]] = None,
+        broker: Optional[Any] = None,
     ):
+
         host, port = server_address
         # Enforce loopback binding by default (Q28)
         if not allow_external and host not in ("127.0.0.1", "localhost", "::1"):
@@ -578,6 +700,8 @@ class MonitorServer(ThreadingHTTPServer):
         self.registry = registry
         self.telemetry = telemetry
         self.auth_token = auth_token
+        self.artifacts_dir = Path(artifacts_dir or "./artifacts").resolve()
+        self.broker = broker
         self.start_time = time.time()
 
 
@@ -589,6 +713,8 @@ def start_monitor_server(
     telemetry: Optional[TelemetryEmitter] = None,
     auth_token: Optional[str] = None,
     allow_external: bool = False,
+    artifacts_dir: Optional[Union[str, Path]] = None,
+    broker: Optional[Any] = None,
 ) -> MonitorServer:
     """Instantiate and start the MonitorServer."""
     col = collector or AccountUsageCollector()
@@ -602,5 +728,8 @@ def start_monitor_server(
         telemetry=tel,
         auth_token=auth_token,
         allow_external=allow_external,
+        artifacts_dir=artifacts_dir,
+        broker=broker,
     )
     return server
+

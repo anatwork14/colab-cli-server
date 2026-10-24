@@ -160,3 +160,45 @@ A responsive read-only SPA displays trends, per-project emitted training curves,
 6. Whether any watch/reload UX is worth Colab's ephemeral lifetime and cost.
 
 Every decision must be logged in progress.md and reflected in acceptance tests.
+
+---
+
+## 9. Durable Storage & Cross-Device Broker Architecture (Issue #21)
+
+```text
+  [Mac / Windows / Mobile Client]
+                 |
+      (Authenticated HTTPS / VPN)
+                 v
+   +---------------------------+
+   |     Workspace Broker      |  <-- Token Auth & Audit Logging
+   +---------------------------+
+          |             |
+          |             v
+          |      [ManagedSessionRegistry]
+          |             |
+          |             v
+          |      [Colab GPU Runtime] (Ephemeral VM)
+          |             |
+          |             | (Local download via Official CLI)
+          v             v
+   +---------------------------+
+   |   Local Artifact Store    |  <-- Multi-Tier Verification (SHA256 + PyTorch)
+   |       (`./artifacts/`)    |
+   +---------------------------+
+                 |
+                 | (Asynchronous Queue Worker + Transfer Journal)
+                 v
+   +---------------------------+
+   |  Google Drive Store (v3)  |  <-- Resumable Uploads & Range Query Resume
+   |    (`Colab-Research/`)    |
+   +---------------------------+
+```
+
+### Invariants & Boundaries
+
+1. **Storage Decoupling**: Remote Colab VMs never mount Google Drive for continuous training writes. VM writes locally; checkpoints are transferred to the Ubuntu host and verified before Google Drive publication.
+2. **Failure Isolation**: A failure in Google Drive upload never marks the GPU training job as failed. Local verified checkpoints remain intact.
+3. **No Allocation on Attach**: Viewing active or terminated runs via the Workspace Broker or M8 UI never provokes a new Colab runtime.
+4. **Secret Boundary**: Drive tokens are stored in `0600` files on the host and never transmitted to the browser or Colab VM.
+

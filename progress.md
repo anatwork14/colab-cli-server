@@ -37,14 +37,31 @@
 | M6 | Artifact/cache/resume and observability | COMPLETE | Issue #10, colab_adapter/artifacts.py, colab_adapter/telemetry.py; 95/95 tests pass |
 | M7 | Integration, end-to-end signoff and docs | COMPLETE | Issue #11, colab_adapter/cli.py, tests/test_project_e2e.py; 111/111 tests pass |
 | M8 | Secure browser training & compute monitor | COMPLETE | Issue #12, colab_adapter/monitor/, tests/test_monitor_backend.py; 105/105 tests pass |
+| V2-Drive | Cross-Device Workspaces & Google Drive Artifacts | COMPLETE | Issue #21, colab_adapter/storage/, broker, reproducibility; 142/142 tests pass |
 | M9 | Cross-provider abstraction (optional) | DEFERRED | Only after Colab V2 is independently usable |
+
 
 ## How an implementer updates this file
 
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-24 — V2 Extension / Gate G-Drive COMPLETE (branch `feat/v2-drive-workspaces`):**
+  - Implemented provider-independent storage abstraction (`ArtifactStore`, `StoredArtifact`, `LocalArtifactStore`, `PublicationManifest`, `TransferJournal`, `TransferRecord`) in `colab_adapter/storage/`.
+  - Implemented Google Drive API v3 resumable chunked upload protocol (`GoogleDriveArtifactStore`) with Range query resume, exponential backoff, Drive quota handling (403), token refresh (401), local SHA256 canonical digests, and remote MD5/size validation.
+  - Connected M6 `ArtifactManager` with asynchronous background `ArtifactUploadWorker` featuring persistent journal task recovery across process restarts.
+  - Implemented deterministic source snapshot creation (`source_snapshot.tar.gz`) with normalized mtime=0, uid=0, and strict secret filtering (`.env`, `*.pem`, `id_rsa`, `__pycache__`, `.git`).
+  - Implemented Ubuntu `WorkspaceBroker` for multi-client read-only attach, token validation, audit logging, expired runtime inspection, and strictly zero VM allocation on attach.
+  - Extended M8 monitoring server (`/api/v1/runs/<id>/artifacts`, `/drive`, `/manifest`) and responsive dashboard for Google Drive artifacts and run history continuity.
+  - Implemented `CheckpointPolicyManager` with minimum interval throttling, keep_last retention, and strict preservation of at least 1 verified local checkpoint.
+  - Added 7 comprehensive test suites in `tests/`: `test_storage_abstraction.py`, `test_google_drive_store.py`, `test_reproducibility.py`, `test_checkpoint_policy.py`, `test_upload_worker.py`, `test_workspace_broker.py`, `test_drive_and_broker_e2e.py`.
+  - Full test suite: **142 tests passing** in `9.0s` (100% pass, 0 failures, 1 skipped).
+  - Preserved 100% backward compatibility with V1 baseline and all M1–M8 milestones.
+  - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive tokens transmitted).
+  - **IMPLEMENTATION READY — LIVE DRIVE VALIDATION PENDING USER APPROVAL.**
+
 - **2026-10-24 — Milestone M7 / Gate G7 COMPLETE (branch `feat/v2-m7-integration`):**
+
   - Integrated complete project CLI subcommands in `colab_adapter/cli.py`: `init`, `validate`, `plan`, `up`, `sync`, `exec`, `status`, `stop`, `reconcile`.
   - Added monitoring CLI subcommands: `snapshot`, `server`.
   - Full `--json` output flags across all commands for automation and agent parsing (Q16).

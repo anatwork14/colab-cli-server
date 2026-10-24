@@ -66,3 +66,12 @@ V2 adds project workspace workflows (`colab-adapter project ...`) and compute mo
 - Train loss/epoch/step/progress/checkpoint and optional GPU samples require actual instrumented run events. Missing values are unavailable, never guessed.
 - Host monitoring on Ubuntu at loopback by default. Remote access from any computer requires explicit operator-approved authenticated TLS/identity proxy or VPN. Never expose tokens or project logs to unauthenticated browsers, raw public ports or client-side storage.
 - Read [docs/MONITORING_DASHBOARD_V2.md](docs/MONITORING_DASHBOARD_V2.md) and meet milestone M8 / gate G8 / Q19–Q31. Offline mock development only without separate deployment consent.
+
+### V2 Google Drive & Cross-Device Workspace guardrails (Issue #21)
+
+- **Independent Drive OAuth**: Drive API credentials must remain completely separate from Colab CLI OAuth credentials. Never transmit Drive access tokens or refresh tokens to the remote Colab VM, client browsers, or logs.
+- **Protected Server-Side Credential Storage**: All secret token files must be stored server-side with strict `0600` (user read/write only) filesystem permissions.
+- **Zero Cloud Allocation on Attach**: Viewing an active or historical run via the Workspace Broker or web dashboard must **never** provoke a new Colab GPU allocation or auto-create a VM.
+- **Durable Local Retention**: The last valid local checkpoint must **never** be deleted before Google Drive upload and verification succeed. Local retention pruning must never delete remote Drive objects without explicit human authorization.
+- **Bit-Reproducible Snapshots**: Source snapshots must be deterministic (normalized headers) and strictly filter out `.env`, private keys, SSH keys, git internals, and cache directories.
+

@@ -115,6 +115,25 @@
 **Status: DEFERRED.**
 - Consider Vkong/dedicated rental provider implementation only when provider APIs, permissions and cost semantics are separately investigated. Do not fake an interchangeable provider API. Not required for Colab V2.
 
+## V2 Extension (Issue #21) — Cross-Device Workspaces & Google Drive Artifacts (Gate G-Drive)
+**Status: COMPLETE (Offline verified; branch `feat/v2-drive-workspaces`). Dependencies: M5, M6, M7, M8.**
+- Implemented provider-independent storage abstraction (`ArtifactStore`, `StoredArtifact`, `LocalArtifactStore`, `PublicationManifest`, `TransferJournal`, `TransferRecord`) in `colab_adapter/storage/`.
+- Implemented official Google Drive API v3 resumable chunked uploader (`GoogleDriveArtifactStore`) with:
+  - Range status query resume (`Range: bytes */total`) for interrupted transfers.
+  - Bounded exponential backoff with jitter on HTTP 429/500/502/503.
+  - Typed error handling for quota exceeded (HTTP 403) and token expiration (HTTP 401 automatic refresh).
+  - Multi-tier integrity verification (local SHA256 canonical, remote size and `md5Checksum` check).
+  - Protected local credential storage with strict `0600` permissions.
+- Connected M6 `ArtifactManager` with asynchronous background `ArtifactUploadWorker` with bounded concurrency and persistent journal recovery across restarts.
+- Implemented deterministic bit-reproducible code snapshots (`create_deterministic_source_snapshot`) with normalized mtime=0 and strict secret filtering (`.env`, `*.pem`, `id_rsa`, `__pycache__`, `.git`).
+- Implemented Ubuntu-hosted `WorkspaceBroker` for multi-device read-only session inspection with constant-time token verification, audit logging, expired session historical inspection, and zero cloud VM allocation.
+- Extended M8 monitoring server (`/api/v1/runs/<id>/artifacts`, `/drive`, `/manifest`) and embedded responsive SPA dashboard for Google Drive artifact tracking and checkpoint continuity.
+- Implemented `CheckpointPolicyManager` with minimum interval throttling, keep_last local cleanup, strict preservation of at least 1 verified local checkpoint, and zero remote deletion.
+- Added comprehensive offline test suites in `tests/test_storage_abstraction.py`, `tests/test_google_drive_store.py`, `tests/test_reproducibility.py`, `tests/test_checkpoint_policy.py`, `tests/test_upload_worker.py`, `tests/test_workspace_broker.py`, and `tests/test_drive_and_broker_e2e.py`.
+- **Full test suite: 142 tests passing** (100% pass, 0 failures, 1 skipped).
+- **Gate G-Drive Satisfied:** 0 runtime spend, 0 cloud VMs allocated, 100% offline mocked verification. Live Drive validation pending user approval.
+
+
 ## Development sequence and parallelism
 
 - First merge M1; then M2 manifest and M3 transports may proceed on non-overlapping branches.
@@ -136,5 +155,7 @@
 | G6 | Artifact provenance, explicit resume, telemetry | PASSED |
 | G7 | Offline suite, owner-approved live evidence, docs | PASSED |
 | G8 | Account ledger, emitted training events, private cross-device read-only UI, zero-alloc safety | PASSED |
+| G-Drive | Google Drive resumable upload, persistent recovery, multi-device broker attach, zero-alloc safety | PASSED (Offline) |
+
 
 See docs/EXPECTED_RESULTS_V2.md for numeric acceptance measurements and definitions.

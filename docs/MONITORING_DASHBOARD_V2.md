@@ -116,3 +116,23 @@ All routes require authentication and authorization, including SSE and exports; 
 - https://github.com/googlecolab/google-colab-cli/blob/main/docs/01_session_management.md
 - https://github.com/googlecolab/google-colab-cli/blob/main/AGENTS.md
 - https://research.google.com/colaboratory/faq.html
+
+---
+
+## 7. Google Drive Artifacts & Cross-Device Run Continuity (Issue #21)
+
+The monitoring dashboard is extended to support durable artifact tracking and cross-device run continuity:
+
+### Additional Endpoints
+
+- `GET /api/v1/runs/<run_id>/artifacts`: Returns list of all verified local and cloud-published artifacts with SHA256 digests and file sizes.
+- `GET /api/v1/runs/<run_id>/drive`: Returns Google Drive publication status (`PUBLISHED`, `PENDING`, `FAILED`, `DISABLED`) and remote file IDs.
+- `GET /api/v1/runs/<run_id>/manifest`: Returns the complete experiment reproducibility manifest (`run_manifest.json` or `manifest.json`).
+
+### UI Features
+
+1. **Recent Training Runs Table**: Includes `Latest Checkpoint` and `Drive Status` columns.
+2. **Durable Artifacts & Google Drive Publication Panel**: Displays all published artifacts, storage providers, local vs remote status, and SHA256 checksums.
+3. **Run History Continuity**: Historical runs persisted in `./artifacts/projects/<project_id>/runs/<run_id>/manifest.json` remain discoverable and inspectable even after the remote Colab virtual machine has terminated.
+4. **Read-Only Invariant Preserved**: All endpoints remain strictly read-only; non-GET requests receive `HTTP 405 Method Not Allowed`.
+

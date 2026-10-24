@@ -82,8 +82,29 @@ from .project_manifest import (
     plan_project,
     validate_manifest,
 )
+from .storage import (
+    ArtifactStore,
+    ArtifactType,
+    GoogleDriveArtifactStore,
+    LocalArtifactStore,
+    PublicationManifest,
+    StoredArtifact,
+    TransferJournal,
+    TransferRecord,
+    TransferStatus,
+    ArtifactUploadWorker,
+)
+from .broker import WorkspaceBroker
+from .checkpoint_policy import CheckpointPolicyConfig, CheckpointPolicyManager
+from .reproducibility import (
+    RunManifest,
+    create_deterministic_source_snapshot,
+    get_environment_info,
+    get_git_provenance,
+)
 
 __all__ = [
+
     "ColabGPUProvider",
     "JobSpec",
     "PreparedJob",
@@ -154,4 +175,23 @@ __all__ = [
     "TelemetryEvent",
     "plan_resume_from_checkpoint",
     "record_interrupted_run",
+    # V2 Drive Workspaces & Storage (Issue #21)
+    "ArtifactStore",
+    "ArtifactType",
+    "StoredArtifact",
+    "LocalArtifactStore",
+    "GoogleDriveArtifactStore",
+    "PublicationManifest",
+    "TransferJournal",
+    "TransferRecord",
+    "TransferStatus",
+    "ArtifactUploadWorker",
+    "WorkspaceBroker",
+    "CheckpointPolicyConfig",
+    "CheckpointPolicyManager",
+    "RunManifest",
+    "create_deterministic_source_snapshot",
+    "get_git_provenance",
+    "get_environment_info",
 ]
+

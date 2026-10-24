@@ -210,8 +210,12 @@ colab-adapter monitor server --host 127.0.0.1 --port 8765 --token <SECRET_TOKEN>
 
 **Documentation:**
 - [Progress ledger](progress.md) — Completed milestones, evidence, and change logs
-- [Milestones](milestones.md) — M0–M8 release gates and evidence requirements
+- [Milestones](milestones.md) — M0–M8 and G-Drive release gates and evidence requirements
+- [Google Drive Artifacts Guide](docs/GOOGLE_DRIVE_ARTIFACTS.md) — Resumable upload, verification, and private storage hierarchy
+- [Cross-Device Workspaces Guide](docs/CROSS_DEVICE_WORKSPACES.md) — Multi-client read-only attach via Workspace Broker
+- [Artifact Recovery & Reproducibility](docs/ARTIFACT_RECOVERY.md) — Bit-reproducible code snapshots and disaster recovery
 - [V2 features](docs/FEATURES_V2.md) — Detailed feature specification
 - [V2 architecture](docs/ARCHITECTURE_V2.md) — Security contracts and threat model
 - [Expected results](docs/EXPECTED_RESULTS_V2.md) — Measurable acceptance criteria
 - [Cross-device Monitor Guide](docs/MONITORING_DASHBOARD_V2.md) — Dashboard architecture and API specification
+

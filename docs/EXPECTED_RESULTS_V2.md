@@ -98,3 +98,20 @@ For each claim, add a result row to progress.md:
 | TBD | TBD | L2 remote T4 multi-module training | Live/approval pending | Verified artifacts, 0 orphan | TBD | NOT_RUN | explicit approval required |
 
 **Do not set PASS from intended behavior.** Release G7 requires test evidence, reviewed limitations, and maintainer signoff.
+
+---
+
+## 9. Google Drive & Cross-Device Workspaces Acceptance Scorecard (Gate G-Drive)
+
+| ID | Description | Target Value | Measured Result | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **Q32** | Resumable chunked upload protocol | 1 MiB chunks; Range query resume on reconnect | 100% verified via MockDriveHttpClient | PASS |
+| **Q33** | Drive quota / rate limit handling | HTTP 403 quotaExceeded raises DriveQuotaExceededError | Confirmed in `test_google_drive_store.py` | PASS |
+| **Q34** | Automatic token refresh on 401 | Refreshes expired token and retries request | Confirmed in `test_google_drive_store.py` | PASS |
+| **Q35** | Integrity verification | Local SHA256 canonical + remote MD5/size check | Confirmed in `test_google_drive_store.py` | PASS |
+| **Q36** | Deterministic source snapshot | Bit-reproducible tar.gz (identical hash on repeat) | Confirmed in `test_reproducibility.py` | PASS |
+| **Q37** | Secret filtering in snapshot | 0 `.env`, `*.key`, `*.pem`, `id_rsa`, `.git` leaked | Confirmed in `test_reproducibility.py` | PASS |
+| **Q38** | Asynchronous worker recovery | Recovers pending tasks from journal across restart | Confirmed in `test_upload_worker.py` | PASS |
+| **Q39** | Multi-client read-only attach | 2 independent clients view same run; 0 VM allocation | Confirmed in `test_workspace_broker.py` | PASS |
+| **Q40** | Expired runtime discovery | Historical runs and Drive links discoverable after VM stop | Confirmed in `test_drive_and_broker_e2e.py` | PASS |
+
