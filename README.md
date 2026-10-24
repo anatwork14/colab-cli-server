@@ -158,10 +158,13 @@ Colab will still execute on a separate temporary VM. This project does not provi
 
 **Implementation source of truth:**
 - [Progress ledger](progress.md) — existing vs planned work and evidence
-- [Milestones](milestones.md) — M0-M8 and release gates
-- [V2 features](docs/FEATURES_V2.md) — F01-F14, manifest and proposed CLI
+- [Milestones](milestones.md) — M0-M9 and release gates
+- [V2 features](docs/FEATURES_V2.md) — F01-F23, manifest and proposed CLI
 - [V2 architecture](docs/ARCHITECTURE_V2.md) — transport/registry/sync/approval threat model
 - [Expected results](docs/EXPECTED_RESULTS_V2.md) — measurable acceptance targets (not actual results)
 - [Agent implementation instructions](docs/AGENT_IMPLEMENTATION_V2.md) — worker ownership, PR process and safety
+- [Cross-device Training & Compute Monitor](docs/MONITORING_DASHBOARD_V2.md) — private planned browser dashboard, emitted training progress and timestamped Colab account CU snapshots
+
+**Planned M8 monitor:** a separate local Ubuntu service with a secure read-only dashboard accessible from authorized computers via VPN or HTTPS identity gateway. It will display account balance, aggregate CU rate, managed training runs and collected history from activation. This is NOT implemented; no full historical Colab billing ledger or per-job CU rate is currently available from the official CLI. Never publish a raw server port or OAuth credential.
 
 **Do not run V2 example project commands yet:** they illustrate intended APIs and are not present in the installed CLI. Existing V1 commands documented above remain usable.
