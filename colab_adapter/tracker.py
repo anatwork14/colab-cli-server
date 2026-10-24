@@ -13,8 +13,34 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Sensitive dictionary key substrings to scrub
+_SENSITIVE_KEYS = (
+    "token",
+    "auth",
+    "secret",
+    "password",
+    "key",
+    "credential",
+    "resumable_session_url",
+    "session_url",
+    "upload_url",
+    "proxy_secret",
+    "trusted_proxy_secret",
+    "x_proxy_secret",
+    "x_api_token",
+    "id_token",
+)
+
 # Regex patterns for detecting and redacting credentials in any string
 SENSITIVE_PATTERNS = [
+    # Google Drive resumable upload URLs
+    (re.compile(r"https://www\.googleapis\.com/upload/drive/v3/files\?[^\s\"'<>]+"), "[REDACTED_UPLOAD_SESSION_URL]"),
+    # Upload session query params
+    (re.compile(r"(session_id|upload_id)=[A-Za-z0-9._\-]+"), r"\1=[REDACTED_SESSION_ID]"),
+    # URL-encoded form parameters
+    (re.compile(r"(client_secret|refresh_token|access_token|id_token)=[^&\s\"']+"), r"\1=[REDACTED_SECRET]"),
+    # JSON string values for sensitive keys in raw text snippets
+    (re.compile(r'(?i)((\\?["\'])(?:client_secret|refresh_token|access_token|resumable_session_url)\2\s*:\s*(\\?["\']))[^\r\n]*?(\3)'), r"\g<1>[REDACTED]\g<4>"),
     # Google OAuth authorization code (e.g. 4/0AXl...)
     (re.compile(r"4/[0-9a-zA-Z_\-]{20,}"), "[REDACTED_OAUTH_CODE]"),
     # Google OAuth Bearer / access token (ya29....)
@@ -50,7 +76,7 @@ def sanitize_data(data: Any) -> Any:
         cleaned = {}
         for k, v in data.items():
             # If the key itself looks like a secret field, redact its value entirely
-            if any(s in k.lower() for s in ("token", "auth", "secret", "password", "key", "credential")):
+            if any(s in str(k).lower() for s in _SENSITIVE_KEYS):
                 cleaned[k] = "[REDACTED]"
             else:
                 cleaned[k] = sanitize_data(v)

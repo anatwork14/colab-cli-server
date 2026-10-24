@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from .errors import ArtifactValidationError, UnmanagedSessionError
+from .tracker import sanitize_text
 from .transports.base import BaseTransport
 
 
@@ -254,7 +255,7 @@ class ArtifactManager:
                 except Exception as ce:
                     # Cloud enqueue failure must NEVER mask successful local verification
                     manifest.drive_publication_status = "FAILED"
-                    manifest.metadata["cloud_enqueue_error"] = str(ce)
+                    manifest.metadata["cloud_enqueue_error"] = sanitize_text(str(ce))
 
             return manifest
 
@@ -267,8 +268,9 @@ class ArtifactManager:
                     pass
             if isinstance(e, (ArtifactValidationError, UnmanagedSessionError)):
                 raise
+            sanitized_err = sanitize_text(str(e))
             raise ArtifactValidationError(
-                f"Failed to retrieve or verify artifact '{remote_path}' from session '{session_id}': {e}",
-                details={"session_id": session_id, "remote_path": remote_path, "error": str(e)},
+                f"Failed to retrieve or verify artifact '{remote_path}' from session '{session_id}': {sanitized_err}",
+                details={"session_id": session_id, "remote_path": remote_path, "error": sanitized_err},
             ) from e
 

@@ -28,6 +28,7 @@ except ImportError:
 
 
 from ..errors import InvalidStateTransitionError, JournalCorruptionError, JournalLockError
+from ..tracker import sanitize_data, sanitize_text
 from .base import _utc_now_iso
 
 logger = logging.getLogger(__name__)
@@ -99,14 +100,19 @@ class TransferRecord:
             )
         self.status = new_status.value
         self.updated_at = _utc_now_iso()
-        if error_message:
-            self.last_error = error_message
+        if error_message is not None:
+            self.last_error = sanitize_text(str(error_message))
 
     def to_dict(self, safe: bool = False) -> Dict[str, Any]:
-        """Convert record to dict, optionally redacting sensitive session URLs."""
+        """Convert record to dict, optionally redacting sensitive session URLs and errors."""
         d = asdict(self)
-        if safe and d.get("resumable_session_url"):
-            d["resumable_session_url"] = "[REDACTED_SESSION_URL]"
+        if safe:
+            if d.get("resumable_session_url"):
+                d["resumable_session_url"] = "[REDACTED_SESSION_URL]"
+            if d.get("last_error"):
+                d["last_error"] = sanitize_data(d["last_error"])
+            if d.get("metadata"):
+                d["metadata"] = sanitize_data(d["metadata"])
         return d
 
     @classmethod
@@ -167,13 +173,21 @@ class TransferJournal:
         if not self.path.exists():
             return {}
         try:
+            mode = stat.S_IMODE(self.path.stat().st_mode)
+            if mode & 0o077:
+                os.chmod(str(self.path), 0o600)
+        except OSError:
+            pass
+
+        try:
             with open(self.path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, ValueError) as jde:
             # Preserve corrupt copy
-            corrupt_file = self.path.parent / f"{self.path.name}.corrupt.{int(time.time())}"
+            corrupt_file = self.path.parent / f"{self.path.name}.corrupt.{int(time.time() * 1000)}"
             try:
                 shutil.copy2(str(self.path), str(corrupt_file))
+                os.chmod(str(corrupt_file), 0o600)
             except Exception:
                 pass
 
@@ -184,6 +198,10 @@ class TransferJournal:
                     with open(bak, "r", encoding="utf-8") as f_bak:
                         data = json.load(f_bak)
                         logger.warning(f"Journal corruption detected; recovered {len(data)} records from backup {bak}")
+                        try:
+                            self._write_records(data)
+                        except Exception as restore_err:
+                            logger.error(f"Failed to restore recovered journal to {self.path}: {restore_err}")
                         return data
                 except Exception:
                     pass
@@ -276,5 +294,6 @@ class TransferJournal:
                     TransferStatus.RETRY_PENDING.value,
                 ):
                     results.append(rec)
+            results.sort(key=lambda r: (r.created_at, r.transfer_id))
             return results
 

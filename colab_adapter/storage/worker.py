@@ -11,7 +11,7 @@ import random
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 from ..errors import (
     ArtifactValidationError,
@@ -19,8 +19,9 @@ from ..errors import (
     DriveIntegrityError,
     DriveQuotaExceededError,
 )
+from ..tracker import sanitize_text
 from .base import ArtifactStore, ArtifactType, StoredArtifact
-from .manifest import compute_file_sha256
+from .manifest import compute_file_md5, compute_file_sha256
 from .transfer import TransferJournal, TransferRecord, TransferStatus
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class ArtifactUploadWorker:
         self.on_failure = on_failure
 
         self._queue: queue.Queue[TransferRecord] = queue.Queue()
+        self._queued_ids: Set[str] = set()
         self._threads: List[threading.Thread] = []
         self._stop_event = threading.Event()
         self._active_transfers: Dict[str, TransferRecord] = {}
@@ -55,18 +57,29 @@ class ArtifactUploadWorker:
         # Load pending or interrupted transfers from persistent journal
         self._recover_pending_transfers()
 
+    def _is_enqueued_or_active(self, transfer_id: str) -> bool:
+        """Check whether transfer is queued, active, or in scheduled retries. Must hold self._lock."""
+        return (
+            transfer_id in self._queued_ids
+            or transfer_id in self._active_transfers
+            or any(r.transfer_id == transfer_id for r in self._scheduled_retries)
+        )
+
     def _recover_pending_transfers(self) -> None:
         """Scan persistent journal and re-enqueue any pending or in-flight transfers."""
         pending = self.journal.get_pending_transfers()
-        for record in pending:
-            # If it was interrupted while UPLOADING, transition back to RETRY_PENDING or UPLOAD_PENDING
-            if record.status == TransferStatus.UPLOADING.value:
-                try:
-                    record.transition_to(TransferStatus.RETRY_PENDING, error_message="Worker restarted during upload")
-                    self.journal.record_transfer(record)
-                except Exception:
-                    pass
-            self._queue.put(record)
+        with self._lock:
+            for record in pending:
+                # If it was interrupted while UPLOADING, transition back to RETRY_PENDING or UPLOAD_PENDING
+                if record.status == TransferStatus.UPLOADING.value:
+                    try:
+                        record.transition_to(TransferStatus.RETRY_PENDING, error_message="Worker restarted during upload")
+                        self.journal.record_transfer(record)
+                    except Exception:
+                        pass
+                if not self._is_enqueued_or_active(record.transfer_id):
+                    self._queued_ids.add(record.transfer_id)
+                    self._queue.put(record)
 
     def start(self) -> None:
         """Start worker background threads."""
@@ -101,8 +114,10 @@ class ArtifactUploadWorker:
                     remaining.append(rec)
             self._scheduled_retries = remaining
 
-        for rec in due:
-            self._queue.put(rec)
+            for rec in due:
+                if not self._is_enqueued_or_active(rec.transfer_id):
+                    self._queued_ids.add(rec.transfer_id)
+                    self._queue.put(rec)
 
     def enqueue(
         self,
@@ -115,12 +130,12 @@ class ArtifactUploadWorker:
     ) -> TransferRecord:
         """Enqueue an artifact for background upload."""
         src = Path(local_path).resolve()
+        current_sha256 = expected_sha256 or compute_file_sha256(src)
+        current_size = src.stat().st_size
         transfer_id = f"{self.store.provider_name}-{project_id}-{run_id}-{src.name}"
 
         record = self.journal.get_transfer(transfer_id)
         if not record:
-            from .manifest import compute_file_md5, compute_file_sha256
-            sha256 = expected_sha256 or compute_file_sha256(src)
             md5_hash = compute_file_md5(src)
             rel_path = f"checkpoints/{src.name}" if artifact_type == ArtifactType.CHECKPOINT.value else src.name
 
@@ -131,13 +146,31 @@ class ArtifactUploadWorker:
                 artifact_id=f"{project_id}/{run_id}/{rel_path}",
                 local_path=str(src),
                 target_rel_path=rel_path,
-                size_bytes=src.stat().st_size,
-                sha256=sha256,
+                size_bytes=current_size,
+                sha256=current_sha256,
                 md5=md5_hash,
                 status=TransferStatus.LOCAL_VERIFIED.value,
                 metadata=metadata or {},
             )
             self.journal.record_transfer(record)
+        else:
+            is_sha_changed = bool(
+                record.sha256
+                and len(record.sha256) == 64
+                and record.sha256.lower() != current_sha256.lower()
+            )
+            is_size_changed = bool(record.size_bytes != current_size)
+            if is_sha_changed or is_size_changed:
+                record.sha256 = current_sha256
+                record.md5 = compute_file_md5(src)
+                record.size_bytes = current_size
+                record.bytes_transferred = 0
+                record.resumable_session_url = None
+                record.retry_count = 0
+                record.status = TransferStatus.LOCAL_VERIFIED.value
+                if metadata:
+                    record.metadata.update(metadata)
+                self.journal.record_transfer(record)
 
         if record.status in (
             TransferStatus.LOCAL_VERIFIED.value,
@@ -145,7 +178,8 @@ class ArtifactUploadWorker:
             TransferStatus.RETRY_PENDING.value,
         ):
             with self._lock:
-                if record.transfer_id not in self._active_transfers:
+                if not self._is_enqueued_or_active(record.transfer_id):
+                    self._queued_ids.add(record.transfer_id)
                     self._queue.put(record)
 
         return record
@@ -159,6 +193,7 @@ class ArtifactUploadWorker:
                 continue
 
             with self._lock:
+                self._queued_ids.discard(record.transfer_id)
                 if record.transfer_id in self._active_transfers:
                     self._queue.task_done()
                     continue
@@ -185,14 +220,31 @@ class ArtifactUploadWorker:
                     metadata=record.metadata,
                     expected_sha256=record.sha256,
                 )
+
+                # Ensure transfer record is transitioned to PUBLISHED if store did not do so
+                refreshed = self.journal.get_transfer(record.transfer_id)
+                if refreshed and refreshed.status != TransferStatus.PUBLISHED.value:
+                    if refreshed.status == TransferStatus.LOCAL_VERIFIED.value:
+                        refreshed.transition_to(TransferStatus.UPLOAD_PENDING)
+                    if refreshed.status == TransferStatus.UPLOAD_PENDING.value:
+                        refreshed.transition_to(TransferStatus.UPLOADING)
+                    if refreshed.status == TransferStatus.UPLOADING.value:
+                        refreshed.transition_to(TransferStatus.DRIVE_VERIFIED)
+                    if refreshed.status == TransferStatus.DRIVE_VERIFIED.value:
+                        refreshed.transition_to(TransferStatus.PUBLISHED)
+                    if stored.remote_file_id:
+                        refreshed.remote_file_id = stored.remote_file_id
+                    self.journal.record_transfer(refreshed)
+
                 if self.on_success:
                     self.on_success(stored)
             except Exception as e:
-                logger.warning(f"Artifact upload failed for {record.artifact_id}: {e}")
+                err_str = sanitize_text(str(e))
+                logger.warning(f"Artifact upload failed for {record.artifact_id}: {err_str}")
                 # Refresh record state from journal
                 refreshed = self.journal.get_transfer(record.transfer_id) or record
                 refreshed.retry_count += 1
-                refreshed.last_error = str(e)
+                refreshed.last_error = err_str
 
                 if refreshed.retry_count <= refreshed.max_retries:
                     backoff = self.initial_retry_delay_sec * (2 ** (refreshed.retry_count - 1)) + random.uniform(0.01, 0.05)
@@ -211,13 +263,19 @@ class ArtifactUploadWorker:
             finally:
                 with self._lock:
                     self._active_transfers.pop(record.transfer_id, None)
+                    self._queued_ids.discard(record.transfer_id)
                 self._queue.task_done()
 
     def wait_for_completion(self, timeout: Optional[float] = None) -> bool:
         """Block until all enqueued items and scheduled retries are processed."""
         start = time.time()
-        while not self._queue.empty() or len(self._active_transfers) > 0 or len(self._scheduled_retries) > 0:
-            if timeout and (time.time() - start) >= timeout:
+        while True:
+            with self._lock:
+                queue_empty = self._queue.empty() and len(self._queued_ids) == 0
+                active_count = len(self._active_transfers)
+                retry_count = len(self._scheduled_retries)
+            if queue_empty and active_count == 0 and retry_count == 0:
+                return True
+            if timeout is not None and (time.time() - start) >= timeout:
                 return False
             time.sleep(0.05)
-        return True
