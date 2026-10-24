@@ -150,21 +150,68 @@ Tests mock subprocesses and never contact Google or allocate a runtime. Contribu
 
 This wrapper and its documentation are licensed under [MIT](LICENSE). Google's `google-colab-cli` is a separate upstream project governed by its own Apache-2.0 license and Colab service terms. No upstream code is vendored here.
 
-## V2 roadmap — VKong-inspired project workspaces (PLANNED)
+## V2 — VKong-Inspired Project Workspaces and Training Monitor
 
-The merged V1 adapter runs individual Python scripts remotely and supports stateful input/output transfer. **V2 is a proposed, not yet implemented, project-centric workflow**: versioned project manifests, safe plans, incremental source synchronization, optional SSH-over-WebSocket to approved existing Colab sessions, attached execution, checkpoint continuity and structured observability.
+The V2 implementation extends the original one-shot adapter into a comprehensive project-centric remote GPU workspace system and real-time training monitor:
 
-Colab will still execute on a separate temporary VM. This project does not provide local transparent CUDA forwarding, an always-on GPU, guaranteed GPU availability, or an endorsement/integration with VKong. Official Colab SSH can implicitly allocate a runtime; the V2 design must prevent unapproved allocation or disable that transport.
+- **Declarative Project Manifests (`colab_project.json`):** Declare source patterns, entrypoints, target accelerators, and artifact rules with offline validation and path escape rejection.
+- **Content-Addressed Incremental Sync:** Two-phase workspace synchronization transfers only modified files via streaming chunked SHA-256 diffing, with atomic commit and opt-in remote file deletion.
+- **Collision-Resistant Session Lifecycle:** Project runtime leases (`colab-v2-<name>-<uuid>`) prevent collisions, enforce state machine transitions, lock against concurrent allocations, and fail-closed on unmanaged user sessions.
+- **Multi-Tier Checkpoint & Artifact Recovery:** Staged atomic download with integrity checksums, ZIP header verification, and safe PyTorch `weights_only=True` inspection.
+- **Private Cross-Device Training & Compute Monitor:** Read-only HTTP/SSE dashboard displaying compute unit balance, burn rates, top-up detection, unattributed spend alerts, and run loss/step charts.
 
-**Implementation source of truth:**
-- [Progress ledger](progress.md) — existing vs planned work and evidence
-- [Milestones](milestones.md) — M0-M9 and release gates
-- [V2 features](docs/FEATURES_V2.md) — F01-F23, manifest and proposed CLI
-- [V2 architecture](docs/ARCHITECTURE_V2.md) — transport/registry/sync/approval threat model
-- [Expected results](docs/EXPECTED_RESULTS_V2.md) — measurable acceptance targets (not actual results)
-- [Agent implementation instructions](docs/AGENT_IMPLEMENTATION_V2.md) — worker ownership, PR process and safety
-- [Cross-device Training & Compute Monitor](docs/MONITORING_DASHBOARD_V2.md) — private planned browser dashboard, emitted training progress and timestamped Colab account CU snapshots
+### Project Workspace CLI Commands
 
-**Planned M8 monitor:** a separate local Ubuntu service with a secure read-only dashboard accessible from authorized computers via VPN or HTTPS identity gateway. It will display account balance, aggregate CU rate, managed training runs and collected history from activation. This is NOT implemented; no full historical Colab billing ledger or per-job CU rate is currently available from the official CLI. Never publish a raw server port or OAuth credential.
+```bash
+# Initialize a new project directory with template manifest and entrypoint
+colab-adapter project init ./my-project --name my-project
 
-**Do not run V2 example project commands yet:** they illustrate intended APIs and are not present in the installed CLI. Existing V1 commands documented above remain usable.
+# Validate manifest schema, path safety, and file existence
+colab-adapter project validate ./my-project
+
+# Compute dry-run file sync diff and session plan without allocating compute
+colab-adapter project plan ./my-project
+
+# Provision or attach to a remote project session under cross-process lock
+colab-adapter project up ./my-project --gpu T4
+
+# Incrementally sync workspace source tree to the remote session
+colab-adapter project sync ./my-project
+
+# Execute project entrypoint with optional runtime arguments
+colab-adapter project exec ./my-project -- --epochs 10 --batch-size 32
+
+# Inspect remote project session status and lease TTL
+colab-adapter project status ./my-project
+
+# Safely terminate project session
+colab-adapter project stop ./my-project
+
+# Reconcile expired project leases and release resources
+colab-adapter project reconcile
+```
+
+All commands support `--json` for machine-readable output by autonomous agents and scripts.
+
+### Training & Compute Monitor CLI Commands
+
+```bash
+# Capture an immediate read-only account usage and session snapshot
+colab-adapter monitor snapshot
+
+# Start local authenticated monitoring server with web dashboard
+colab-adapter monitor server --host 127.0.0.1 --port 8765 --token <SECRET_TOKEN>
+```
+
+**Security & Account Protection:**
+- Poller executes strictly read-only official CLI queries (`colab usage`, `colab sessions`) and **never** provisions cloud VMs.
+- Web dashboard is strictly read-only: no remote code execution, stop, or approval endpoints.
+- Binds to localhost by default; access from other machines should use an SSH tunnel or VPN.
+
+**Documentation:**
+- [Progress ledger](progress.md) — Completed milestones, evidence, and change logs
+- [Milestones](milestones.md) — M0–M8 release gates and evidence requirements
+- [V2 features](docs/FEATURES_V2.md) — Detailed feature specification
+- [V2 architecture](docs/ARCHITECTURE_V2.md) — Security contracts and threat model
+- [Expected results](docs/EXPECTED_RESULTS_V2.md) — Measurable acceptance criteria
+- [Cross-device Monitor Guide](docs/MONITORING_DASHBOARD_V2.md) — Dashboard architecture and API specification

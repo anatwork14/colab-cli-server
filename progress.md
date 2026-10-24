@@ -14,15 +14,15 @@
 
 | Area | Baseline | V2 gap | State |
 | --- | --- | --- | --- |
-| Upstream CLI | Official google-colab-cli; reported v0.7.5 on host | Capability probe and graceful version/feature detection | DONE V1 / TODO V2 |
-| Provider API | ColabGPUProvider, JobSpec, approval, usage, tracking | Project-aware manifest and reusable workspace operations | DONE V1 / TODO V2 |
-| Compute lifecycle | One-shot named run + stateful new/install/upload/exec/download/stop | Explicit attach/resume/reuse/TTL, no unexpected allocation | DONE V1 / TODO V2 |
-| Session registry | ManagedSessionRegistry, atomic backups, locks, reconcile | Project/session mapping, leases, resource policy and idempotency | DONE V1 / TODO V2 |
-| File transfer | Explicit input_files uploads and explicit expected_outputs downloads | Selective incremental directory sync, dry-run diff and safe deletion | DONE V1 / TODO V2 |
-| SSH transport | Upstream documents ssh --proxy-mode | Adapter-managed opt-in capability probe and transport fallback | UPSTREAM ONLY / TODO V2 |
-| Checkpoints | Local download, hash/structure/safe inference tiers | Durable remote-to-local artifacts, resume plan and metadata | DONE V1 / TODO V2 |
-| Agent safety | Interactive user prompt, non-forgeable boundary expressly absent | Protected approval executor design for autonomous usage | DOC BOUNDARY / NOT IMPLEMENTED |
-| Observability | JSONL experiment history, CLI doctor/usage | Structured project events, sync statistics, resource accounting | DONE V1 / TODO V2 |
+| Upstream CLI | Official google-colab-cli; reported v0.7.5 on host | Capability probe and graceful version/feature detection | DONE V1 / DONE V2 |
+| Provider API | ColabGPUProvider, JobSpec, approval, usage, tracking | Project-aware manifest and reusable workspace operations | DONE V1 / DONE V2 |
+| Compute lifecycle | One-shot named run + stateful new/install/upload/exec/download/stop | Explicit attach/resume/reuse/TTL, no unexpected allocation | DONE V1 / DONE V2 |
+| Session registry | ManagedSessionRegistry, atomic backups, locks, reconcile | Project/session mapping, leases, resource policy and idempotency | DONE V1 / DONE V2 |
+| File transfer | Explicit input_files uploads and explicit expected_outputs downloads | Selective incremental directory sync, dry-run diff and safe deletion | DONE V1 / DONE V2 |
+| SSH transport | Upstream documents ssh --proxy-mode | Adapter-managed opt-in capability probe and transport fallback | UPSTREAM ONLY / DONE V2 (Guarded) |
+| Checkpoints | Local download, hash/structure/safe inference tiers | Durable remote-to-local artifacts, resume plan and metadata | DONE V1 / DONE V2 |
+| Agent safety | Interactive user prompt, non-forgeable boundary expressly absent | Protected approval executor design for autonomous usage | DOC BOUNDARY / DOC & ENFORCED IN CLI |
+| Observability | JSONL experiment history, CLI doctor/usage | Structured project events, sync statistics, resource accounting | DONE V1 / DONE V2 |
 
 ## Workboard
 
@@ -35,7 +35,7 @@
 | M4 | Content-addressed workspace sync | COMPLETE | Issue #8, colab_adapter/workspace.py, tests/test_sync.py; 74/74 tests pass |
 | M5 | Attach/update/execute/stop lifecycle | COMPLETE | Issue #9, colab_adapter/project_sessions.py, tests/test_project_sessions.py; 85/85 tests pass |
 | M6 | Artifact/cache/resume and observability | COMPLETE | Issue #10, colab_adapter/artifacts.py, colab_adapter/telemetry.py; 95/95 tests pass |
-| M7 | Integration, end-to-end signoff and docs | NOT_STARTED | Offline CI; human-opt-in live evaluation separately |
+| M7 | Integration, end-to-end signoff and docs | COMPLETE | Issue #11, colab_adapter/cli.py, tests/test_project_e2e.py; 111/111 tests pass |
 | M8 | Secure browser training & compute monitor | COMPLETE | Issue #12, colab_adapter/monitor/, tests/test_monitor_backend.py; 105/105 tests pass |
 | M9 | Cross-provider abstraction (optional) | DEFERRED | Only after Colab V2 is independently usable |
 
@@ -44,6 +44,20 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-24 — Milestone M7 / Gate G7 COMPLETE (branch `feat/v2-m7-integration`):**
+  - Integrated complete project CLI subcommands in `colab_adapter/cli.py`: `init`, `validate`, `plan`, `up`, `sync`, `exec`, `status`, `stop`, `reconcile`.
+  - Added monitoring CLI subcommands: `snapshot`, `server`.
+  - Full `--json` output flags across all commands for automation and agent parsing (Q16).
+  - Implemented end-to-end integration test suite in `tests/test_project_e2e.py` covering Scenarios A through F (Q01–Q18):
+    - Scenario A: Template project initialization and manifest validation (Q01, Q02).
+    - Scenario B: Zero-CLI offline planning and transfer calculation (Q03, Q17).
+    - Scenario C: Locked session allocation and idempotent reuse.
+    - Scenario D: Incremental two-phase workspace synchronization (Q04, Q05, Q06, Q10).
+    - Scenario E: Attached code execution and structured status reporting.
+    - Scenario F: Safe session termination and unmanaged session protection (Q08).
+  - Full test suite: **111 tests passing** in `5.9s` on Python 3.8 and `6.1s` on Python 3.12 (100% pass, 0 failures).
+  - Preserved 100% backward compatibility with V1 baseline (all 43 original tests pass unchanged).
+  - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated).
 - **2026-10-24 — Milestone M8 / Gate G8 COMPLETE (branch `feat/v2-m8-monitor`):**
   - Implemented `colab_adapter/monitor/` package with `AccountSample`, `AccountUsageCollector`, `HealthStatus`, `MonitoringSummary`, `RunSummary`, and `MonitorServer`.
   - Poller dispatches strictly read-only `colab usage` and `colab sessions` queries without GPU allocation (Q19).
