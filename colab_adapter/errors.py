@@ -11,6 +11,7 @@ from .provider import (
     ColabProviderError,
     DependencyMissingError,
     InvalidJobSpecError,
+    RemoteExecutionError,
 )
 
 _SECRET_PATTERN = re.compile(

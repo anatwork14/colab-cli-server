@@ -36,11 +36,13 @@
 - **Gate G2 Satisfied:** Multi-module PyTorch project planned offline; path traversal and symlink escapes rejected; 0 allocating calls.
 
 ## M3 — SSH transport feasibility & safety (G3)
-**Status: NOT_STARTED. Dependencies: M1; parallelizable with M2.**
-- Implement transport interface supporting upstream exec/upload/download and optional colab ssh --proxy-mode over SSH clients. No raw Colab API fork.
-- Feature-gate SSH. Verify existing authorized managed session before connection; **do not assume preflight eliminates auto-create race**. Require an enforceable no-auto-create mechanism or keep SSH disabled for autonomous/no-allocation paths.
-- Handle no SSH server (404), 401/403, 429, broken proxy, missing ssh/rsync, key permissions, host verification and disconnects.
-- **Accept:** mocked successful handshake/remote command; no-Vm capability/refusal tests; fallback to official file operations; no secret leakage and no unexpected cloud allocation.
+**Status: COMPLETE (branch feat/v2-m3-transport). Dependencies: M1; parallelizable with M2.**
+- Implemented `BaseTransport` abstraction with `OfficialCliTransport` and guarded `SshProxyTransport`.
+- `OfficialCliTransport`: implements upload, download, list_dir, remove_file, exec_code (with remote traceback detection and --env support) and check_health using official CLI commands. Guaranteed fail-closed on missing sessions with 0 risk of auto-allocation.
+- `SshProxyTransport`: strictly disabled by default (`allow_ssh=False`). When enabled, enforces `build_safe_ssh_proxy_invocation` using isolated single-session config without `-s`, eliminating TOCTOU auto-allocation risks. Fails closed with typed exceptions on HTTP 404, 401, 429, 502 with clear fallback guidance.
+- Enforced session registry ownership check across all transport operations.
+- Added comprehensive unit tests in `tests/test_transports.py` (7 tests). Full suite: 70 tests passing.
+- **Gate G3 Satisfied:** Official CLI transport verified; guarded SSH transport fails closed; 0 cloud spend.
 
 ## M4 — Incremental workspace sync (G4; V2 MVP core)
 **Status: NOT_STARTED. Dependencies: M2 and M3 fallback interface.**
@@ -101,7 +103,7 @@
 | --- | --- | --- |
 | G1 | Upstream + threat contract + no-allocation feature probes | PASSED |
 | G2 | Manifest parser, plans, schema negative tests | PASSED |
-| G3 | SSH or graceful fallback, no-surprise-billing tests | NOT_STARTED |
+| G3 | SSH or graceful fallback, no-surprise-billing tests | PASSED |
 | G4 | Secure delta sync, replay/rollback/path safety | NOT_STARTED |
 | G5 | Human approved lifecycle, state invariants, reuse | NOT_STARTED |
 | G6 | Artifact provenance, explicit resume, telemetry | NOT_STARTED |

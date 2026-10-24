@@ -44,6 +44,11 @@ from .capability import (
     CliCapabilities,
     SshSafetyGuard,
 )
+from .transports import (
+    BaseTransport,
+    OfficialCliTransport,
+    SshProxyTransport,
+)
 from .project_manifest import (
     ProjectSpec,
     discover_project_files,
@@ -95,6 +100,9 @@ __all__ = [
     "CapabilityProbe",
     "CliCapabilities",
     "SshSafetyGuard",
+    "BaseTransport",
+    "OfficialCliTransport",
+    "SshProxyTransport",
     # V2 Project Manifest
     "ProjectSpec",
     "load_manifest",

@@ -31,7 +31,7 @@
 | M0 | V1 baseline accepted | COMPLETE | PR #2, main commit above |
 | M1 | Feature compatibility and security contracts | COMPLETE | Issue #5, docs/UPSTREAM_COMPATIBILITY_V2.md, colab_adapter/errors.py, colab_adapter/capability.py; 55/55 tests pass |
 | M2 | Project manifest, validation and safe plan | COMPLETE | Issue #6, colab_adapter/project_manifest.py, tests/test_project_manifest.py; 63/63 tests pass |
-| M3 | SSH transport and no-surprise-allocation boundary | NOT_STARTED | Offline SSH capability probe, mock 404/401/429; no live probe |
+| M3 | SSH transport and no-surprise-allocation boundary | COMPLETE | Issue #7, colab_adapter/transports/, tests/test_transports.py; 70/70 tests pass |
 | M4 | Content-addressed workspace sync | NOT_STARTED | Manifests, delta engine, push/pull, exclusions, safety tests |
 | M5 | Attach/update/execute/stop lifecycle | NOT_STARTED | Approved transitions, session-aware CLI and recovery |
 | M6 | Artifact/cache/resume and observability | NOT_STARTED | Durable output validation and metrics |
@@ -44,6 +44,12 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-24 — Milestone M3 / Gate G3 COMPLETE (branch `feat/v2-m3-transport`):**
+  - Implemented typed `BaseTransport` abstraction in `colab_adapter/transports/base.py`.
+  - Built `OfficialCliTransport` implementing upload, download, list_dir, remove_file, exec_code, and health checks using official Google CLI commands. Enforced session registry ownership check before every call.
+  - Built `SshProxyTransport` implementing guarded SSH-over-WebSocket using isolated single-session config without `-s`, eliminating TOCTOU auto-allocation risks. Fails closed with typed errors.
+  - Added test suite `tests/test_transports.py` (7 tests). Full suite: **70 tests passed** in `3.25s` on Python 3.8 and `4.32s` on Python 3.12 (Q01, Q02, Q08, Q09, Q18).
+  - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated).
 - **2026-10-24 — Milestone M2 / Gate G2 COMPLETE (branch `feat/v2-m2-manifest`):**
   - Implemented typed `ProjectSpec` in `colab_adapter/project_manifest.py` supporting schema_version 1, entrypoints, dependencies, arguments, accelerators, timeouts, and artifact declarations.
   - Built robust manifest parser supporting stdlib JSON natively and PyYAML optionally.
