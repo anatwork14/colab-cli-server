@@ -89,11 +89,16 @@
 - **Accept:** all expected-results V2 minimum gates met; owner signs off real Colab behavior; documented feature fallbacks.
 
 ## M8 — Training & Compute Dashboard (G8; cross-device monitoring)
-**Status: NOT_STARTED.** Read-only account collector, data model and fixture UI may be developed after M1 in parallel with M2–M6; real run-specific metrics integrate after M5/M6.
-- Create an Ubuntu-hosted, loopback-only-by-default web monitor accessible from authorized computers through a separately approved encrypted/authenticated VPN or HTTPS access gateway. Never expose raw Colab credentials or an unauthenticated web port.
-- Poll only official read-only `colab usage` (account CU balance, aggregate CU/h rate, active assignments) and `colab sessions`; store timestamped JSONL snapshots privately. Do not allocate or keep alive any Colab runtime from dashboard or test suite.
-- Build a dashboard with Overview, Training Runs, Run Detail, Compute History, Sessions, History/Artifacts, Health. Charts from true emitted progress/metrics, log tail, checkpoints; optional VRAM/utilization only from existing approved jobs with instrumentation.
-- Data-quality contract: account-wide CU snapshots cannot reconstruct all prior usage or exact job spend. Show monitor-start timestamp, collection gaps, top-up/adjustment uncertainty, unknown attribution and stale data.
+**Status: COMPLETE (branch feat/v2-m8-monitor). Dependencies: M1–M6.**
+- Implemented `AccountSample`, `AccountUsageCollector`, `HealthStatus`, `MonitoringSummary`, and `RunSummary` in `colab_adapter/monitor/`.
+- Safe read-only poller dispatching strictly read-only `colab usage` and `colab sessions` commands (0 VM allocation, Q19).
+- Ingested 1,440 synthetic snapshots without data loss (Q20).
+- Honest accounting: detects CU top-ups/refunds without negative spend (Q22); distinguishes unattributed account-wide spend when external sessions exist (Q23); immutable `monitoring_since` timestamp (Q24).
+- Resilient error handling: CLI error/timeout backoff and stale indicators (Q25).
+- Authenticated loopback HTTP server with token auth (Q26), SSE event stream with resume cursor (Q27), strict localhost default binding (Q28), and read-only 405 Method Not Allowed enforcement (Q29).
+- Embedded responsive SPA dashboard with real emitted metrics (Q30) and deep credential redaction (Q31).
+- Added comprehensive unit tests in `tests/test_monitor_backend.py` (10 tests). Full offline suite: 105 tests passing.
+- **Gate G8 Satisfied:** Validated Q19–Q31; 0 cloud spend.
 - Build a read-only authenticated REST/SSE API, responsive mobile UI, cursor pagination, retention, bounded polling/backoff and secret redaction. No run/stop/SSH/approval web endpoints in this version.
 - Provide deterministic offline source/parser tests, 100-file and 100-run fixtures, two-browser mock verification and zero provisioning calls. Security review includes auth bypass, XSS from logs, cross-origin, exports, secrets and resource bounds.
 - Acceptance: [docs/MONITORING_DASHBOARD_V2.md](docs/MONITORING_DASHBOARD_V2.md) and [Q19–Q31](docs/EXPECTED_RESULTS_V2.md) satisfied. Real remote browser access configured/tested only with explicit operator authorization.
@@ -123,6 +128,6 @@
 | G5 | Human approved lifecycle, state invariants, reuse | PASSED |
 | G6 | Artifact provenance, explicit resume, telemetry | PASSED |
 | G7 | Offline suite, owner-approved live evidence, docs | NOT_STARTED |
-| G8 | Account ledger, emitted training events, private cross-device read-only UI, zero-alloc safety | NOT_STARTED |
+| G8 | Account ledger, emitted training events, private cross-device read-only UI, zero-alloc safety | PASSED |
 
 See docs/EXPECTED_RESULTS_V2.md for numeric acceptance measurements and definitions.

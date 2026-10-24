@@ -36,7 +36,7 @@
 | M5 | Attach/update/execute/stop lifecycle | COMPLETE | Issue #9, colab_adapter/project_sessions.py, tests/test_project_sessions.py; 85/85 tests pass |
 | M6 | Artifact/cache/resume and observability | COMPLETE | Issue #10, colab_adapter/artifacts.py, colab_adapter/telemetry.py; 95/95 tests pass |
 | M7 | Integration, end-to-end signoff and docs | NOT_STARTED | Offline CI; human-opt-in live evaluation separately |
-| M8 | Secure browser training & compute monitor | NOT_STARTED | Account snapshots, run telemetry, private authenticated UI, cross-device access; G8/Q19-Q31 |
+| M8 | Secure browser training & compute monitor | COMPLETE | Issue #12, colab_adapter/monitor/, tests/test_monitor_backend.py; 105/105 tests pass |
 | M9 | Cross-provider abstraction (optional) | DEFERRED | Only after Colab V2 is independently usable |
 
 ## How an implementer updates this file
@@ -44,6 +44,16 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-24 — Milestone M8 / Gate G8 COMPLETE (branch `feat/v2-m8-monitor`):**
+  - Implemented `colab_adapter/monitor/` package with `AccountSample`, `AccountUsageCollector`, `HealthStatus`, `MonitoringSummary`, `RunSummary`, and `MonitorServer`.
+  - Poller dispatches strictly read-only `colab usage` and `colab sessions` queries without GPU allocation (Q19).
+  - Ingested 1,440 synthetic snapshots without data loss (Q20).
+  - Honest accounting: detects CU top-ups/refunds without negative spend (Q22); distinguishes unattributed account-wide spend when external sessions exist (Q23); immutable `monitoring_since` timestamp (Q24).
+  - Resilient error handling: CLI error/timeout backoff and stale indicators (Q25).
+  - Authenticated loopback HTTP server with token auth (Q26), SSE event stream with resume cursor (Q27), strict localhost default binding (Q28), and read-only 405 Method Not Allowed enforcement (Q29).
+  - Embedded responsive SPA dashboard with real emitted metrics (Q30) and deep credential redaction (Q31).
+  - Added unit test suite `tests/test_monitor_backend.py` (10 tests). Full offline suite: **105 tests passed** in `4.90s` on Python 3.8 and `4.84s` on Python 3.12.
+  - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated).
 - **2026-10-24 — Milestone M6 / Gate G6 COMPLETE (branch `feat/v2-m6-artifacts`):**
   - Implemented `colab_adapter/artifacts.py` with `ArtifactManifest`, `ArtifactManager`, and `verify_local_artifact`.
   - Multi-tier artifact verification: file existence, minimum size, chunked streaming SHA256, ZIP structure inspection, and safe PyTorch `weights_only=True` loading (Q14).
