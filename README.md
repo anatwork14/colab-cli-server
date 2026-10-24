@@ -122,6 +122,7 @@ Start here:
 | [Authentication](docs/AUTHENTICATION.md) | Headless OAuth, identity, ADC alternative, protecting tokens |
 | [Architecture](docs/ARCHITECTURE.md) | Components, lifecycle, compute-unit and capability boundaries |
 | [Jobs and artifacts](docs/JOBS.md) | One-shot vs. stateful execution, datasets, checkpoints |
+| [Adapter & Provider](docs/ADAPTER.md) | Modular ColabGPUProvider, experiment tracking, CLI adapter |
 | [Agent setup](docs/AGENT_SETUP.md) | Readiness gates and validation checklist |
 | [Security](docs/SECURITY.md) | Public-repo safety, approvals, credentials, threat model |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Typical failures, allocation, runtime loss, cleanup |
