@@ -36,17 +36,19 @@ It implements `ColabGPUProvider`, `ManagedSessionRegistry`, `ColabProcessLock`, 
 
 1. **Session Ownership & Protection of Unrelated Work:**
    The adapter maintains a local registry (`~/.colab_experiments/managed_sessions.json`) tracking only sessions provisioned by itself.
+   - `cancel_job(session_id)` immediately refuses requests for sessions not registered as managed by this adapter, returning `False` without invoking remote termination.
+   - One-shot jobs (`stateful=False`) are pre-registered with deterministic IDs passed explicitly via `colab run -s <session_id>`. If the local subprocess times out or is interrupted, the adapter explicitly attempts cleanup of the registered session.
    - `cleanup()` and `reconcile_stale_sessions()` strictly terminate only registered managed sessions.
    - Unmanaged user sessions on the account are detected, reported, and left completely untouched.
 
 2. **Approval Architecture & Tamper Resistance:**
-   - At planning time (`prepare_job`), the adapter computes a cryptographic fingerprint of all job inputs (script content SHA256, requirements SHA256, dataset hashes, GPU, timeout).
-   - At submission time (`submit_job`), all assets on disk are re-hashed. Any modification between approval and execution triggers `JobTamperedError`.
+   - At planning time (`prepare_job`), the adapter computes a cryptographic fingerprint binding all immutable job assets and mutable execution parameters: project name, script content SHA256, requirements SHA256, input files (local path, remote transfer destination, content SHA256), expected outputs, output download directory, dataset identifier, requested GPU, timeout, and stateful flag.
+   - At submission time (`submit_job`), all assets on disk and remote transfer destinations are re-verified. Any modification between approval and execution triggers `JobTamperedError`.
    - **Security Boundary:** The interactive terminal prompt (`ALLOCATE <GPU> <NONCE>`) is a human safeguard. In environments with autonomous agents sharing the same OS account, in-process nonces do not form a cryptographic sandbox. A **separately protected approval executor** running under an independent OS user or container with an out-of-band authorization channel must be used for untrusted autonomy.
 
-3. **Cross-Process Concurrency Protection:**
-   Uses non-blocking `fcntl.flock` on `~/.colab_experiments/colab_gpu.lock`.
-   Concurrent submissions across multiple processes fail immediately with `DuplicateAllocationError`, preventing accidental duplicate billing.
+3. **Cross-Process and Cross-Thread Concurrency Protection:**
+   `ColabProcessLock` enforces synchronization using thread locks combined with non-blocking `fcntl.flock` on `~/.colab_experiments/colab_gpu.lock`.
+   Concurrent submissions across processes or threads fail immediately with `DuplicateAllocationError`, preventing accidental duplicate billing.
 
 4. **Deep Credential Sanitization:**
    `ExperimentTracker` recursively applies regular expression scrubbers across all logged fields, paths, and tracebacks, redacting:
@@ -57,8 +59,9 @@ It implements `ColabGPUProvider`, `ManagedSessionRegistry`, `ColabProcessLock`, 
    - URL query secrets (`?code=...`, `&token=...`)
    All log files (`experiments.jsonl`, `managed_sessions.json`, `colab_gpu.lock`) are enforced with private `0600` permissions.
 
-5. **Error Preservation in `finally` Handlers:**
+5. **Error Preservation & Independent Failure Tracking:**
    Primary execution errors (e.g. remote tracebacks, CUDA errors, missing files) are never masked by subsequent cleanup or usage-query failures. Cleanup and usage errors are captured as distinct fields in experiment metadata, and the primary exception is preserved.
+   If execution succeeds but remote session teardown fails, the experiment is marked `CLEANUP_FAILED` with `success=False`, and a `CleanupError` is raised.
 
 6. **Subprocess Timeout Guards:**
    Subprocess calls have explicit wall-clock timeouts (`spec.timeout + 180s`) to ensure local processes never hang indefinitely if the remote kernel or network deadlocks.
@@ -66,10 +69,14 @@ It implements `ColabGPUProvider`, `ManagedSessionRegistry`, `ColabProcessLock`, 
 7. **Dual Authentication Support:**
    Supports both `auth_mode="oauth2"` (validating `~/.config/colab-cli/token.json`) and `auth_mode="adc"` (Application Default Credentials via `GOOGLE_APPLICATION_CREDENTIALS` or `gcloud`).
 
-8. **Multi-Tier Checkpoint Verification:**
+8. **Multi-Tier Checkpoint Verification with Fail-Closed Security:**
    - **Level 1 (Integrity):** SHA256 checksum and JSON manifest validation.
    - **Level 2 (Structure):** PyTorch ZIP format and file header inspection (`data.pkl`, format version).
    - **Level 3 (Inference):** Full weight loading via `torch.load(weights_only=True)` and forward-pass inference when PyTorch is installed locally.
+   - **Fail-Closed Policy:** Automatic fallback to unrestricted `torch.load(..., weights_only=False)` is disabled to protect against arbitrary code execution via malicious pickle payloads.
+
+9. **Interruption & Lifecycle State Machine:**
+   Interrupting execution (e.g. `KeyboardInterrupt` / SIGINT) is explicitly caught and transitions the managed session and experiment record to `INTERRUPTED` with `success=False`, rather than silently succeeding.
 
 ---
 

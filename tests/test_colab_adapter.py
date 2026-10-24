@@ -559,6 +559,196 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
         mode = oct(self.tracker.jsonl_path.stat().st_mode & 0o777)
         self.assertEqual(mode, "0o600")
 
+    # 23. Refuse cancel_job for unmanaged sessions
+    def test_cancel_job_refuses_unmanaged_session(self):
+        with mock.patch.object(self.provider, "_run_cli") as mock_cli:
+            res = self.provider.cancel_job("unmanaged-session-999")
+            self.assertFalse(res)
+            mock_cli.assert_not_called()
+
+        self.registry.register("managed-session-888", "job-888", "T4", "proj")
+        with mock.patch.object(self.provider, "_run_cli") as mock_cli:
+            mock_cli.return_value = subprocess.CompletedProcess(args=["colab", "stop"], returncode=0, stdout="Stopped", stderr="")
+            res = self.provider.cancel_job("managed-session-888")
+            self.assertTrue(res)
+            mock_cli.assert_called_once_with(["stop", "-s", "managed-session-888"], timeout=60.0)
+            self.assertEqual(self.registry.get_all_managed()["managed-session-888"]["state"], "TERMINATED")
+
+    # 24. Thread and process concurrency protection
+    def test_thread_concurrency_protection(self):
+        import threading
+        lock = ColabProcessLock(lock_path=self.base_dir / "thread_test.lock")
+        self.assertTrue(lock.acquire(blocking=False))
+
+        other_lock = ColabProcessLock(lock_path=self.base_dir / "thread_test.lock")
+        acquired_in_thread = []
+
+        def worker():
+            acq = other_lock.acquire(blocking=False)
+            acquired_in_thread.append(acq)
+            if acq:
+                other_lock.release()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        self.assertEqual(acquired_in_thread, [False])
+        lock.release()
+
+        acquired_in_thread.clear()
+        t2 = threading.Thread(target=worker)
+        t2.start()
+        t2.join()
+        self.assertEqual(acquired_in_thread, [True])
+
+    # 25. Tampering of remote destination path is rejected
+    def test_tampering_remote_destination_rejected(self):
+        spec = JobSpec(
+            project_name="p",
+            script_path=self.script_file,
+            gpu="T4",
+            input_files={str(self.input_file): "/remote/clean_path.csv"},
+        )
+        prep = self.provider.prepare_job(spec)
+        approved = ApprovedJob(
+            prepared_job=prep,
+            approval_code=prep.approval_nonce,
+            approved_by="tester",
+            fingerprint=prep.fingerprint,
+            approved_at="now",
+        )
+
+        self.provider.verify_job_integrity(approved)
+
+        approved.prepared_job.spec.input_files[str(self.input_file)] = "/remote/malicious_dest.csv"
+
+        with self.assertRaises(JobTamperedError) as ctx:
+            self.provider.verify_job_integrity(approved)
+        self.assertIn("modified after approval", str(ctx.exception))
+
+    # 26. Interrupted by KeyboardInterrupt records INTERRUPTED state
+    def test_interrupted_by_keyboard_interrupt_records_interrupted_state(self):
+        spec = JobSpec(project_name="p", script_path=self.script_file, gpu="T4", stateful=True)
+        prep = self.provider.prepare_job(spec)
+        approved = ApprovedJob(
+            prepared_job=prep,
+            approval_code=prep.approval_nonce,
+            approved_by="tester",
+            fingerprint=prep.fingerprint,
+            approved_at="now",
+        )
+        with mock.patch.object(self.provider, "check_availability", return_value={"authenticated": True, "active_sessions": []}):
+            with mock.patch.object(self.provider, "_run_cli") as mock_cli:
+                def side_effect(cmd_args, *args, **kwargs):
+                    cmd = cmd_args[0]
+                    if cmd == "new":
+                        return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="Created", stderr="")
+                    elif cmd == "exec":
+                        raise KeyboardInterrupt("Simulated Ctrl+C")
+                    elif cmd == "stop":
+                        return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="Stopped", stderr="")
+                    return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="", stderr="")
+
+                mock_cli.side_effect = side_effect
+                with self.assertRaises(KeyboardInterrupt):
+                    self.provider.submit_job(approved)
+
+                job_record = self.tracker.get_job(prep.job_id)
+                self.assertIsNotNone(job_record)
+                self.assertEqual(job_record.get("job_state"), "INTERRUPTED")
+                self.assertFalse(job_record.get("success"))
+
+    # 27. Cleanup failure marks CLEANUP_FAILED state and raises CleanupError
+    def test_cleanup_failure_marks_cleanup_failed_state(self):
+        spec = JobSpec(project_name="p", script_path=self.script_file, gpu="T4", stateful=True)
+        prep = self.provider.prepare_job(spec)
+        approved = ApprovedJob(
+            prepared_job=prep,
+            approval_code=prep.approval_nonce,
+            approved_by="tester",
+            fingerprint=prep.fingerprint,
+            approved_at="now",
+        )
+        with mock.patch.object(self.provider, "check_availability", return_value={"authenticated": True, "active_sessions": []}):
+            with mock.patch.object(self.provider, "_run_cli") as mock_cli:
+                def side_effect(cmd_args, *args, **kwargs):
+                    cmd = cmd_args[0]
+                    if cmd == "new":
+                        return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="Created", stderr="")
+                    elif cmd == "exec":
+                        return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="Success", stderr="")
+                    elif cmd == "stop":
+                        return subprocess.CompletedProcess(args=cmd_args, returncode=1, stdout="", stderr="Teardown RPC failure")
+                    return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="", stderr="")
+
+                mock_cli.side_effect = side_effect
+                with self.assertRaises(CleanupError) as ctx:
+                    self.provider.submit_job(approved)
+                self.assertIn("Teardown RPC failure", str(ctx.exception))
+
+                job_record = self.tracker.get_job(prep.job_id)
+                self.assertIsNotNone(job_record)
+                self.assertEqual(job_record.get("job_state"), "CLEANUP_FAILED")
+                self.assertFalse(job_record.get("success"))
+                self.assertEqual(job_record.get("cleanup_status"), "ORPHANED")
+
+    # 28. One-shot named session reconciliation after timeout
+    def test_one_shot_named_session_reconciliation_after_timeout(self):
+        spec = JobSpec(project_name="p", script_path=self.script_file, gpu="T4", stateful=False)
+        prep = self.provider.prepare_job(spec)
+        approved = ApprovedJob(
+            prepared_job=prep,
+            approval_code=prep.approval_nonce,
+            approved_by="tester",
+            fingerprint=prep.fingerprint,
+            approved_at="now",
+        )
+        with mock.patch.object(self.provider, "check_availability", return_value={"authenticated": True, "active_sessions": []}):
+            with mock.patch.object(self.provider, "_run_cli") as mock_cli:
+                def side_effect(cmd_args, *args, **kwargs):
+                    cmd = cmd_args[0]
+                    if cmd == "run":
+                        raise RemoteExecutionError("Colab CLI command timed out after 480.0s")
+                    elif cmd == "stop":
+                        return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="Stopped", stderr="")
+                    return subprocess.CompletedProcess(args=cmd_args, returncode=0, stdout="", stderr="")
+
+                mock_cli.side_effect = side_effect
+                with self.assertRaises(RemoteExecutionError):
+                    self.provider.submit_job(approved)
+
+                stop_calls = [c[0][0] for c in mock_cli.call_args_list if c[0][0][0] == "stop"]
+                self.assertTrue(len(stop_calls) > 0)
+                self.assertEqual(stop_calls[0], ["stop", "-s", prep.job_id])
+                self.assertTrue(self.registry.is_managed(prep.job_id))
+
+    # 29. Checkpoint verification fails closed on unsupported weights_only
+    def test_verify_checkpoint_refuses_insecure_fallback(self):
+        from examples.verify_checkpoint import verify_checkpoint
+        import zipfile
+        import json
+        import hashlib
+
+        chk_dir = self.base_dir / "chk_test"
+        chk_dir.mkdir(parents=True, exist_ok=True)
+        chk_file = chk_dir / "model_checkpoint.pt"
+        st_file = chk_dir / "status.json"
+
+        with zipfile.ZipFile(str(chk_file), "w") as zf:
+            zf.writestr("archive/data.pkl", b"dummy")
+            zf.writestr("archive/version", b"3")
+
+        sha = hashlib.sha256(chk_file.read_bytes()).hexdigest()
+        st_file.write_text(json.dumps({"sha256": sha}), encoding="utf-8")
+
+        mock_torch = mock.MagicMock()
+        mock_torch.load.side_effect = TypeError("unexpected keyword argument 'weights_only'")
+
+        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
+            ok = verify_checkpoint(chk_dir)
+            self.assertFalse(ok)
+
 
 if __name__ == "__main__":
     unittest.main()

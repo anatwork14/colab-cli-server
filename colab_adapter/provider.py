@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -105,18 +106,33 @@ def check_disk_space(target_path: Path, min_free_mb: int = 500) -> None:
 
 
 class ColabProcessLock:
-    """Cross-process file lock preventing concurrent Colab allocations."""
+    """Cross-process and cross-thread lock preventing concurrent Colab allocations."""
+
+    _path_locks: Dict[Path, threading.Lock] = {}
+    _path_locks_guard = threading.Lock()
 
     def __init__(self, lock_path: Optional[Path] = None):
         if lock_path is None:
             lock_path = Path.home() / ".colab_experiments" / "colab_gpu.lock"
         self.lock_path = Path(lock_path)
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._thread_lock = self._get_thread_lock(self.lock_path)
         self._fd: Optional[int] = None
+        self._is_held_by_thread = False
+
+    @classmethod
+    def _get_thread_lock(cls, path: Path) -> threading.Lock:
+        with cls._path_locks_guard:
+            resolved = path.resolve()
+            if resolved not in cls._path_locks:
+                cls._path_locks[resolved] = threading.Lock()
+            return cls._path_locks[resolved]
 
     def acquire(self, blocking: bool = False) -> bool:
-        if self._fd is not None:
-            return True
+        # Prevent reentrancy across threads sharing this lock path
+        if not self._thread_lock.acquire(blocking=blocking):
+            return False
+
         flags = os.O_RDWR | os.O_CREAT
         fd = os.open(str(self.lock_path), flags, 0o600)
         lock_flags = fcntl.LOCK_EX
@@ -124,12 +140,21 @@ class ColabProcessLock:
             lock_flags |= fcntl.LOCK_NB
         try:
             fcntl.flock(fd, lock_flags)
-            os.write(fd, f"pid={os.getpid()}\ntime={time.time()}\n".encode("utf-8"))
+            os.write(
+                fd,
+                f"pid={os.getpid()}\nthread={threading.get_ident()}\ntime={time.time()}\n".encode("utf-8"),
+            )
             self._fd = fd
+            self._is_held_by_thread = True
             return True
         except (BlockingIOError, OSError):
             os.close(fd)
+            self._thread_lock.release()
             return False
+        except Exception:
+            os.close(fd)
+            self._thread_lock.release()
+            raise
 
     def release(self) -> None:
         if self._fd is not None:
@@ -139,6 +164,12 @@ class ColabProcessLock:
             except OSError:
                 pass
             self._fd = None
+        if self._is_held_by_thread:
+            self._is_held_by_thread = False
+            try:
+                self._thread_lock.release()
+            except RuntimeError:
+                pass
 
     def __enter__(self) -> "ColabProcessLock":
         if not self.acquire(blocking=False):
@@ -415,7 +446,7 @@ class ColabGPUProvider:
             return {"success": False, "error": str(e), "raw_output": ""}
 
     def _compute_job_hashes(self, job: JobSpec) -> Tuple[str, str, str, str]:
-        """Compute cryptographic SHA256 hashes of all job assets to guarantee integrity."""
+        """Compute cryptographic SHA256 hashes of all job assets and parameters to guarantee integrity."""
         script_path = Path(job.script_path).expanduser().resolve()
         script_sha = hashlib.sha256(script_path.read_bytes()).hexdigest()
 
@@ -428,11 +459,20 @@ class ColabGPUProvider:
         for local_p in sorted(job.input_files.keys()):
             p = Path(local_p).expanduser().resolve()
             h = hashlib.sha256(p.read_bytes()).hexdigest()
-            input_hashes.append(f"{local_p}:{h}")
+            remote_dest = str(job.input_files[local_p])
+            input_hashes.append(f"{local_p}->{remote_dest}:{h}")
         inputs_sha = hashlib.sha256(";".join(input_hashes).encode("utf-8")).hexdigest()
 
         gpu = job.gpu.upper()
-        fingerprint_src = f"{script_sha}:{reqs_sha}:{inputs_sha}:{gpu}:{job.timeout}:{job.stateful}"
+        outputs_str = ";".join(sorted(job.expected_outputs))
+        out_dir = str(job.output_download_dir or "")
+        dataset_id = str(job.dataset_identifier or "")
+        proj_name = str(job.project_name)
+
+        fingerprint_src = (
+            f"{proj_name}:{script_sha}:{reqs_sha}:{inputs_sha}:{outputs_str}:"
+            f"{out_dir}:{dataset_id}:{gpu}:{job.timeout}:{job.stateful}"
+        )
         fingerprint = hashlib.sha256(fingerprint_src.encode("utf-8")).hexdigest()
         return script_sha, reqs_sha, inputs_sha, fingerprint
 
@@ -475,7 +515,7 @@ class ColabGPUProvider:
         if job.stateful:
             cmd = ["colab", f"--auth={self.auth_mode}", "new", "-s", job_id, "--gpu", gpu]
         else:
-            cmd = ["colab", f"--auth={self.auth_mode}", "run", "--gpu", gpu, "--timeout", str(job.timeout), str(script_path)]
+            cmd = ["colab", f"--auth={self.auth_mode}", "run", "-s", job_id, "--gpu", gpu, "--timeout", str(job.timeout), str(script_path)]
 
         prepared = PreparedJob(
             job_id=job_id,
@@ -553,8 +593,27 @@ class ColabGPUProvider:
         )
 
     def verify_job_integrity(self, approved_job: ApprovedJob) -> None:
-        """Verify that job assets have not been modified between preparation and submission."""
+        """Verify that job assets and parameters have not been modified between preparation and submission.
+
+        NOTE ON SECURITY ARCHITECTURE:
+        This integrity verification ensures that an approved JobSpec has not experienced accidental
+        tampering, file mutation, or destination path modification prior to remote execution.
+        While it validates parameters, input file hashes, remote transfer destinations, outputs,
+        and approval nonces, it operates within the Python runtime and does not constitute an
+        unforgeable authorization boundary against untrusted local agents running under the same
+        OS user account. Autonomous agent workflows requiring cryptographic separation must rely on
+        a separately protected approval executor or daemon with non-delegable credentials.
+        """
         prep = approved_job.prepared_job
+        if not approved_job.approval_code:
+            raise JobTamperedError("Missing approval code. Execution rejected.")
+        if approved_job.approval_code != prep.approval_nonce:
+            raise JobTamperedError("Approval nonce mismatch. Execution rejected.")
+        if approved_job.fingerprint != prep.fingerprint:
+            raise JobTamperedError("Approved job fingerprint mismatch. Execution rejected.")
+        if not approved_job.approved_by:
+            raise JobTamperedError("Missing approved_by authorization identity. Execution rejected.")
+
         script_sha, reqs_sha, inputs_sha, current_fp = self._compute_job_hashes(prep.spec)
 
         if script_sha != prep.script_sha256:
@@ -562,9 +621,9 @@ class ColabGPUProvider:
         if reqs_sha != prep.reqs_sha256:
             raise JobTamperedError("Requirements file was modified after approval. Execution rejected.")
         if inputs_sha != prep.inputs_sha256:
-            raise JobTamperedError("Input dataset files were modified after approval. Execution rejected.")
+            raise JobTamperedError("Input dataset files or remote destinations were modified after approval. Execution rejected.")
         if current_fp != approved_job.fingerprint:
-            raise JobTamperedError("Job configuration was altered after approval. Execution rejected.")
+            raise JobTamperedError("Job configuration or output parameters were altered after approval. Execution rejected.")
 
     def submit_job(self, approved_job: ApprovedJob) -> JobResult:
         """Execute approved job on Colab backend with cross-process locking, lifecycle guard and cleanup."""
@@ -575,7 +634,7 @@ class ColabGPUProvider:
         spec = prep.spec
         gpu = spec.gpu.upper()
         job_id = prep.job_id
-        session_id = job_id if spec.stateful else f"run-{prep.script_sha256[:6]}"
+        session_id = job_id
 
         # 2. Acquire cross-process execution lock
         with self.lock:
@@ -592,7 +651,7 @@ class ColabGPUProvider:
             # Record compute units before
             usage_before = self.get_usage().get("raw_output")
             start_time = datetime.now(timezone.utc).isoformat()
-            primary_error: Optional[Exception] = None
+            primary_error: Optional[BaseException] = None
             cleanup_error: Optional[str] = None
             usage_error: Optional[str] = None
             output_files: List[str] = []
@@ -612,27 +671,44 @@ class ColabGPUProvider:
 
             try:
                 if not spec.stateful:
-                    # One-shot colab run
-                    cmd_args = ["run", "--gpu", gpu, "--timeout", str(spec.timeout), str(Path(spec.script_path).resolve())]
-                    res = self._run_cli(cmd_args, timeout=cli_wall_clock_timeout)
-                    execution_logs = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
+                    # One-shot colab run with explicit session name
+                    cmd_args = ["run", "-s", session_id, "--gpu", gpu, "--timeout", str(spec.timeout), str(Path(spec.script_path).resolve())]
+                    try:
+                        res = self._run_cli(cmd_args, timeout=cli_wall_clock_timeout)
+                        execution_logs = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
 
-                    if res.returncode != 0:
-                        if "ResourceExhausted" in execution_logs or "unavailable" in execution_logs.lower():
-                            raise AllocationError(f"GPU {gpu} allocation unavailable on Colab: {execution_logs}")
-                        raise RemoteExecutionError(f"Colab execution failed with exit code {res.returncode}:\n{execution_logs}")
+                        if res.returncode != 0:
+                            if "ResourceExhausted" in execution_logs or "unavailable" in execution_logs.lower():
+                                raise AllocationError(f"GPU {gpu} allocation unavailable on Colab: {execution_logs}")
+                            raise RemoteExecutionError(f"Colab execution failed with exit code {res.returncode}:\n{execution_logs}")
 
-                    error_indicators = (
-                        "Traceback (most recent call last):",
-                        "CUDA out of memory",
-                        "ModuleNotFoundError:",
-                        "SyntaxError:",
-                    )
-                    if any(ind in execution_logs for ind in error_indicators):
-                        raise RemoteExecutionError(f"Remote error detected in execution logs:\n{execution_logs}")
+                        error_indicators = (
+                            "Traceback (most recent call last):",
+                            "CUDA out of memory",
+                            "ModuleNotFoundError:",
+                            "SyntaxError:",
+                        )
+                        if any(ind in execution_logs for ind in error_indicators):
+                            raise RemoteExecutionError(f"Remote error detected in execution logs:\n{execution_logs}")
 
-                    cleanup_status = "CLEANED"
-                    self.registry.update_state(session_id, "TERMINATED")
+                        cleanup_status = "CLEANED"
+                        self.registry.update_state(session_id, "TERMINATED")
+                    except BaseException as one_shot_err:
+                        # Attempt explicit cleanup for the registered session in case of CLI failure or timeout
+                        try:
+                            res_stop = self._run_cli(["stop", "-s", session_id], timeout=30.0)
+                            if res_stop.returncode == 0:
+                                cleanup_status = "RUNTIME_STOPPED"
+                                self.registry.update_state(session_id, "TERMINATED")
+                            else:
+                                cleanup_status = "ORPHANED"
+                                self.registry.update_state(session_id, "NEEDS_RECONCILIATION")
+                                cleanup_error = f"Failed to stop session: {(res_stop.stderr or res_stop.stdout or '').strip()}"
+                        except Exception as ce:
+                            cleanup_status = "ORPHANED"
+                            self.registry.update_state(session_id, "NEEDS_RECONCILIATION")
+                            cleanup_error = f"Exception during session stop: {ce}"
+                        raise
                 else:
                     # Stateful multi-step lifecycle
                     # Step 1: colab new
@@ -700,9 +776,11 @@ class ColabGPUProvider:
                             self.registry.update_state(session_id, "NEEDS_RECONCILIATION")
                             cleanup_error = f"Exception during session stop: {ce}"
 
-            except Exception as e:
+            except BaseException as e:
                 primary_error = e
-                if cleanup_status == "PENDING":
+                if isinstance(e, KeyboardInterrupt):
+                    self.registry.update_state(session_id, "INTERRUPTED")
+                elif cleanup_status == "PENDING":
                     cleanup_status = "FAILED"
                     self.registry.update_state(session_id, "NEEDS_RECONCILIATION")
                 raise
@@ -719,6 +797,25 @@ class ColabGPUProvider:
                 except Exception as ue:
                     usage_error = str(ue)
 
+                compute_success = (primary_error is None)
+                cleanup_success = (cleanup_status in ("CLEANED", "RUNTIME_STOPPED")) and (cleanup_error is None)
+                overall_success = compute_success and cleanup_success
+
+                if isinstance(primary_error, KeyboardInterrupt):
+                    job_state = "INTERRUPTED"
+                elif primary_error is not None:
+                    job_state = "FAILED"
+                elif not cleanup_success:
+                    job_state = "CLEANUP_FAILED"
+                else:
+                    job_state = "COMPLETED"
+
+                error_summary_val = None
+                if primary_error is not None:
+                    error_summary_val = str(primary_error)
+                elif cleanup_error is not None:
+                    error_summary_val = f"Cleanup failed: {cleanup_error}"
+
                 try:
                     meta = ExperimentMetadata(
                         job_id=job_id,
@@ -726,14 +823,14 @@ class ColabGPUProvider:
                         requested_accelerator=gpu,
                         start_time=start_time,
                         completion_time=completion_time,
-                        job_state="COMPLETED" if (primary_error is None) else "FAILED",
+                        job_state=job_state,
                         script_path=str(Path(spec.script_path).resolve()),
                         script_revision=prep.script_sha256[:8],
                         dependencies=[str(spec.requirements_path)] if spec.requirements_path else [],
                         dataset_identifier=spec.dataset_identifier,
                         output_artifact_paths=output_files,
-                        success=(primary_error is None),
-                        error_summary=str(primary_error) if primary_error else None,
+                        success=overall_success,
+                        error_summary=error_summary_val,
                         cleanup_status=cleanup_status,
                         cleanup_error=cleanup_error,
                         usage_error=usage_error,
@@ -750,14 +847,14 @@ class ColabGPUProvider:
 
             return JobResult(
                 job_id=job_id,
-                success=True,
-                state="COMPLETED",
+                success=overall_success,
+                state=job_state,
                 output_files=output_files,
-                error=None,
+                error=error_summary_val if not overall_success else None,
                 cleanup_error=cleanup_error,
                 usage_error=usage_error,
                 logs=execution_logs,
-                cleaned_up=(cleanup_status in ("CLEANED", "RUNTIME_STOPPED")),
+                cleaned_up=cleanup_success,
                 session_id=session_id,
             )
 
@@ -784,9 +881,13 @@ class ColabGPUProvider:
         return logged.get("output_artifact_paths", [])
 
     def cancel_job(self, session_id: str) -> bool:
-        """Cancel and terminate a running managed Colab session."""
+        """Cancel and terminate a running managed Colab session.
+
+        Refuses to stop sessions not owned by this adapter to protect unmanaged user workloads.
+        """
         if not self.registry.is_managed(session_id):
-            print(f"Warning: Session '{session_id}' is not in managed registry.", file=sys.stderr)
+            print(f"Refusing to cancel unmanaged session '{session_id}'. Adapter only controls its own registered sessions.", file=sys.stderr)
+            return False
         res = self._run_cli(["stop", "-s", session_id], timeout=60.0)
         if res.returncode == 0:
             self.registry.update_state(session_id, "TERMINATED")

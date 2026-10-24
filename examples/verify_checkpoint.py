@@ -94,8 +94,12 @@ def verify_checkpoint(artifacts_dir: Path) -> bool:
         try:
             data = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
         except TypeError:
-            # Fallback for older PyTorch versions that do not accept weights_only
-            data = torch.load(str(checkpoint_path), map_location="cpu")
+            print(
+                "FAILED: Refusing unrestricted pickle deserialization. "
+                "PyTorch >=2.0 with weights_only=True support is required for safe checkpoint verification.",
+                file=sys.stderr,
+            )
+            return False
 
         state_dict = data.get("model_state_dict")
         if not state_dict:
