@@ -262,6 +262,45 @@ def _backoff_delay(base_delay: float, headers: Optional[Mapping[str, Any]] = Non
     return min(base_delay * (1.0 + random.uniform(0.1, 0.5)), _MAX_RETRY_AFTER_SEC)
 
 
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _ensure_private_parent_dir(directory: Path) -> Path:
+    """Resolve ``directory`` and create missing ancestors with mode 0700.
+
+    Only directories created by this call are chmod'ed; pre-existing ones are untouched.
+    """
+    resolved = directory.resolve()
+    missing: List[Path] = []
+    probe = resolved
+    while not os.path.exists(str(probe)):
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    for d in reversed(missing):
+        try:
+            os.mkdir(str(d), 0o700)
+        except FileExistsError:
+            continue
+        os.chmod(str(d), 0o700)
+    return resolved
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Best-effort fsync of a directory so a rename is durable."""
+    try:
+        dfd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
 @dataclass
 class DriveCredentials:
     """OAuth2 credentials for Google Drive API."""
@@ -280,8 +319,16 @@ class DriveCredentials:
         return True
 
     def save(self, file_path: Union[str, Path]) -> None:
-        p = Path(file_path).resolve()
-        p.parent.mkdir(parents=True, exist_ok=True)
+        """Atomically write credentials with mode 0600.
+
+        Secret bytes go only to a fresh temp file created with O_EXCL|O_NOFOLLOW
+        and fchmod'ed to 0600 before any write; it is then renamed over the target.
+        A symlink at the target is replaced, never written through. On failure the
+        previous file is left intact and the temp file is removed.
+        """
+        target = Path(file_path).expanduser()
+        parent = _ensure_private_parent_dir(target.parent)
+        target = parent / target.name
         data = {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
@@ -290,10 +337,36 @@ class DriveCredentials:
             "token_expiry": self.token_expiry,
             "token_uri": self.token_uri,
         }
-        # Secure file permissions (0600)
-        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        tmp = parent / f".{target.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        fd: Optional[int] = None
+        try:
+            payload = json.dumps(data, indent=2).encode("utf-8")
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW, 0o600)
+            os.fchmod(fd, 0o600)  # umask-independent; applied before any secret byte is written
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            os.replace(str(tmp), str(target))
+        except BaseException as exc:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            with contextlib.suppress(OSError):
+                os.unlink(str(tmp))
+            if isinstance(exc, Exception):
+                detail = type(exc).__name__
+                if isinstance(exc, OSError) and exc.strerror:
+                    detail = f"{detail}: {exc.strerror}"
+                # from None: never chain the original exception (may carry context).
+                raise DriveAuthenticationError(
+                    f"Failed to save Drive credentials to {target} ({detail})"
+                ) from None
+            raise
+        _fsync_dir(parent)
 
     @classmethod
     def load(cls, file_path: Union[str, Path]) -> "DriveCredentials":
