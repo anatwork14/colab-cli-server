@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from colab_adapter.errors import (
+    ArtifactNotFoundError,
     ArtifactValidationError,
     DriveAuthenticationError,
     DriveIntegrityError,
@@ -59,6 +60,19 @@ class MockDriveHttpClient:
         self.simulate_resume_interruption = False
         self.resumed_called = False
         self.upload_sessions_initiated = 0
+
+        # Pagination and listing error simulation controls
+        self.list_page_size_override: Optional[int] = None
+        self.inject_looping_page_token: bool = False
+        self.inject_malformed_page_token: Any = None
+        self.fail_list_files_status: Optional[int] = None
+        self.fail_list_files_body: Optional[bytes] = None
+        self.fail_list_files_exception: Optional[Exception] = None
+        self.fail_list_files_at_page: Optional[int] = None
+        self.list_files_page_count: int = 0
+        self.fail_folder_lookup_status: Optional[int] = None
+        self.fail_folder_lookup_body: Optional[bytes] = None
+        self.fail_folder_lookup_exception: Optional[Exception] = None
 
         # Session tracking buffers and committed files
         self.session_buffers: Dict[str, bytearray] = {}
@@ -154,6 +168,13 @@ class MockDriveHttpClient:
         if "drive/v3/files?q=" in url and method == "GET":
             q_unquoted = urllib.parse.unquote(url)
             if "mimeType = 'application/vnd.google-apps.folder'" in q_unquoted:
+                if self.fail_folder_lookup_exception is not None:
+                    raise self.fail_folder_lookup_exception
+                if self.fail_folder_lookup_status is not None:
+                    return self.fail_folder_lookup_status, {}, self.fail_folder_lookup_body or b'{"error": "Folder lookup failed"}'
+                if self.fail_folder_lookup_body is not None:
+                    return 200, {}, self.fail_folder_lookup_body
+
                 matched_folders = []
                 for f in self.mock_files:
                     if f.get("mimeType") == "application/vnd.google-apps.folder":
@@ -163,6 +184,48 @@ class MockDriveHttpClient:
                             if (f_parent is None and "'root' in parents" in q_unquoted) or (f_parent and f"'{f_parent}' in parents" in q_unquoted):
                                 matched_folders.append({"id": f["id"], "name": f_name})
                 return 200, {}, json.dumps({"files": matched_folders}).encode("utf-8")
+
+            # Non-folder files query: parse pagination params
+            parsed = urllib.parse.urlparse(url)
+            qs = urllib.parse.parse_qs(parsed.query)
+            parsed_page_size = qs.get("pageSize", [None])[0]
+            parsed_page_token = qs.get("pageToken", [None])[0]
+
+            effective_page_size = self.list_page_size_override or (int(parsed_page_size) if parsed_page_size else None)
+
+            current_page = 1
+            offset = 0
+            if parsed_page_token:
+                m_page = re.match(r"page-(\d+)-offset-(\d+)", parsed_page_token)
+                if m_page:
+                    current_page = int(m_page.group(1))
+                    offset = int(m_page.group(2))
+                elif parsed_page_token.startswith("offset-"):
+                    offset = int(parsed_page_token.split("-")[1])
+                    current_page = (offset // (effective_page_size or 100)) + 1
+                else:
+                    self.list_files_page_count += 1
+                    current_page = self.list_files_page_count
+                    if effective_page_size:
+                        offset = (current_page - 1) * effective_page_size
+            else:
+                self.list_files_page_count = 1
+                current_page = 1
+                offset = 0
+
+            # Check simulated failure for file listing
+            if self.fail_list_files_exception is not None:
+                if self.fail_list_files_at_page is None or current_page == self.fail_list_files_at_page:
+                    raise self.fail_list_files_exception
+
+            if self.fail_list_files_status is not None:
+                if self.fail_list_files_at_page is None or current_page == self.fail_list_files_at_page:
+                    body = self.fail_list_files_body if self.fail_list_files_body is not None else b'{"error": "Simulated listing failure"}'
+                    return self.fail_list_files_status, {}, body
+
+            if self.fail_list_files_body is not None:
+                if self.fail_list_files_at_page is None or current_page == self.fail_list_files_at_page:
+                    return 200, {}, self.fail_list_files_body
 
             matched = []
             for f in self.mock_files:
@@ -188,6 +251,23 @@ class MockDriveHttpClient:
                             "description": f.get("description", ""),
                             "createdTime": f.get("createdTime", "2026-01-01T00:00:00Z"),
                         })
+
+            if effective_page_size is not None and effective_page_size > 0:
+                page_items = matched[offset : offset + effective_page_size]
+                has_more = (offset + effective_page_size) < len(matched)
+                resp_dict: Dict[str, Any] = {"files": page_items}
+
+                if self.inject_malformed_page_token is not None:
+                    resp_dict["nextPageToken"] = self.inject_malformed_page_token
+                elif self.inject_looping_page_token:
+                    resp_dict["nextPageToken"] = "looping-page-token"
+                elif has_more:
+                    next_page_num = current_page + 1
+                    next_offset = offset + effective_page_size
+                    resp_dict["nextPageToken"] = f"page-{next_page_num}-offset-{next_offset}"
+
+                return 200, {}, json.dumps(resp_dict).encode("utf-8")
+
             return 200, {}, json.dumps({"files": matched}).encode("utf-8")
 
         if "drive/v3/files" in url and method == "POST" and "uploadType=resumable" not in url:
@@ -1571,6 +1651,372 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
             self.assertFalse(self.store._is_trusted_staged_file(fake_file))
         finally:
             os.umask(old_umask)
+
+    # =========================================================================
+    # Section 6.4: Full Bounded Pagination Tests (F3)
+    # =========================================================================
+
+    def test_6_4_1_single_page_with_no_next_page_token(self):
+        """6.4.1. Single page listing with no nextPageToken returns all files."""
+        folder_id = "folder-page-1"
+        self.mock_client.mock_files.extend([
+            {"id": "file-101", "name": "weights.pt", "parent": folder_id, "size": 100, "mimeType": "application/octet-stream"},
+            {"id": "file-102", "name": "weights.pt", "parent": folder_id, "size": 200, "mimeType": "application/octet-stream"},
+        ])
+        files = self.store._list_files_in_folder("weights.pt", folder_id)
+        self.assertEqual(len(files), 2)
+        self.assertEqual([f["id"] for f in files], ["file-101", "file-102"])
+
+    def test_6_4_2_two_pages_traversal(self):
+        """6.4.2. Two pages traversal (nextPageToken on page 1, none on page 2)."""
+        folder_id = "folder-page-2"
+        self.mock_client.list_page_size_override = 2
+        self.mock_client.mock_files.extend([
+            {"id": "file-201", "name": "model.bin", "parent": folder_id, "size": 10, "mimeType": "application/octet-stream"},
+            {"id": "file-202", "name": "model.bin", "parent": folder_id, "size": 20, "mimeType": "application/octet-stream"},
+            {"id": "file-203", "name": "model.bin", "parent": folder_id, "size": 30, "mimeType": "application/octet-stream"},
+            {"id": "file-204", "name": "model.bin", "parent": folder_id, "size": 40, "mimeType": "application/octet-stream"},
+        ])
+        files = self.store._list_files_in_folder("model.bin", folder_id)
+        self.assertEqual(len(files), 4)
+        self.assertEqual([f["id"] for f in files], ["file-201", "file-202", "file-203", "file-204"])
+
+    def test_6_4_3_five_pages_with_target_on_page_five(self):
+        """6.4.3. Five pages traversal where target candidate revision is on page 5."""
+        project_id = "proj_p5"
+        run_id = "run_p5"
+        folder_id = self.store.resolve_target_folder_id(project_id, run_id, "checkpoints")
+
+        # 12 candidate dummy files + 1 target candidate = 13 files across 5 pages of size 3
+        self.mock_client.list_page_size_override = 3
+        target_data = b"TARGET_REVISION_ON_PAGE_FIVE"
+        target_sha = hashlib.sha256(target_data).hexdigest()
+
+        for i in range(12):
+            dummy_data = f"DUMMY_REVISION_{i}".encode("utf-8")
+            self.mock_client.mock_files.append({
+                "id": f"dummy-cand-{i:02d}",
+                "name": "model.pt",
+                "parent": folder_id,
+                "content": dummy_data,
+                "mimeType": "application/octet-stream",
+                "appProperties": {
+                    "sha256": hashlib.sha256(dummy_data).hexdigest(),
+                    "is_latest": "false",
+                },
+            })
+
+        # 13th file is on page 5 (4 pages * 3 items = 12 items on pages 1-4)
+        self.mock_client.mock_files.append({
+            "id": "target-cand-page5",
+            "name": "model.pt",
+            "parent": folder_id,
+            "content": target_data,
+            "mimeType": "application/octet-stream",
+            "appProperties": {
+                "sha256": target_sha,
+                "is_latest": "true",
+            },
+        })
+
+        # Case A: Versioned retrieval finding target on page 5
+        dest_ver = Path(self.test_dir) / "dest_ver_p5.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt@sha256_{target_sha}", dest_ver)
+        self.assertEqual(dest_ver.read_bytes(), target_data)
+
+        # Case B: Unversioned retrieval finding is_latest="true" on page 5 (with no local manifest)
+        dest_unv = Path(self.test_dir) / "dest_unv_p5.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_unv)
+        self.assertEqual(dest_unv.read_bytes(), target_data)
+
+    def test_6_4_4_duplicate_file_ids_across_pages_deduplicated(self):
+        """6.4.4. Duplicate file IDs across pages deduplicated deterministically."""
+        folder_id = "folder-dedup"
+        self.mock_client.list_page_size_override = 2
+        # Page 1: dup-1, file-2
+        # Page 2: dup-1, file-3
+        self.mock_client.mock_files.extend([
+            {"id": "file-dup-1", "name": "data.bin", "parent": folder_id, "size": 10, "mimeType": "application/octet-stream"},
+            {"id": "file-2", "name": "data.bin", "parent": folder_id, "size": 20, "mimeType": "application/octet-stream"},
+            {"id": "file-dup-1", "name": "data.bin", "parent": folder_id, "size": 10, "mimeType": "application/octet-stream"},
+            {"id": "file-3", "name": "data.bin", "parent": folder_id, "size": 30, "mimeType": "application/octet-stream"},
+        ])
+        files = self.store._list_files_in_folder("data.bin", folder_id)
+        self.assertEqual(len(files), 3)
+        self.assertEqual([f["id"] for f in files], ["file-dup-1", "file-2", "file-3"])
+
+    def test_6_4_5_repeating_looping_page_token_raises_error(self):
+        """6.4.5. Repeating/looping nextPageToken raises DriveTransferError."""
+        folder_id = "folder-loop"
+        self.mock_client.inject_looping_page_token = True
+        self.mock_client.mock_files.extend([
+            {"id": "file-l1", "name": "loop.bin", "parent": folder_id, "size": 10, "mimeType": "application/octet-stream"},
+            {"id": "file-l2", "name": "loop.bin", "parent": folder_id, "size": 20, "mimeType": "application/octet-stream"},
+        ])
+        with self.assertRaises(DriveTransferError) as cm:
+            self.store._list_files_in_folder("loop.bin", folder_id)
+        self.assertIn("loop", str(cm.exception).lower())
+
+    def test_6_4_6_exceeding_max_list_pages_raises_error(self):
+        """6.4.6. Exceeding max_list_pages while nextPageToken remains raises DriveTransferError."""
+        folder_id = "folder-max-pages"
+        custom_store = GoogleDriveArtifactStore(
+            credentials=self.creds,
+            credentials_file=self.credentials_file,
+            local_staging_dir=self.staging_dir,
+            http_client=self.mock_client,
+            list_page_size=2,
+            max_list_pages=2,
+            initial_backoff_sec=0.01,
+        )
+        self.mock_client.mock_files.extend([
+            {"id": "f-1", "name": "overflow.pt", "parent": folder_id, "size": 1, "mimeType": "application/octet-stream"},
+            {"id": "f-2", "name": "overflow.pt", "parent": folder_id, "size": 2, "mimeType": "application/octet-stream"},
+            {"id": "f-3", "name": "overflow.pt", "parent": folder_id, "size": 3, "mimeType": "application/octet-stream"},
+            {"id": "f-4", "name": "overflow.pt", "parent": folder_id, "size": 4, "mimeType": "application/octet-stream"},
+            {"id": "f-5", "name": "overflow.pt", "parent": folder_id, "size": 5, "mimeType": "application/octet-stream"},
+        ])
+        with self.assertRaises(DriveTransferError) as cm:
+            custom_store._list_files_in_folder("overflow.pt", folder_id)
+        self.assertIn("max_list_pages", str(cm.exception))
+
+    def test_6_4_7_exceeding_max_list_candidates_raises_error(self):
+        """6.4.7. Exceeding max_list_candidates raises DriveTransferError."""
+        folder_id = "folder-max-cands"
+        custom_store = GoogleDriveArtifactStore(
+            credentials=self.creds,
+            credentials_file=self.credentials_file,
+            local_staging_dir=self.staging_dir,
+            http_client=self.mock_client,
+            list_page_size=10,
+            max_list_candidates=3,
+            initial_backoff_sec=0.01,
+        )
+        for i in range(5):
+            self.mock_client.mock_files.append({
+                "id": f"cand-{i}", "name": "cands.pt", "parent": folder_id, "size": 1, "mimeType": "application/octet-stream"
+            })
+        with self.assertRaises(DriveTransferError) as cm:
+            custom_store._list_files_in_folder("cands.pt", folder_id)
+        self.assertIn("max_list_candidates", str(cm.exception))
+
+    def test_6_4_8_mid_pagination_failure_raises_error(self):
+        """6.4.8. Mid-pagination failure on page 2 (503 or malformed JSON) raises DriveTransferError."""
+        folder_id = "folder-mid-fail"
+        self.mock_client.list_page_size_override = 2
+        for i in range(6):
+            self.mock_client.mock_files.append({
+                "id": f"mid-{i}", "name": "fail.pt", "parent": folder_id, "size": 1, "mimeType": "application/octet-stream"
+            })
+
+        # Subtest A: HTTP 503 on page 2
+        self.mock_client.fail_list_files_status = 503
+        self.mock_client.fail_list_files_at_page = 2
+        with self.assertRaises(DriveTransferError):
+            self.store._list_files_in_folder("fail.pt", folder_id)
+
+        # Subtest B: Malformed JSON on page 2
+        self.mock_client.fail_list_files_status = None
+        self.mock_client.fail_list_files_body = b"NOT_VALID_JSON_ON_PAGE_2"
+        self.mock_client.fail_list_files_at_page = 2
+        with self.assertRaises(DriveTransferError) as cm:
+            self.store._list_files_in_folder("fail.pt", folder_id)
+        self.assertIn("Malformed JSON", str(cm.exception))
+
+    def test_6_4_9_malformed_page_token_raises_error(self):
+        """6.4.9. Malformed non-string or whitespace nextPageToken raises DriveTransferError."""
+        folder_id = "folder-mal-token"
+        self.mock_client.inject_malformed_page_token = 12345
+        self.mock_client.mock_files.append({
+            "id": "f-tok-1", "name": "tok.pt", "parent": folder_id, "size": 1, "mimeType": "application/octet-stream"
+        })
+        with self.assertRaises(DriveTransferError) as cm:
+            self.store._list_files_in_folder("tok.pt", folder_id)
+        self.assertIn("Malformed non-string", str(cm.exception))
+
+        self.mock_client.inject_malformed_page_token = "   "
+        with self.assertRaises(DriveTransferError) as cm:
+            self.store._list_files_in_folder("tok.pt", folder_id)
+        self.assertIn("whitespace nextPageToken", str(cm.exception))
+
+    # =========================================================================
+    # Section 7.4: Listing Error Classification & No Duplicate Upload Tests (F4)
+    # =========================================================================
+
+    def test_7_4_1_listing_http_401_raises_authentication_error(self):
+        """7.4.1. HTTP 401 during _list_files_in_folder raises DriveAuthenticationError."""
+        self.mock_client.fail_list_files_status = 401
+        self.mock_client.auth_expired = True
+        with self.assertRaises(DriveAuthenticationError):
+            self.store._list_files_in_folder("test.pt", "folder-1")
+
+    def test_7_4_2_listing_http_403_quota_and_forbidden_classification(self):
+        """7.4.2. HTTP 403 quota/permission during _list_files_in_folder classified strictly."""
+        # Case A: Storage quota exceeded
+        self.mock_client.fail_list_files_status = 403
+        self.mock_client.fail_list_files_body = b'{"error": {"errors": [{"reason": "storageQuotaExceeded"}]}}'
+        with self.assertRaises(DriveQuotaExceededError):
+            self.store._list_files_in_folder("test.pt", "folder-1")
+
+        # Case B: Forbidden / permission denied
+        self.mock_client.fail_list_files_body = b'{"error": {"errors": [{"reason": "forbidden"}]}}'
+        with self.assertRaises(DriveAuthenticationError):
+            self.store._list_files_in_folder("test.pt", "folder-1")
+
+    def test_7_4_3_listing_http_server_errors_raise_transfer_error(self):
+        """7.4.3. HTTP 429/500/503 during _list_files_in_folder raise DriveTransferError."""
+        for code in (429, 500, 503):
+            self.mock_client.fail_list_files_status = code
+            self.mock_client.fail_list_files_body = f'{{"error": "HTTP {code}"}}'.encode("utf-8")
+            with self.assertRaises(DriveTransferError):
+                self.store._list_files_in_folder("test.pt", "folder-1")
+
+    def test_7_4_4_listing_network_exception_raises_transfer_error(self):
+        """7.4.4. Network timeout or ConnectionResetError during _list_files_in_folder raises DriveTransferError."""
+        self.mock_client.fail_list_files_exception = ConnectionResetError("Connection reset by peer")
+        with self.assertRaises(DriveTransferError) as cm:
+            self.store._list_files_in_folder("test.pt", "folder-1")
+        self.assertIn("Connection reset by peer", str(cm.exception))
+
+    def test_7_4_5_listing_malformed_payload_structures_raise_transfer_error(self):
+        """7.4.5. Invalid JSON, non-dict JSON, missing/non-list 'files' key raise DriveTransferError."""
+        cases = [
+            (b"NOT_JSON", "Malformed JSON"),
+            (b"[1, 2, 3]", "missing 'files' list"),
+            (b'{"no_files": []}', "missing 'files' list"),
+            (b'{"files": "not_a_list"}', "missing 'files' list"),
+            (b'{"files": ["not_a_dict"]}', "missing string 'id'"),
+            (b'{"files": [{"name": "no_id"}]}', "missing string 'id'"),
+            (b'{"files": [{"id": 12345}]}', "missing string 'id'"),
+        ]
+        for body, expected_err in cases:
+            self.mock_client.fail_list_files_body = body
+            with self.assertRaises(DriveTransferError) as cm:
+                self.store._list_files_in_folder("test.pt", "folder-1")
+            self.assertIn(expected_err, str(cm.exception))
+
+    def test_7_4_6_listing_valid_empty_files_returns_empty_list(self):
+        """7.4.6. Valid HTTP 200 with {"files": []} returns empty list."""
+        self.mock_client.mock_files.clear()
+        files = self.store._list_files_in_folder("non_existent.pt", "folder-empty")
+        self.assertEqual(files, [])
+
+    def test_7_4_7_publish_does_not_initiate_duplicate_upload_on_listing_failure(self):
+        """7.4.7. Publish raises DriveTransferError and does NOT initiate upload session on listing failure."""
+        project_id = "proj_dup_prev"
+        run_id = "run_dup_prev"
+        file_path = Path(self.test_dir) / "dup_model.pt"
+        data = b"MODEL_DATA_FOR_DUPLICATE_PREVENTION_TEST"
+        file_path.write_bytes(data)
+
+        # Pre-resolve target folder
+        target_folder_id = self.store.resolve_target_folder_id(project_id, run_id, "checkpoints")
+
+        # Pre-populate remote file as already existing on Drive
+        self.mock_client.mock_files.append({
+            "id": "existing-drive-file-999",
+            "name": file_path.name,
+            "parent": target_folder_id,
+            "content": data,
+            "mimeType": "application/octet-stream",
+            "appProperties": {
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "is_latest": "true",
+            },
+        })
+
+        initial_upload_sessions = self.mock_client.upload_sessions_initiated
+
+        # Subtest A: Listing fails with HTTP 503
+        self.mock_client.fail_list_files_status = 503
+        with self.assertRaises(DriveTransferError):
+            self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Crucial assertion: no upload session was initiated
+        self.assertEqual(self.mock_client.upload_sessions_initiated, initial_upload_sessions)
+
+        # Subtest B: Listing fails with malformed JSON
+        self.mock_client.fail_list_files_status = None
+        self.mock_client.fail_list_files_body = b"GARBAGE_JSON"
+        with self.assertRaises(DriveTransferError):
+            self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Still no upload session was initiated
+        self.assertEqual(self.mock_client.upload_sessions_initiated, initial_upload_sessions)
+
+    def test_7_4_8_find_or_create_folder_failure_does_not_send_post(self):
+        """7.4.8. _find_or_create_folder failing with HTTP 500/503 raises DriveTransferError and does not POST."""
+        self.mock_client.fail_folder_lookup_status = 503
+        initial_posts = [r for r in self.mock_client.requests_log if r[0] == "POST"]
+
+        with self.assertRaises(DriveTransferError):
+            self.store._find_or_create_folder("fail_folder", parent_id="root")
+
+        current_posts = [r for r in self.mock_client.requests_log if r[0] == "POST"]
+        self.assertEqual(len(current_posts), len(initial_posts))
+
+        # Also test malformed JSON on folder lookup
+        self.mock_client.fail_folder_lookup_status = None
+        self.mock_client.fail_folder_lookup_body = b"NOT_JSON_FOLDER"
+        with self.assertRaises(DriveTransferError):
+            self.store._find_or_create_folder("fail_folder_2", parent_id="root")
+
+        current_posts = [r for r in self.mock_client.requests_log if r[0] == "POST"]
+        self.assertEqual(len(current_posts), len(initial_posts))
+
+    def test_7_4_9_listing_parent_folder_404_raises_artifact_not_found(self):
+        """7.4.9. Parent folder HTTP 404 during _list_files_in_folder raises ArtifactNotFoundError."""
+        self.mock_client.fail_list_files_status = 404
+        self.mock_client.fail_list_files_body = b'{"error": {"code": 404, "message": "File not found"}}'
+        with self.assertRaises(ArtifactNotFoundError):
+            self.store._list_files_in_folder("test.pt", "missing-folder-id")
+
+    # =========================================================================
+    # Additional Verification: Init Param Validation & Error Propagation
+    # =========================================================================
+
+    def test_init_pagination_parameter_validation(self):
+        """GoogleDriveArtifactStore validates pagination parameters >= 1."""
+        with self.assertRaises(ValueError):
+            GoogleDriveArtifactStore(list_page_size=0)
+        with self.assertRaises(ValueError):
+            GoogleDriveArtifactStore(list_page_size=-5)
+        with self.assertRaises(ValueError):
+            GoogleDriveArtifactStore(max_list_pages=0)
+        with self.assertRaises(ValueError):
+            GoogleDriveArtifactStore(max_list_candidates=0)
+
+        store = GoogleDriveArtifactStore(
+            list_page_size=25,
+            max_list_pages=10,
+            max_list_candidates=500,
+        )
+        self.assertEqual(store.list_page_size, 25)
+        self.assertEqual(store.max_list_pages, 10)
+        self.assertEqual(store.max_list_candidates, 500)
+
+    def test_retrieve_and_exists_error_propagation(self):
+        """retrieve() and exists() re-raise DriveTransferError / DriveAuthenticationError."""
+        project_id = "proj_err_prop"
+        run_id = "run_err_prop"
+        dest = Path(self.test_dir) / "err_dest.pt"
+
+        # Folder lookup failure during retrieve() raises DriveTransferError, NOT ArtifactNotFoundError
+        self.mock_client.fail_folder_lookup_status = 503
+        with self.assertRaises(DriveTransferError):
+            self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest)
+
+        # File listing failure during exists() re-raises DriveTransferError, does NOT return False
+        self.mock_client.fail_folder_lookup_status = None
+        self.mock_client.fail_list_files_status = 503
+        with self.assertRaises(DriveTransferError):
+            self.store.exists(f"{project_id}/{run_id}/checkpoints/model.pt")
+
+        # 401 during exists() re-raises DriveAuthenticationError
+        self.mock_client.fail_list_files_status = 401
+        self.mock_client.auth_expired = True
+        with self.assertRaises(DriveAuthenticationError):
+            self.store.exists(f"{project_id}/{run_id}/checkpoints/model.pt")
 
 
 if __name__ == "__main__":
