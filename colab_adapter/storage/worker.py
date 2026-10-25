@@ -5,13 +5,16 @@ per-file retries with backoff, and strict isolation from training job execution 
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import queue
 import random
 import shutil
+import stat
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
@@ -45,6 +48,7 @@ class ArtifactUploadWorker:
         initial_retry_delay_sec: float = 0.2,
         on_success: Optional[Callable[[StoredArtifact], None]] = None,
         on_failure: Optional[Callable[[TransferRecord, Exception], None]] = None,
+        allowed_source_root: Optional[Union[str, Path]] = None,
     ):
         self.store = store
         self.journal = journal
@@ -52,6 +56,7 @@ class ArtifactUploadWorker:
         self.initial_retry_delay_sec = initial_retry_delay_sec
         self.on_success = on_success
         self.on_failure = on_failure
+        self.allowed_source_root = Path(allowed_source_root).resolve() if allowed_source_root is not None else None
 
         self._queue: queue.Queue[TransferRecord] = queue.Queue()
         self._queued_ids: Set[str] = set()
@@ -69,6 +74,43 @@ class ArtifactUploadWorker:
             logger.warning("Error recovering from journal on init: %s", ex)
             self._quarantine_corrupt_journal()
 
+    @property
+    def trusted_staging_root(self) -> Path:
+        """Absolute resolved path to the trusted staging root owned by the journal."""
+        return (self.journal.path.parent / ".staged_uploads").resolve()
+
+    def _ensure_trusted_staging_root(self) -> Path:
+        """Validate and create trusted staging root with strict 0700 permissions and no symlinks."""
+        raw_root = self.journal.path.parent / ".staged_uploads"
+        if raw_root.is_symlink():
+            raise ArtifactValidationError(f"Symlinked staging directory rejected: {raw_root}")
+        raw_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            os.chmod(str(raw_root), 0o700)
+        except OSError:
+            pass
+        if raw_root.is_symlink():
+            raise ArtifactValidationError(f"Symlinked staging directory rejected: {raw_root}")
+        return raw_root.resolve()
+
+    def _is_trusted_staged_path(self, path: Union[str, Path]) -> bool:
+        """Check if path is inside this worker's trusted staging root, rejecting symlinks and fake roots."""
+        if not path:
+            return False
+        p = Path(path)
+        try:
+            if p.is_symlink():
+                return False
+            raw_root = self.journal.path.parent / ".staged_uploads"
+            if raw_root.is_symlink():
+                return False
+            trusted_root = raw_root.resolve()
+            resolved = p.resolve()
+            rel = resolved.relative_to(trusted_root)
+            return len(rel.parts) >= 1 and not any(part == ".." for part in rel.parts)
+        except (ValueError, OSError):
+            return False
+
     def _quarantine_corrupt_journal(self) -> None:
         """Quarantine corrupt journal file to .corrupt.<timestamp>.bak and reset with empty records."""
         ts = int(time.time() * 1000)
@@ -76,6 +118,10 @@ class ArtifactUploadWorker:
         try:
             if self.journal.path.exists():
                 shutil.copy2(str(self.journal.path), str(corrupt_file))
+                try:
+                    os.chmod(str(corrupt_file), 0o600)
+                except OSError:
+                    pass
         except Exception:
             pass
         self.journal._write_records({})
@@ -218,9 +264,34 @@ class ArtifactUploadWorker:
         if not proj_arg or not run_arg:
             raise ArtifactValidationError("Missing project_id or run_id for enqueue.")
 
-        src = Path(src_arg).resolve()
-        if not src.exists():
-            raise ArtifactValidationError(f"Artifact source file does not exist: {src}")
+        raw_p = Path(src_arg)
+        if ".." in raw_p.parts:
+            raise ArtifactValidationError(f"Path traversal sequence rejected in source path: {raw_p}")
+
+        if raw_p.is_symlink() or not raw_p.exists() or not stat.S_ISREG(raw_p.lstat().st_mode):
+            raise ArtifactValidationError(f"Refusing to stage symlink or non-regular file: {raw_p}")
+
+        if self.allowed_source_root is not None:
+            resolved_root = self.allowed_source_root.resolve()
+            resolved_p = raw_p.resolve()
+            try:
+                resolved_p.relative_to(resolved_root)
+            except ValueError:
+                raise ArtifactValidationError(f"Source file {raw_p} escapes allowed root {resolved_root}")
+            curr = raw_p.parent
+            while curr != curr.parent and curr != raw_p:
+                if curr.is_symlink():
+                    try:
+                        curr.resolve().relative_to(resolved_root)
+                    except ValueError:
+                        raise ArtifactValidationError(f"Symlink in parent directory escapes allowed root: {curr}")
+                if curr.resolve() == resolved_root:
+                    break
+                curr = curr.parent
+
+        src = raw_p.resolve()
+        if not src.exists() or not stat.S_ISREG(src.stat().st_mode):
+            raise ArtifactValidationError(f"Artifact source file does not exist or is non-regular: {src}")
 
         current_sha256 = ArtifactStore.compute_sha256(src)
         current_size = src.stat().st_size
@@ -257,22 +328,108 @@ class ArtifactUploadWorker:
             meta_arg["category"] = cat_arg
 
         with self.journal.acquire_artifact_lock(self.store.provider_name, proj_arg, run_arg, src.name):
-            # Protect against in-place source file mutation after enqueue() using atomic temp copy under lock:
-            staging_dir = self.journal.path.parent / ".staged_uploads" / f"{proj_arg}_{run_arg}_{current_sha256[:16]}"
-            staging_dir.mkdir(parents=True, exist_ok=True)
+            # Protect against in-place source file mutation after enqueue() using atomic 0600 temp copy under lock:
+            trusted_staging_root = self._ensure_trusted_staging_root()
+            staging_dir = trusted_staging_root / f"{proj_arg}_{run_arg}_{current_sha256[:16]}"
+            if staging_dir.is_symlink():
+                raise ArtifactValidationError("Symlinked staging directory rejected")
+            staging_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                os.chmod(str(staging_dir), 0o700)
+            except OSError:
+                pass
+
+            try:
+                staging_dir.resolve().relative_to(trusted_staging_root)
+            except ValueError:
+                raise ArtifactValidationError("Symlinked staging directory rejected")
+
+            if (staging_dir.stat().st_mode & 0o777) != 0o700:
+                os.chmod(str(staging_dir), 0o700)
+                if (staging_dir.stat().st_mode & 0o777) != 0o700:
+                    raise ArtifactValidationError(f"Staging directory permissions insecure: {oct(staging_dir.stat().st_mode)}")
+
             staged_file = staging_dir / src.name
-            if not staged_file.exists() or ArtifactStore.compute_sha256(staged_file).lower() != current_sha256.lower():
-                tmp_staged = staging_dir / f"{src.name}.tmp.{os.getpid()}.{threading.get_ident()}"
-                shutil.copy2(str(src), str(tmp_staged))
-                staged_sha256 = ArtifactStore.compute_sha256(tmp_staged)
-                if staged_sha256.lower() != current_sha256.lower():
-                    if tmp_staged.exists():
+            if staged_file.is_symlink():
+                raise ArtifactValidationError(f"Refusing to stage symlink or non-regular file: {staged_file}")
+
+            needs_copy = True
+            if staged_file.exists() and stat.S_ISREG(staged_file.lstat().st_mode):
+                try:
+                    os.chmod(str(staged_file), 0o600)
+                    if (
+                        staged_file.stat().st_size == current_size
+                        and ArtifactStore.compute_sha256(staged_file).lower() == current_sha256.lower()
+                    ):
+                        needs_copy = False
+                except OSError:
+                    needs_copy = True
+
+            if needs_copy:
+                tmp_staged = staging_dir / f"{src.name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
+                tmp_fd = None
+                tmp_created = False
+                try:
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+                    tmp_fd = os.open(str(tmp_staged), flags, 0o600)
+                    tmp_created = True
+                    try:
+                        os.chmod(str(tmp_staged), 0o600)
+                    except OSError:
+                        pass
+
+                    hasher = hashlib.sha256()
+                    staged_size = 0
+                    with os.fdopen(tmp_fd, "wb") as f_out:
+                        tmp_fd = None  # fdopen takes ownership of tmp_fd
+                        with open(src, "rb") as f_in:
+                            while True:
+                                chunk = f_in.read(64 * 1024)
+                                if not chunk:
+                                    break
+                                f_out.write(chunk)
+                                hasher.update(chunk)
+                                staged_size += len(chunk)
+                        f_out.flush()
+                        os.fsync(f_out.fileno())
+
+                    try:
+                        os.chmod(str(tmp_staged), 0o600)
+                    except OSError:
+                        pass
+
+                    staged_sha256 = hasher.hexdigest().lower()
+
+                    if (
+                        staged_size != current_size
+                        or staged_sha256 != current_sha256.lower()
+                        or (sha_arg and staged_sha256 != sha_arg.lower())
+                    ):
+                        if tmp_staged.exists():
+                            try:
+                                tmp_staged.unlink()
+                            except OSError:
+                                pass
+                        tmp_created = False
+                        raise ArtifactValidationError("Source file mutated during enqueue staging")
+
+                    os.replace(str(tmp_staged), str(staged_file))
+                    tmp_created = False
+                    try:
+                        os.chmod(str(staged_file), 0o600)
+                    except OSError:
+                        pass
+                finally:
+                    if tmp_fd is not None:
+                        try:
+                            os.close(tmp_fd)
+                        except OSError:
+                            pass
+                    if tmp_created and tmp_staged.exists():
                         try:
                             tmp_staged.unlink()
                         except OSError:
                             pass
-                    raise ArtifactValidationError("Source file mutated during enqueue staging")
-                os.replace(str(tmp_staged), str(staged_file))
 
             self.journal._load()
             existing = self.journal.get_transfer(transfer_id)
@@ -357,8 +514,8 @@ class ArtifactUploadWorker:
                     "Artifact %s was already published by another worker/process; skipping upload.",
                     task.transfer_id,
                 )
-                if ".staged_uploads" in src.parts:
-                    shutil.rmtree(src.parent, ignore_errors=True)
+                if self._is_trusted_staged_path(src):
+                    shutil.rmtree(str(src.parent), ignore_errors=True)
                 if self.on_success:
                     stored = StoredArtifact(
                         artifact_id=existing.artifact_id,
@@ -389,8 +546,8 @@ class ArtifactUploadWorker:
                         "Artifact %s was already published by another worker/process; skipping upload.",
                         task.transfer_id,
                     )
-                    if ".staged_uploads" in src.parts:
-                        shutil.rmtree(src.parent, ignore_errors=True)
+                    if self._is_trusted_staged_path(src):
+                        shutil.rmtree(str(src.parent), ignore_errors=True)
                     if self.on_success:
                         stored = StoredArtifact(
                             artifact_id=existing_rec.artifact_id,
@@ -412,16 +569,32 @@ class ArtifactUploadWorker:
                 )
                 return False
 
-            if not src.is_file():
-                raise ArtifactValidationError(f"Local artifact source file missing: {src}")
-
-            actual_sha256 = ArtifactStore.compute_sha256(src)
-            if task_expected_sha and len(task_expected_sha) == 64 and actual_sha256.lower() != task_expected_sha.lower():
-                raise ArtifactValidationError(
-                    f"Local artifact modified before publication: expected {task_expected_sha}, got {actual_sha256}"
-                )
-
             try:
+                # Pre-upload staged file validation
+                if src.is_symlink() or not src.exists() or not stat.S_ISREG(src.lstat().st_mode):
+                    task.status = TransferStatus.UPLOAD_FAILED.value
+                    task.last_error = f"Refusing to upload symlink or non-regular file: {src}"
+                    self.journal.record_transfer(task)
+                    raise ArtifactValidationError(f"Refusing to upload symlink or non-regular file: {src}")
+
+                if task.size_bytes is not None and src.stat().st_size != task.size_bytes:
+                    task.status = TransferStatus.UPLOAD_FAILED.value
+                    task.last_error = f"Local staged file size mismatch: expected {task.size_bytes}, got {src.stat().st_size}"
+                    self.journal.record_transfer(task)
+                    raise ArtifactValidationError(
+                        f"Local artifact modified before publication: expected size {task.size_bytes}, got {src.stat().st_size}"
+                    )
+
+                actual_sha256 = ArtifactStore.compute_sha256(src)
+                expected_sha = (task_expected_sha or task.sha256)
+                if expected_sha and len(expected_sha) == 64 and actual_sha256.lower() != expected_sha.lower():
+                    task.status = TransferStatus.UPLOAD_FAILED.value
+                    task.last_error = f"Local staged artifact modified before publication: expected {expected_sha}, got {actual_sha256}"
+                    self.journal.record_transfer(task)
+                    raise ArtifactValidationError(
+                        f"Local artifact modified before publication: expected {expected_sha}, got {actual_sha256}"
+                    )
+
                 stored = self.store.publish(
                     source=src,
                     project_id=task.project_id,
@@ -433,14 +606,22 @@ class ArtifactUploadWorker:
 
                 self.journal.mark_completed(task.transfer_id, remote_id=stored.remote_file_id)
 
-                if ".staged_uploads" in src.parts:
-                    shutil.rmtree(src.parent, ignore_errors=True)
+                if self._is_trusted_staged_path(src):
+                    shutil.rmtree(str(src.parent), ignore_errors=True)
 
                 if self.on_success:
                     self.on_success(stored)
                 return True
             finally:
                 self.journal.release_transfer_lease(task.transfer_id, lease_token)
+
+    def _process_single_transfer(self, task: UploadTask) -> bool:
+        """Alias for _process_task."""
+        return self._process_task(task)
+
+    def _upload_with_lease(self, task: UploadTask) -> bool:
+        """Alias for _process_task."""
+        return self._process_task(task)
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -471,7 +652,10 @@ class ArtifactUploadWorker:
                 refreshed.retry_count += 1
                 refreshed.last_error = err_str
 
-                if refreshed.retry_count <= refreshed.max_retries:
+                if isinstance(e, ArtifactValidationError):
+                    refreshed.status = TransferStatus.UPLOAD_FAILED.value
+                    self.journal.record_transfer(refreshed)
+                elif refreshed.retry_count <= refreshed.max_retries:
                     backoff = self.initial_retry_delay_sec * (2 ** (refreshed.retry_count - 1)) + random.uniform(0.01, 0.05)
                     refreshed.next_retry_at = time.time() + backoff
                     refreshed.status = TransferStatus.RETRY_PENDING.value
