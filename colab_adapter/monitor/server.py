@@ -26,7 +26,7 @@ import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from ..provider import ManagedSessionRegistry
 from ..telemetry import TelemetryEmitter
@@ -317,6 +317,18 @@ def _event_run_key(ev: Dict[str, Any]) -> Tuple[str, str]:
     selector, so they never match a named project (D10).
     """
     return (str(ev.get("project_id") or ""), str(ev.get("run_id") or ""))
+
+
+def _drop_phantom_legacy_keys(keys: Iterable[Tuple[str, str]]) -> Set[Tuple[str, str]]:
+    """Remove legacy keyless RunKeys ('', run_id) whenever a named project owns that run id.
+
+    Legacy events carry no project_id. When a named project also owns the same run id, the
+    keyless entry is a phantom duplicate and must not be listed or counted. A legacy key with
+    no named owner is kept, so legacy-only runs stay visible.
+    """
+    key_set = set(keys)
+    named_run_ids = {k[1] for k in key_set if k[0]}
+    return {k for k in key_set if k[0] or k[1] not in named_run_ids}
 
 
 def _load_run_manifest(run_dir: Path, project_id: str, run_id: str) -> Optional[Dict[str, Any]]:
@@ -684,7 +696,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         running_count = sum(1 for s in all_managed.values() if s.get("state") in ("READY", "RUNNING", "ACTIVE"))
 
         events = self.server.telemetry.get_events(project_id=project)
-        unique_runs = len({_event_run_key(e) for e in events if e.get("run_id")})
+        # Same phantom rule as /runs so total_runs equals the runs list length for event-backed runs.
+        unique_runs = len(_drop_phantom_legacy_keys({_event_run_key(e) for e in events if e.get("run_id")}))
 
         summary = MonitoringSummary(
             current_balance_cu=latest.balance_cu if latest else None,
@@ -836,9 +849,17 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                     chk_arts = [a for a in run_arts if a.get("artifact_type") == "checkpoint" or a.get("category") == "checkpoint"]
                     if chk_arts:
                         run["checkpoint_count"] = max(run.get("checkpoint_count", 0), len(chk_arts))
-                        latest_chk = next((a for a in chk_arts if a.get("is_latest")), chk_arts[-1])
-                        run["latest_checkpoint_name"] = Path(latest_chk.get("logical_path") or latest_chk.get("path", "")).name
-                        run["latest_checkpoint_sha256"] = latest_chk.get("sha256")
+                        # Only an artifact the manifest head marks is_latest=True may name the latest
+                        # checkpoint. No guessing from order: unknown leaves name/sha null.
+                        latest_chk = next((a for a in chk_arts if a.get("is_latest") is True), None)
+                        if latest_chk is not None:
+                            run["latest_checkpoint_name"] = Path(latest_chk.get("logical_path") or latest_chk.get("path", "")).name
+                            run["latest_checkpoint_sha256"] = latest_chk.get("sha256")
+                            run["latest_checkpoint_state"] = "known"
+                        else:
+                            run["latest_checkpoint_name"] = None
+                            run["latest_checkpoint_sha256"] = None
+                            run["latest_checkpoint_state"] = "unknown"
                     drive_arts = [a for a in run_arts if a.get("storage_provider") == "google_drive" or a.get("remote_file_id") or a.get("remote_available")]
                     if drive_arts:
                         run["drive_publication_status"] = "PUBLISHED"
@@ -852,16 +873,18 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         all_managed = self.server.registry.get_all_managed()
         active_session_ids = {s_id for s_id, s_info in all_managed.items() if s_info.get("state") in ("READY", "RUNNING", "ACTIVE")}
 
+        # A legacy keyless event stream must not appear as a phantom project next to a named owner of the run.
+        # Filter BEFORE counting so phantom keys do not inflate run_id_counts.
+        kept_keys = _drop_phantom_legacy_keys(runs_map.keys())
+        for legacy_key in [k for k in runs_map if k not in kept_keys]:
+            del runs_map[legacy_key]
+
         # The registry records no project/run id per session, so a session id is
         # attributed to a run only when exactly one run key carries that run id.
         run_id_counts: Dict[str, int] = {}
         for key in runs_map:
             run_id_counts[key[1]] = run_id_counts.get(key[1], 0) + 1
 
-        # A legacy keyless event stream must not appear as a phantom project next to a named owner of the run.
-        named_run_ids = {k[1] for k in runs_map if k[0]}
-        for legacy_key in [k for k in runs_map if not k[0] and k[1] in named_run_ids]:
-            del runs_map[legacy_key]
         ordered_keys = sorted(runs_map)
         for key in ordered_keys:
             run = runs_map[key]
@@ -944,32 +967,36 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 deduped[key] = a
         parsed_artifacts = list(deduped.values())
 
-        # Derive is_latest for each logical_path group
+        # Derive is_latest for each logical_path group ONLY from an authoritative manifest
+        # head (manifest latest_by_path). The per-entry "is_latest" flags carried inside
+        # manifest entries (e.g. copied from Drive/remote appProperties) are NOT authoritative
+        # for display and are overwritten here. When there is no head for the logical path,
+        # the head matches no listed revision, or it matches more than one, every revision
+        # is unknown (None). Never guess from created_at, step or list order.
         groups: Dict[str, List[Dict[str, Any]]] = {}
         for a in parsed_artifacts:
             groups.setdefault(a["logical_path"], []).append(a)
 
         for l_path, items in groups.items():
-            matched_by_manifest = False
+            target_id: Any = None
             if l_path in latest_by_path:
                 target = latest_by_path[l_path]
-                target_id = target if isinstance(target, str) else (target.get("artifact_id") or target.get("sha256"))
+                if isinstance(target, str):
+                    target_id = target
+                elif isinstance(target, dict):
+                    target_id = target.get("artifact_id") or target.get("sha256")
+            matches = [
+                item for item in items
+                if target_id and (item.get("artifact_id") == target_id or item.get("sha256") == target_id)
+            ]
+            if len(matches) == 1:
                 for item in items:
-                    if item.get("artifact_id") == target_id or item.get("sha256") == target_id:
-                        item["is_latest"] = True
-                        matched_by_manifest = True
-                    else:
-                        item["is_latest"] = False
-            if not matched_by_manifest:
-                def _sort_key(it):
-                    c_at = it.get("created_at") or ""
-                    s = it.get("step")
-                    step_num = s if isinstance(s, int) else -1
-                    return (c_at, step_num, it.get("artifact_id") or "")
-
-                sorted_items = sorted(items, key=_sort_key)
-                for i, item in enumerate(sorted_items):
-                    item["is_latest"] = (i == len(sorted_items) - 1)
+                    item["is_latest"] = item is matches[0]
+                    item["latest_state"] = "known"
+            else:
+                for item in items:
+                    item["is_latest"] = None
+                    item["latest_state"] = "unknown"
 
         # Merge with local files found on disk in run_dir (avoiding duplicates and staged files)
         if run_dir and Path(run_dir).is_dir():
@@ -1028,7 +1055,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                             "artifact_id": rel if project_id else f"{run_id}/{rel}",
                             "logical_path": rel,
                             "revision_id": f"sha256_{f_sha[:12]}" if f_sha else "unversioned",
-                            "is_latest": True,
+                            # Unmanifested: no manifest head exists, so latest is unknown.
+                            "is_latest": None,
+                            "latest_state": "unknown",
                             "step": None,
                             "size_bytes": f_size,
                             "sha256": f_sha,

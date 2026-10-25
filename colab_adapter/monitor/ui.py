@@ -1330,9 +1330,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         tdPath.appendChild(strongPath);
 
         const badge = document.createElement('span');
-        const isLatest = a.is_latest !== false;
-        badge.className = isLatest ? 'badge badge-green' : 'badge badge-neutral';
-        badge.textContent = isLatest ? 'LATEST' : 'HISTORICAL';
+        // Only a manifest-confirmed head is LATEST; null/unknown must not imply latest.
+        if (a.is_latest === true) {
+          badge.className = 'badge badge-green';
+          badge.textContent = 'LATEST';
+        } else if (a.is_latest === false) {
+          badge.className = 'badge badge-neutral';
+          badge.textContent = 'HISTORICAL';
+        } else {
+          badge.className = 'badge badge-neutral';
+          badge.textContent = 'UNKNOWN';
+        }
         badge.style.marginLeft = '8px';
         tdPath.appendChild(badge);
 
@@ -1581,7 +1589,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         const tdChk = document.createElement('td');
         const chkCount = r.checkpoint_count || 0;
-        const chkStr = chkCount > 0 ? String(chkCount) + (r.latest_checkpoint_name ? ` (${r.latest_checkpoint_name})` : '') : '0';
+        let chkStr = chkCount > 0 ? String(chkCount) : '0';
+        if (chkCount > 0 && r.latest_checkpoint_name) {
+          chkStr += ` (${r.latest_checkpoint_name})`;
+        } else if (chkCount > 0 && r.latest_checkpoint_state === 'unknown') {
+          chkStr += ' (latest unknown)';
+        }
         tdChk.appendChild(document.createTextNode(chkStr));
         if (r.latest_checkpoint_sha256) {
           tdChk.appendChild(document.createTextNode(' '));
