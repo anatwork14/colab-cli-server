@@ -25,6 +25,7 @@ if __package__ is None or __package__ == "":
     )
     from colab_adapter.project_sessions import ProjectSessionManager
     from colab_adapter.provider import (
+        AllocationError,
         ApprovalRequiredError,
         ColabGPUProvider,
         JobSpec,
@@ -46,6 +47,7 @@ else:
     )
     from .project_sessions import ProjectSessionManager
     from .provider import (
+        AllocationError,
         ApprovalRequiredError,
         ColabGPUProvider,
         JobSpec,
@@ -399,6 +401,33 @@ def handle_project_command(args: argparse.Namespace) -> int:
     except GlobalCapExceededError as e:
         print(json.dumps({"error": str(e), "reason": e.reason}, indent=2), file=sys.stderr)
         return 4
+    except AllocationError as e:
+        # Exit 6 = the allocation failed or is uncertain and a runtime may still be assigned (orphan possible);
+        # exit 1 = the failure was proven not to leave an assignment. Never retried automatically.
+        orphan = bool(getattr(e, "orphan_possible", True))
+        details = getattr(e, "details", None) or {}
+        if is_json:
+            print(json.dumps({
+                "error": str(e),
+                "orphan_possible": orphan,
+                "session_id": details.get("session_id"),
+            }, indent=2), file=sys.stderr)
+        else:
+            print(f"Project Error: {e}", file=sys.stderr)
+        return 6 if orphan else 1
+    except KeyboardInterrupt:
+        if action == "up":
+            msg = ("Interrupted during `project up`. POSSIBLE ORPHAN GPU RUNTIME: `colab new` may have assigned a "
+                   "VM that has no local name. The record is NEEDS_RECONCILIATION and still counts toward the "
+                   "one-session cap; the approval is spent and nothing will retry. Check `colab usage` (Active "
+                   "assignments vs your baseline) and the Colab web UI and stop any runtime you did not intend.")
+            if is_json:
+                print(json.dumps({"error": msg, "orphan_possible": True, "session_id": None}, indent=2), file=sys.stderr)
+            else:
+                print(f"Project Error: {msg}", file=sys.stderr)
+            return 6
+        print("Interrupted.", file=sys.stderr)
+        return 130
     except ColabV2Error as e:
         if is_json:
             print(json.dumps(e.to_dict(), indent=2), file=sys.stderr)

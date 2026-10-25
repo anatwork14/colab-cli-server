@@ -79,6 +79,7 @@ PROVISIONING_STALE_S = 300.0
 STOP_TIMEOUT_S = 60.0
 USAGE_TIMEOUT_S = 30.0
 SESSIONS_TIMEOUT_S = 60.0
+_UNNAMED_SESSION_RE = re.compile(r"^\s*\[\?\]")
 EXIT_CODE_MARKER = "EXIT_CODE"
 _EXIT_MARKER_RE = re.compile(r"^EXIT_CODE (-?[0-9]+)\s*$", re.MULTILINE)
 
@@ -188,6 +189,7 @@ class _Verification:
     level: Optional[str]
     detail: str
     listed: bool
+    count: Optional[int] = None  # active assignments read after the check (None when not read)
 
 
 def _id_pattern(session_id: str) -> "re.Pattern":
@@ -565,6 +567,9 @@ class ProjectSessionManager:
             session.expires_at = exp_iso
             # Baseline for server-side verification, read BEFORE `colab new`. None when `usage` is unavailable.
             session.metadata["assignments_before"] = self._assignments_now()
+            # Runtimes that already exist without a local name (for example created in the Colab UI); an orphan from a
+            # failed `new` is indistinguishable from them except by count, so the baseline is part of the proof.
+            session.metadata["unnamed_before"] = self._unnamed_sessions_now()
             session.transition_to(ProjectSessionState.PROVISIONING)
 
             # Record in registry with full metadata
@@ -577,21 +582,14 @@ class ProjectSessionManager:
             cmd = [self.colab_binary, f"--auth={self.auth_mode}", "new", "-s", session_id, "--gpu", gpu]
             try:
                 res = self._run_cmd(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180.0)
-                if res.returncode != 0:
-                    err_msg = (res.stderr or res.stdout or "").strip()
-                    # A nonzero exit is NOT evidence that no VM was assigned: upstream assigns the VM before it
-                    # records the local name. Only positive evidence may free the cap.
-                    proven = self._settle_failed_allocation(
-                        session, f"Allocation CLI failed (exit {res.returncode}): {err_msg}"
-                    )
-                    raise self._allocation_error(session_id, gpu, err_msg, proven)
             except subprocess.TimeoutExpired as te:
                 self._flag_orphan_risk(session, "Allocation CLI timed out; an unnamed orphan VM may exist")
                 raise self._allocation_error(session_id, gpu, "timed out after 180s", False) from te
             except AllocationError:
                 raise
             except (FileNotFoundError, PermissionError) as ex:
-                # The executable could not be started, so `colab new` never ran: no assignment can exist.
+                # Only the exec of `colab` itself can raise these here (this try covers just the subprocess call):
+                # the executable could not be started, so `colab new` never ran and no assignment can exist.
                 session.transition_to(ProjectSessionState.FAILED, reason=f"colab could not be executed: {type(ex).__name__}")
                 self._commit_session(session)
                 raise
@@ -608,9 +606,29 @@ class ProjectSessionManager:
                 self._best_effort_stop_locked(session)
                 raise
 
-            # Transition to READY
-            session.transition_to(ProjectSessionState.READY)
-            self._commit_session(session)
+            if res.returncode != 0:
+                err_msg = (res.stderr or res.stdout or "").strip()
+                # A nonzero exit is NOT evidence that no VM was assigned: upstream assigns the VM before it
+                # records the local name. Only positive evidence may free the cap.
+                proven = self._settle_failed_allocation(
+                    session, f"Allocation CLI failed (exit {res.returncode}): {err_msg}"
+                )
+                raise self._allocation_error(session_id, gpu, err_msg, proven)
+
+            # Transition to READY. A runtime exists now: if READY cannot be recorded, the record must not be left
+            # looking idle or vanish from the cap.
+            try:
+                session.transition_to(ProjectSessionState.READY)
+                committed = self._commit_session(session)
+            except BaseException as exc:
+                self._flag_orphan_risk(
+                    session, f"READY could not be recorded ({type(exc).__name__}); a runtime was allocated"
+                )
+                raise
+            if not committed:
+                raise self._allocation_error(
+                    session_id, gpu, "the session record is missing from the registry after allocation", False
+                )
             return session
 
     def attach(self, session_id: str) -> ProjectSession:
@@ -746,6 +764,18 @@ class ProjectSessionManager:
         except Exception:  # noqa: BLE001
             return None
 
+    def _unnamed_sessions_now(self) -> Optional[int]:
+        """Number of `[?]` (runtime with no local name) lines in `colab sessions`, or None when unreadable."""
+        try:
+            res = self._cli(["sessions"], SESSIONS_TIMEOUT_S)
+            out = _strip_ansi(res.stdout or "")
+            if res.returncode != 0:
+                combined = (out + "\n" + _strip_ansi(res.stderr or "")).lower()
+                return 0 if "no active sessions" in combined else None
+            return sum(1 for line in out.splitlines() if _UNNAMED_SESSION_RE.match(line))
+        except Exception:  # noqa: BLE001 - unknown means not proven
+            return None
+
     def _verify_gone(self, session_id: str, baseline: Optional[int]) -> _Verification:
         listed = self._sessions_listed(session_id)
         if listed is None:
@@ -759,8 +789,10 @@ class ProjectSessionManager:
         if baseline is None or after is None:
             return _Verification(True, "weak", "usage baseline unavailable; verified with sessions only", listed=False)
         if after <= baseline:
-            return _Verification(True, "strong", f"active assignments {after} <= baseline {baseline}", listed=False)
-        return _Verification(False, None, f"active assignments {after} > baseline {baseline}", listed=False)
+            return _Verification(True, "strong", f"active assignments {after} <= baseline {baseline}",
+                                 listed=False, count=after)
+        return _Verification(False, None, f"active assignments {after} > baseline {baseline}",
+                             listed=False, count=after)
 
     # ----- registry writes that never flip a newer TERMINATED back -----
 
@@ -803,23 +835,36 @@ class ProjectSessionManager:
     # allocation may be recorded as FAILED (a lagging server-side count must not fool a single read).
     FAILURE_SETTLE_SECONDS = 5.0
 
-    def _allocation_failure_evidence(self, session_id: str, baseline: Optional[int]) -> "tuple":
+    def _allocation_failure_evidence(self, session_id: str, baseline: Optional[int],
+                                     unnamed_before: Optional[int] = None) -> "tuple":
         """(proven, detail): True only with positive evidence that no assignment remains.
 
-        Requires a known pre-allocation baseline, and TWO consecutive strong verifications
-        (`colab sessions` readable and not listing the id, `colab usage` readable and not above the
-        baseline), separated by FAILURE_SETTLE_SECONDS. Anything unreadable, unknown, above the
-        baseline or inconsistent between the two readings is NOT proof.
+        Requires a known baseline AND a known count of unnamed (`[?]`) runtimes before allocation, and TWO
+        consecutive readings separated by FAILURE_SETTLE_SECONDS in which: `colab sessions` is readable and does
+        not list the id, `colab usage` is readable and EQUALS the baseline (a different count means something else
+        changed concurrently, so absence of our VM cannot be inferred), and no more unnamed `[?]` runtimes exist
+        than before. Anything unreadable, unknown, different or inconsistent is NOT proof. Best used with a
+        baseline of 0 and no other runtimes on the account.
         """
         if baseline is None:
             return False, "the active-assignment baseline could not be read before allocation"
+        if unnamed_before is None:
+            return False, "the unnamed-runtime baseline could not be read before allocation"
         for attempt in range(2):
             verdict = self._verify_gone(session_id, baseline)
             if not verdict.ok or verdict.level != "strong":
                 return False, verdict.detail
+            if verdict.count != baseline:
+                return False, (f"active assignments {verdict.count} differ from baseline {baseline}; "
+                               "a concurrent change cannot be ruled out")
+            unnamed_now = self._unnamed_sessions_now()
+            if unnamed_now is None:
+                return False, "could not read `colab sessions` for unnamed runtimes"
+            if unnamed_now > unnamed_before:
+                return False, f"{unnamed_now} unnamed runtime(s) listed, {unnamed_before} before allocation"
             if attempt == 0 and self.FAILURE_SETTLE_SECONDS > 0:
                 time.sleep(self.FAILURE_SETTLE_SECONDS)
-        return True, f"no assignment remains (two readings, baseline {baseline})"
+        return True, f"no assignment remains (two readings, baseline {baseline}, unnamed {unnamed_before})"
 
     def _settle_failed_allocation(self, session: ProjectSession, reason: str) -> bool:
         """Record a failed allocation. FAILED only when proven empty, else NEEDS_RECONCILIATION (cap kept).
@@ -828,7 +873,9 @@ class ProjectSessionManager:
         """
         baseline = session.metadata.get("assignments_before")
         try:
-            proven, detail = self._allocation_failure_evidence(session.session_id, baseline)
+            proven, detail = self._allocation_failure_evidence(
+                session.session_id, baseline, session.metadata.get("unnamed_before")
+            )
         except BaseException:  # noqa: BLE001 - evidence gathering must never mask the failure or free the cap
             proven, detail = False, "evidence check was interrupted or failed"
         session.metadata["allocation_failure_evidence"] = detail
@@ -1112,10 +1159,17 @@ class ProjectSessionManager:
             outcome = self._best_effort_stop(sid, lock_wait_s=GUARD_STOP_LOCK_WAIT_S)
             if not isinstance(exc, Exception):
                 raise
-            raise AllocationError(
+            verified = outcome == "the session was stopped and verified"
+            err = AllocationError(
                 f"Lease guard could not be started for '{sid}' ({type(exc).__name__}); {outcome}. "
                 "The approval stays consumed."
-            ) from exc
+                + ("" if verified else
+                   " POSSIBLE ORPHAN GPU RUNTIME: the session may still be running without a deadline guard; "
+                   "check `colab usage` (Active assignments) and the Colab web UI and stop it by hand if needed.")
+            )
+            err.orphan_possible = not verified
+            err.details = {"session_id": sid, "orphan_possible": not verified}
+            raise err from exc
 
     def _best_effort_stop(self, session_id: str, lock_wait_s: float) -> str:
         """Try one verified stop and describe the result accurately for the operator."""

@@ -211,13 +211,13 @@ class TestProjectSessions(unittest.TestCase):
         # up() reads the usage baseline before `colab new`; exactly one allocation must be dispatched.
         allocations = [c.args[0] for c in mock_run.call_args_list if "new" in c.args[0]]
         self.assertEqual(len(allocations), 1)
-        self.assertEqual(mock_run.call_count, 2)  # one baseline `usage` read, then `new`
+        self.assertEqual(mock_run.call_count, 3)  # baseline `usage` and `sessions` reads (read-only), then `new`
 
         # Second call to up with reuse_active=True (default)
         s2 = manager.up(self.spec, lease_seconds=3600.0, reuse_active=True)
         self.assertEqual(s1.session_id, s2.session_id)
         # Verify no second CLI allocation was made (the call count is unchanged by the reuse)
-        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(mock_run.call_count, 3)
         self.assertEqual(len([c for c in mock_run.call_args_list if "new" in c.args[0]]), 1)
 
     def test_q08_attach_refuses_unmanaged_session(self):

@@ -20,6 +20,9 @@ verified in its source (commands/session.py, commands/usage.py, consumption.py):
   has been called), and the file `<FAKE_COLAB_DIR>/usage_lag_remaining` holding N, which hides unnamed orphans
   from the next N `usage` readings (a lagging server-side count).
 
+`sessions` switch: FAKE_COLAB_SESSIONS_FAIL (exits 1). `new` switch: FAKE_COLAB_REMOVE_ON_NEW=<id> removes that
+alive runtime when `new` is called.
+
 Env switches: FAKE_COLAB_STOP_FAIL (every stop exits 1), FAKE_COLAB_STOP_LIE (stop exits 0 but keeps
 the id alive), and the file `<FAKE_COLAB_DIR>/stop_fail_remaining` holding N, which makes the next N
 stops exit 1 and then decrements.
@@ -50,6 +53,9 @@ def alive_ids():
 
 
 if command == "sessions":
+    if os.environ.get("FAKE_COLAB_SESSIONS_FAIL"):
+        print("sessions unavailable", file=sys.stderr)
+        sys.exit(1)
     ids = alive_ids()
     if not ids:
         print("[colab] No active sessions found on server.")
@@ -80,6 +86,9 @@ if command == "new":
     sid = rest[rest.index("-s") + 1]
     mode = os.environ.get("FAKE_COLAB_NEW_MODE", "ok")
     open(os.path.join(state_dir, "new_called"), "w", encoding="utf-8").close()
+    gone = os.environ.get("FAKE_COLAB_REMOVE_ON_NEW")
+    if gone and os.path.exists(os.path.join(alive_dir, gone)):
+        os.remove(os.path.join(alive_dir, gone))  # another runtime ends while `new` runs (concurrent change)
     if mode == "fail_before":
         print("[colab] Error: no GPU quota available.", file=sys.stderr)
         sys.exit(1)
