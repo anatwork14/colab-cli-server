@@ -24,8 +24,92 @@ from .provider import (
     UnsupportedGPUError,
 )
 from .tracker import ExperimentMetadata, ExperimentTracker
+from .errors import (
+    ColabV2Error,
+    UpstreamCliError,
+    UpstreamCliNotFoundError,
+    AutoAllocationBlockedError,
+    SshAutoAllocationRiskError,
+    ManifestValidationError,
+    WorkspaceSyncError,
+    ArtifactValidationError,
+    TransportError,
+    TransportUnavailableError,
+    SessionNotFoundError,
+    UnmanagedSessionError,
+    SessionAllocationRequiredError,
+    SshHandshakeError,
+    ProjectSessionError,
+    LeaseExpiredError,
+    InvalidStateTransitionError,
+)
+from .project_sessions import (
+    ProjectSession,
+    ProjectSessionManager,
+    ProjectSessionState,
+    VALID_TRANSITIONS,
+)
+from .capability import (
+    CapabilityProbe,
+    CliCapabilities,
+    SshSafetyGuard,
+    probe_cli_capabilities,
+)
+from .transports import (
+    BaseTransport,
+    GuardedSshTransport,
+    OfficialCliTransport,
+    SshProxyTransport,
+)
+from .workspace import (
+    SyncDelta,
+    WorkspaceSyncEngine,
+    compute_sync_delta,
+)
+from .artifacts import (
+    ArtifactManifest,
+    ArtifactManager,
+    verify_local_artifact,
+)
+from .telemetry import (
+    TelemetryEmitter,
+    TelemetryEvent,
+    plan_resume_from_checkpoint,
+    record_interrupted_run,
+)
+from .project_manifest import (
+    ProjectSpec,
+    create_execution_plan,
+    discover_project_files,
+    init_project,
+    load_manifest,
+    load_project_manifest,
+    plan_project,
+    validate_manifest,
+)
+from .storage import (
+    ArtifactStore,
+    ArtifactType,
+    GoogleDriveArtifactStore,
+    LocalArtifactStore,
+    PublicationManifest,
+    StoredArtifact,
+    TransferJournal,
+    TransferRecord,
+    TransferStatus,
+    ArtifactUploadWorker,
+)
+from .broker import WorkspaceBroker
+from .checkpoint_policy import CheckpointPolicyConfig, CheckpointPolicyManager
+from .reproducibility import (
+    RunManifest,
+    create_deterministic_source_snapshot,
+    get_environment_info,
+    get_git_provenance,
+)
 
 __all__ = [
+
     "ColabGPUProvider",
     "JobSpec",
     "PreparedJob",
@@ -50,4 +134,74 @@ __all__ = [
     "RegistryCorruptedError",
     "ColabProcessLock",
     "ManagedSessionRegistry",
+    # V2 additions
+    "ColabV2Error",
+    "UpstreamCliError",
+    "UpstreamCliNotFoundError",
+    "AutoAllocationBlockedError",
+    "SshAutoAllocationRiskError",
+    "ManifestValidationError",
+    "WorkspaceSyncError",
+    "ArtifactValidationError",
+    "TransportError",
+    "TransportUnavailableError",
+    "SessionNotFoundError",
+    "UnmanagedSessionError",
+    "SessionAllocationRequiredError",
+    "SshHandshakeError",
+    "ProjectSessionError",
+    "LeaseExpiredError",
+    "InvalidStateTransitionError",
+    "CapabilityProbe",
+    "probe_cli_capabilities",
+    "CliCapabilities",
+    "SshSafetyGuard",
+    "BaseTransport",
+    "OfficialCliTransport",
+    "SshProxyTransport",
+    "GuardedSshTransport",
+    "SyncDelta",
+    "WorkspaceSyncEngine",
+    "compute_sync_delta",
+    # V2 Project Manifest
+    "ProjectSpec",
+    "load_manifest",
+    "load_project_manifest",
+    "validate_manifest",
+    "plan_project",
+    "create_execution_plan",
+    "init_project",
+    "discover_project_files",
+    # V2 Project Sessions (M5)
+    "ProjectSession",
+    "ProjectSessionManager",
+    "ProjectSessionState",
+    "VALID_TRANSITIONS",
+    # V2 Artifacts and Telemetry (M6)
+    "ArtifactManifest",
+    "ArtifactManager",
+    "verify_local_artifact",
+    "TelemetryEmitter",
+    "TelemetryEvent",
+    "plan_resume_from_checkpoint",
+    "record_interrupted_run",
+    # V2 Drive Workspaces & Storage (Issue #21)
+    "ArtifactStore",
+    "ArtifactType",
+    "StoredArtifact",
+    "LocalArtifactStore",
+    "GoogleDriveArtifactStore",
+    "PublicationManifest",
+    "TransferJournal",
+    "TransferRecord",
+    "TransferStatus",
+    "ArtifactUploadWorker",
+    "WorkspaceBroker",
+    "CheckpointPolicyConfig",
+    "CheckpointPolicyManager",
+    "RunManifest",
+    "create_deterministic_source_snapshot",
+    "get_git_provenance",
+    "get_environment_info",
 ]
+

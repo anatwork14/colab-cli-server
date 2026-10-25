@@ -149,3 +149,75 @@ Tests mock subprocesses and never contact Google or allocate a runtime. Contribu
 ## License and attribution
 
 This wrapper and its documentation are licensed under [MIT](LICENSE). Google's `google-colab-cli` is a separate upstream project governed by its own Apache-2.0 license and Colab service terms. No upstream code is vendored here.
+
+## V2 — VKong-Inspired Project Workspaces and Training Monitor
+
+The V2 implementation extends the original one-shot adapter into a comprehensive project-centric remote GPU workspace system and real-time training monitor:
+
+- **Declarative Project Manifests (`colab_project.json`):** Declare source patterns, entrypoints, target accelerators, and artifact rules with offline validation and path escape rejection.
+- **Content-Addressed Incremental Sync:** Two-phase workspace synchronization transfers only modified files via streaming chunked SHA-256 diffing, with atomic commit and opt-in remote file deletion.
+- **Collision-Resistant Session Lifecycle:** Project runtime leases (`colab-v2-<name>-<uuid>`) prevent collisions, enforce state machine transitions, lock against concurrent allocations, and fail-closed on unmanaged user sessions.
+- **Multi-Tier Checkpoint & Immutable Revision Recovery:** Staged atomic download with integrity checksums, ZIP header verification, safe PyTorch `weights_only=True` inspection, and immutable `@sha256_<digest>` revision history (`PublicationManifest` v2) preserving both latest and historical checkpoints across local and Google Drive storage.
+- **Private Cross-Device Training & Compute Monitor:** Read-only HTTP/SSE dashboard displaying compute unit balance, burn rates, top-up detection, unattributed spend alerts, run loss/step charts, and checkpoint revision history (`LATEST` vs `HISTORICAL`), hardened with per-response cryptographic CSP nonces and verified in headless Chromium CI.
+
+### Project Workspace CLI Commands
+
+```bash
+# Initialize a new project directory with template manifest and entrypoint
+colab-adapter project init ./my-project --name my-project
+
+# Validate manifest schema, path safety, and file existence
+colab-adapter project validate ./my-project
+
+# Compute dry-run file sync diff and session plan without allocating compute
+colab-adapter project plan ./my-project
+
+# Provision or attach to a remote project session under cross-process lock
+colab-adapter project up ./my-project --gpu T4
+
+# Incrementally sync workspace source tree to the remote session
+colab-adapter project sync ./my-project
+
+# Execute project entrypoint with optional runtime arguments
+colab-adapter project exec ./my-project -- --epochs 10 --batch-size 32
+
+# Inspect remote project session status and lease TTL
+colab-adapter project status ./my-project
+
+# Safely terminate project session
+colab-adapter project stop ./my-project
+
+# Reconcile expired project leases and release resources
+colab-adapter project reconcile
+```
+
+All commands support `--json` for machine-readable output by autonomous agents and scripts.
+
+### Training & Compute Monitor CLI Commands
+
+```bash
+# Start local authenticated monitoring server with web dashboard (loopback default)
+colab-adapter monitor --host 127.0.0.1 --port 8080 --auth-token <SECRET_TOKEN>
+
+# Start monitoring server with TLS encryption or behind a verified identity proxy
+colab-adapter monitor --host 0.0.0.0 --port 8443 --allow-external \
+  --auth-token <SECRET_TOKEN> --require-tls \
+  --tls-certfile /path/to/cert.pem --tls-keyfile /path/to/key.pem
+```
+
+**Security & Account Protection:**
+- Poller executes strictly read-only official CLI queries (`colab usage`, `colab sessions`) and **never** provisions cloud VMs.
+- Web dashboard is strictly read-only: no remote code execution, stop, or approval endpoints.
+- Binds to localhost by default; access from other machines should use an SSH tunnel or VPN.
+
+**Documentation:**
+- [Progress ledger](progress.md) — Completed milestones, evidence, and change logs
+- [Milestones](milestones.md) — M0–M8 and G-Drive release gates and evidence requirements
+- [Google Drive Artifacts Guide](docs/GOOGLE_DRIVE_ARTIFACTS.md) — Resumable upload, verification, and private storage hierarchy
+- [Cross-Device Workspaces Guide](docs/CROSS_DEVICE_WORKSPACES.md) — Multi-client read-only attach via Workspace Broker
+- [Artifact Recovery & Reproducibility](docs/ARTIFACT_RECOVERY.md) — Bit-reproducible code snapshots and disaster recovery
+- [V2 features](docs/FEATURES_V2.md) — Detailed feature specification
+- [V2 architecture](docs/ARCHITECTURE_V2.md) — Security contracts and threat model
+- [Expected results](docs/EXPECTED_RESULTS_V2.md) — Measurable acceptance criteria
+- [Cross-device Monitor Guide](docs/MONITORING_DASHBOARD_V2.md) — Dashboard architecture and API specification
+
