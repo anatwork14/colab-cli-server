@@ -40,7 +40,7 @@ from colab_adapter.provider import (
     ColabProcessLock,
     ManagedSessionRegistry,
 )
-from tests.approval_helpers import grant_v2
+from tests.approval_helpers import fake_guard_spawner, grant_v2
 from tests.test_allocation_approval_gate import GateFixture
 
 APPROVAL_TTY = "colab_adapter.approval._stdio_is_tty"

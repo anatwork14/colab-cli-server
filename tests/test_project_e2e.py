@@ -56,7 +56,7 @@ from colab_adapter.project_sessions import (
     ProjectSessionState,
 )
 from colab_adapter.provider import ApprovalRequiredError, ManagedSessionRegistry
-from tests.approval_helpers import grant_v2
+from tests.approval_helpers import fake_guard_spawner, grant_v2
 from colab_adapter.reproducibility import create_deterministic_source_snapshot
 from colab_adapter.storage import (
     ArtifactType,
@@ -156,7 +156,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             executed_cmds.append(cmd)
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Session created", stderr="")
 
-        mgr = ProjectSessionManager(
+        mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             run_cmd_fn=mock_run_cmd,
         )
@@ -166,7 +166,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         s1 = mgr.up(spec, lease_seconds=1800.0, approval_id=grant_v2(mgr, spec, 1800.0))
         self.assertEqual(s1.state, ProjectSessionState.READY.value)
         self.assertEqual(len(executed_cmds), 1)
-        self.assertEqual(executed_cmds[0][:3], ["colab", "new", "-s"])
+        self.assertEqual(executed_cmds[0][:4], ["colab", "--auth=oauth2", "new", "-s"])
 
         # Second call reuses existing active session
         s2 = mgr.up(spec, reuse_active=True)
@@ -260,7 +260,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             "has_traceback": False,
         }
 
-        mgr = ProjectSessionManager(
+        mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             transport=mock_transport,
         )
@@ -299,7 +299,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             self.registry._atomic_write_locked(data)
 
         mock_run = MagicMock(return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""))
-        mgr = ProjectSessionManager(registry=self.registry, run_cmd_fn=mock_run)
+        mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), registry=self.registry, run_cmd_fn=mock_run)
 
         # 1. Unmanaged session is strictly refused (Q08)
         from colab_adapter.errors import UnmanagedSessionError
@@ -311,7 +311,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         ok = mgr.stop(managed_id)
         self.assertTrue(ok)
         mock_run.assert_called_once_with(
-            ["colab", "stop", "-s", managed_id],
+            ["colab", "--auth=oauth2", "stop", "-s", managed_id],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -420,7 +420,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             executed_cmds.append(cmd)
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Session created", stderr="")
 
-        session_mgr = ProjectSessionManager(
+        session_mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             run_cmd_fn=mock_run_cmd,
         )
@@ -437,7 +437,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         self.assertEqual(session.state, ProjectSessionState.READY.value)
         self.assertEqual(session.accelerator, "T4")
         self.assertEqual(len(executed_cmds), 1)
-        self.assertEqual(executed_cmds[0][:3], ["colab", "new", "-s"])
+        self.assertEqual(executed_cmds[0][:4], ["colab", "--auth=oauth2", "new", "-s"])
 
         # =====================================================================
         # Stage 4: Colab session creation
@@ -995,7 +995,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             executed_cmds.append(cmd)
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Session created", stderr="")
 
-        session_mgr = ProjectSessionManager(
+        session_mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             run_cmd_fn=mock_run_cmd,
         )
@@ -1457,7 +1457,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         mock_transport.download_file.side_effect = mock_download
         mock_transport.exec_code.side_effect = mock_exec_code
 
-        session_mgr = ProjectSessionManager(
+        session_mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             run_cmd_fn=mock_run_cmd,
             transport=mock_transport,

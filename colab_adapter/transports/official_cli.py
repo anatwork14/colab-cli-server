@@ -42,6 +42,9 @@ def _validate_remote_path(remote_path: str) -> str:
     return remote_path
 
 
+EXEC_UPSTREAM_MARGIN_S = 15
+
+
 class OfficialCliTransport(BaseTransport):
     """Primary transport implementation backed by official google-colab-cli."""
 
@@ -233,7 +236,10 @@ class OfficialCliTransport(BaseTransport):
             tmp_script = tf.name
 
         try:
-            args = ["exec", "-s", session_id, "-f", tmp_script]
+            # Upstream `colab exec` defaults to a 30 s kernel timeout, which kills long training runs.
+            # Pass our budget explicitly, minus a margin so upstream reports its own timeout first.
+            upstream_timeout = max(1, int(timeout) - EXEC_UPSTREAM_MARGIN_S)
+            args = ["exec", "-s", session_id, "-f", tmp_script, "--timeout", str(upstream_timeout)]
             if env:
                 for k, v in env.items():
                     args.extend(["--env", f"{k}={v}"])

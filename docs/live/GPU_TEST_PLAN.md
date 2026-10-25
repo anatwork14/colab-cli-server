@@ -10,7 +10,7 @@ Project fixtures: `examples/live-smoke/` (manifest `colab-project.json`, `gpu_pr
 |---|---|
 | Accelerator | 1 x T4 |
 | Allocations (`project up` / `colab new`) | at most 1, for the whole plan |
-| Lease | `--lease-seconds 900` (hard cap 900 s) |
+| Lease | `--lease-seconds 900` (the lease, not a billing cap; a best-effort host-side guard stops only this session at the deadline and verifies it with `sessions`; check `sessions` and `usage` after every step) |
 | Sessions touched | only the one session created by G3 |
 | Remote workload | `gpu_probe.py` and `train_tiny.py` only; no dataset download, no pip install |
 | Training size | 60 steps by default, hard maximum 200 (enforced by the script) |

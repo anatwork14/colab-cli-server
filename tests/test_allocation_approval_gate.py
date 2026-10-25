@@ -36,7 +36,7 @@ from colab_adapter.provider import (
     ManagedSessionRegistry,
 )
 from colab_adapter.tracker import ExperimentTracker
-from tests.approval_helpers import grant_record, grant_v1, grant_v2
+from tests.approval_helpers import fake_guard_spawner, grant_record, grant_v1, grant_v2
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 APPROVAL_TTY = "colab_adapter.approval._stdio_is_tty"
@@ -76,11 +76,11 @@ class GateFixture(unittest.TestCase):
         return ProjectSpec(**kwargs)
 
     def make_manager(self):
-        return ProjectSessionManager(registry=self.registry, lock=self.lock, run_cmd_fn=self.fake_colab)
+        return ProjectSessionManager(spawn_fn=fake_guard_spawner(self), registry=self.registry, lock=self.lock, run_cmd_fn=self.fake_colab)
 
     def fake_colab(self, cmd, **kwargs):
         self.commands.append(list(cmd))
-        if len(cmd) > 1 and cmd[1] == "new":
+        if len(cmd) > 2 and cmd[2] == "new":
             self.new_calls.append(list(cmd))
             with open(self.calls_log, "a", encoding="utf-8") as fh:
                 fh.write("new\n")
@@ -149,7 +149,7 @@ class TestNoApprovalNoAllocation(GateFixture):
 
     def test_require_approval_knob_is_gone(self):
         with self.assertRaises(TypeError):
-            ProjectSessionManager(registry=self.registry, lock=self.lock, run_cmd_fn=self.fake_colab,
+            ProjectSessionManager(spawn_fn=fake_guard_spawner(self), registry=self.registry, lock=self.lock, run_cmd_fn=self.fake_colab,
                                   require_approval=False)
 
 
@@ -302,7 +302,7 @@ class TestFailedAllocationConsumesApproval(GateFixture):
 
     def test_timeout_consumes_approval_and_needs_reconciliation(self):
         approval_id = grant_v2(self.manager, self.spec, 1800.0)
-        self.new_exception = subprocess.TimeoutExpired(cmd=["colab", "new"], timeout=180.0)
+        self.new_exception = subprocess.TimeoutExpired(cmd=["colab", "--auth=oauth2", "new"], timeout=180.0)
         with self.assertRaises(AllocationError):
             self.manager.up(self.spec, lease_seconds=1800.0, approval_id=approval_id)
         states = [info["state"] for info in self.registry.get_all_managed().values()]
@@ -349,7 +349,7 @@ class TestStopScope(GateFixture):
         approval_id = grant_v2(self.manager, self.spec, 1800.0)
         managed = self.manager.up(self.spec, lease_seconds=1800.0, approval_id=approval_id)
         self.assertTrue(self.manager.stop(managed.session_id))
-        stop_targets = [c[c.index("-s") + 1] for c in self.commands if len(c) > 1 and c[1] == "stop"]
+        stop_targets = [c[c.index("-s") + 1] for c in self.commands if len(c) > 2 and c[2] == "stop"]
         self.assertEqual(stop_targets, [managed.session_id])
 
 
@@ -381,7 +381,7 @@ class TestConcurrentUp(GateFixture):
         outcome_lock = threading.Lock()
 
         def worker():
-            manager = ProjectSessionManager(
+            manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
                 registry=self.registry,
                 lock=ColabProcessLock(self.lock_path),
                 run_cmd_fn=self.fake_colab,
@@ -441,17 +441,37 @@ from colab_adapter.project_sessions import ProjectSessionManager
 from colab_adapter.provider import ColabProcessLock, ManagedSessionRegistry
 
 def fake_colab(cmd, **kwargs):
-    if len(cmd) > 1 and cmd[1] == "new":
+    if len(cmd) > 2 and cmd[2] == "new":
         with open(calls_log, "a", encoding="utf-8") as fh:
             fh.write("new\n")
         time.sleep(0.5)
     return subprocess.CompletedProcess(cmd, 0, "ok", "")
 
 spec = ProjectSpec(name="gate_proj", root=Path(root), entrypoint="train.py", gpu="T4", timeout_seconds=600.0)
+class _FakeGuard:
+    # The child never needs a real lease guard; a bare object keeps the test free of stray processes.
+    pid = __import__("os").getpid()
+    returncode = None
+
+    def poll(self):
+        return None
+
+
+def _fake_guard_spawn(cmd, **kwargs):
+    from colab_adapter.lease_guard import merge_guard_metadata
+    from datetime import datetime, timezone
+
+    sid = cmd[cmd.index("--session-id") + 1]
+    merge_guard_metadata(ManagedSessionRegistry(Path(registry_path)), sid,
+                         {"guard_started_at": datetime.now(timezone.utc).isoformat()})
+    return _FakeGuard()
+
+
 mgr = ProjectSessionManager(
     registry=ManagedSessionRegistry(Path(registry_path)),
     lock=ColabProcessLock(Path(lock_path)),
     run_cmd_fn=fake_colab,
+    spawn_fn=_fake_guard_spawn,
 )
 try:
     s = mgr.up(spec, lease_seconds=1800.0, approval_id=approval_id)

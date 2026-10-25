@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -35,10 +36,30 @@ from .approval import (
     ensure_global_cap,
     v2_plan,
 )
+from .lease_guard import (
+    child_env,
+    ensure_guard_dir,
+    epoch_from_iso,
+    guard_command,
+    guard_log_path,
+    guard_process_matches,
+    guard_spawn_lock,
+    merge_guard_metadata,
+    open_private_append,
+    validate_session_id,
+)
 from .project_manifest import ProjectSpec
-from .provider import ApprovalRequiredError, ColabProcessLock, ManagedSessionRegistry
+from .provider import ApprovalRequiredError, ColabProcessLock, ManagedSessionRegistry, is_process_running
 from .transports.base import BaseTransport
 from .transports.official_cli import OfficialCliTransport
+
+LEASE_GUARD_CONFIRM_S = 5.0
+# Upstream `colab exec` should time out before our own subprocess budget does.
+EXEC_MIN_TIMEOUT_S = 1.0
+
+
+def _default_spawn(cmd: List[str], **kwargs: Any) -> subprocess.Popen:
+    return subprocess.Popen(cmd, **kwargs)
 
 
 class ProjectSessionState(str, enum.Enum):
@@ -193,16 +214,22 @@ class ProjectSessionManager:
         transport: Optional[BaseTransport] = None,
         colab_binary: Optional[str] = None,
         run_cmd_fn: Optional[Callable[..., subprocess.CompletedProcess]] = None,
+        auth_mode: str = "oauth2",
+        spawn_fn: Optional[Callable[..., Any]] = None,
     ):
         self.registry = registry or ManagedSessionRegistry()
         self.lock = lock or ColabProcessLock()
         self.colab_binary = colab_binary or "colab"
+        self.auth_mode = auth_mode
         self._run_cmd = run_cmd_fn or subprocess.run
+        # Injection point for tests only; production spawns a real detached lease guard.
+        self._spawn_fn = spawn_fn or _default_spawn
         # Allocation approval is always enforced inside up(); there is no constructor bypass.
         self.approvals = ApprovalStore(approvals_dir_for_registry(self.registry))
         self.transport = transport or OfficialCliTransport(
             registry=self.registry,
             cli_path=self.colab_binary,
+            auth_mode=self.auth_mode,
         )
 
     @staticmethod
@@ -307,6 +334,27 @@ class ProjectSessionManager:
     ) -> ProjectSession:
         """Provision or attach a session. A new allocation requires a valid, unconsumed approval.
 
+        After the session is READY (or reused), a detached lease guard is started. If the guard cannot
+        be confirmed alive, the session is stopped again (fail closed) and AllocationError is raised.
+        """
+        session = self._up_allocate(
+            spec,
+            lease_seconds=lease_seconds,
+            reuse_active=reuse_active,
+            approval_id=approval_id,
+        )
+        self._guard_or_fail_closed(session)
+        return session
+
+    def _up_allocate(
+        self,
+        spec: ProjectSpec,
+        lease_seconds: float = 3600.0,
+        reuse_active: bool = True,
+        approval_id: Optional[str] = None,
+    ) -> ProjectSession:
+        """Allocation half of up(): reuse check, global cap, approval verify-and-consume, `colab new`.
+
         Order inside the ColabProcessLock critical section: reuse check, global cap, approval
         verify-and-consume (single use, before any CLI call), registry PROVISIONING intent, `colab new`.
         """
@@ -374,7 +422,7 @@ class ProjectSessionManager:
                 self.registry._atomic_write_locked(data)
 
             # Call official CLI to allocate new session: colab new -s <session_id> --gpu <accelerator>
-            cmd = [self.colab_binary, "new", "-s", session_id, "--gpu", gpu]
+            cmd = [self.colab_binary, f"--auth={self.auth_mode}", "new", "-s", session_id, "--gpu", gpu]
             try:
                 res = self._run_cmd(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180.0)
                 if res.returncode != 0:
@@ -448,8 +496,20 @@ class ProjectSessionManager:
         timeout: float = 300.0,
         working_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Execute command in an attached session with state validation and lock safety."""
+        """Execute command in an attached session with state validation and lock safety.
+
+        The lease guard is (re)started first, so remote work never runs without a deadline guard.
+        The timeout is clamped to the remaining lease.
+        """
+        self.ensure_lease_guard(session_id)
         session = self.attach(session_id)
+        remaining = session.time_remaining()
+        effective_timeout = min(float(timeout), remaining)
+        if effective_timeout < EXEC_MIN_TIMEOUT_S:
+            raise LeaseExpiredError(
+                f"Only {remaining:.1f}s of lease remain for '{session_id}'; refusing exec.",
+                details={"session_id": session_id, "expires_at": session.expires_at},
+            )
 
         session.transition_to(ProjectSessionState.RUNNING)
         with self.registry._lock():
@@ -468,7 +528,7 @@ class ProjectSessionManager:
                 session_id=session_id,
                 code=cmd,
                 env=env,
-                timeout=timeout,
+                timeout=effective_timeout,
             )
             session.transition_to(ProjectSessionState.READY)
             return result
@@ -479,11 +539,29 @@ class ProjectSessionManager:
                 session.transition_to(ProjectSessionState.READY, reason=f"Execution completed with error: {e}")
             raise
         finally:
-            with self.registry._lock():
-                data = self.registry._read_locked()
-                if session_id in data:
-                    data[session_id] = session.to_dict()
-                    self.registry._atomic_write_locked(data)
+            self._persist_preserving_guard(session)
+
+    def _persist_preserving_guard(self, session: ProjectSession) -> None:
+        """Write the session unless the registry already holds a terminal state.
+
+        The guard may stop the session during a long exec; a stale in-memory copy must not
+        resurrect it. Guard metadata written by the guard process is kept as well.
+        """
+        with self.registry._lock():
+            data = self.registry._read_locked()
+            current = data.get(session.session_id)
+            if current is None:
+                return
+            if current.get("state") in ("TERMINATED", "FAILED"):
+                return
+            new_record = session.to_dict()
+            merged_md = dict(new_record.get("metadata") or {})
+            for key, value in (current.get("metadata") or {}).items():
+                if key.startswith("guard_"):
+                    merged_md[key] = value
+            new_record["metadata"] = merged_md
+            data[session.session_id] = new_record
+            self.registry._atomic_write_locked(data)
 
     def _stop_locked(self, session_id: str, session: Optional[ProjectSession] = None) -> bool:
         """Internal worker to stop a session when self.lock is already held."""
@@ -498,7 +576,7 @@ class ProjectSessionManager:
             except InvalidStateTransitionError:
                 pass
 
-        cmd = [self.colab_binary, "stop", "-s", session_id]
+        cmd = [self.colab_binary, f"--auth={self.auth_mode}", "stop", "-s", session_id]
         res = self._run_cmd(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60.0)
         if res.returncode == 0:
             if session:
@@ -524,8 +602,13 @@ class ProjectSessionManager:
                 self.registry.update_state(session_id, ProjectSessionState.NEEDS_RECONCILIATION.value)
             raise CleanupError(f"Failed to stop session '{session_id}': {err_msg}")
 
-    def stop(self, session_id: str) -> bool:
-        """Safely terminate a managed session. Refuses unmanaged sessions."""
+    def stop(self, session_id: str, *, terminate_guard: bool = True) -> bool:
+        """Safely terminate a managed session. Refuses unmanaged sessions.
+
+        After a successful stop the session's lease guard is terminated (SIGTERM, verified by
+        cmdline). A failed stop leaves the guard running as the deadline backstop.
+        The guard itself passes terminate_guard=False.
+        """
         if not self.registry.is_managed(session_id):
             raise UnmanagedSessionError(
                 f"Refusing to stop unmanaged session '{session_id}'. Adapter only manages its own registered sessions.",
@@ -536,7 +619,128 @@ class ProjectSessionManager:
             all_managed = self.registry.get_all_managed()
             info = all_managed.get(session_id, {})
             session = ProjectSession.from_dict(info) if info else None
-            return self._stop_locked(session_id, session)
+            ok = self._stop_locked(session_id, session)
+        if terminate_guard:
+            self._terminate_guard(session_id)
+        return ok
+
+    # ----- host-side lease guard -------------------------------------------------------------
+
+    def _guard_pid_of(self, session_id: str) -> Optional[int]:
+        info = self.registry.get_all_managed().get(session_id, {})
+        pid = (info.get("metadata") or {}).get("guard_pid")
+        try:
+            return int(pid) if pid is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _terminate_guard(self, session_id: str) -> None:
+        pid = self._guard_pid_of(session_id)
+        if pid is None or pid == os.getpid():
+            return
+        if guard_process_matches(pid, session_id):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+    def start_lease_guard(self, session: ProjectSession, confirm_timeout: float = LEASE_GUARD_CONFIRM_S) -> int:
+        """Spawn a detached lease guard for this session and confirm it is alive. Returns its pid.
+
+        Raises AllocationError if spawning fails, the guard exits, or it is not confirmed in time.
+        """
+        sid = validate_session_id(session.session_id)
+        registry_path = Path(self.registry.registry_path)
+        deadline = epoch_from_iso(session.expires_at)
+        ensure_guard_dir(registry_path)
+        # Clear any stale startup marker first: only this incarnation's guard may confirm itself.
+        merge_guard_metadata(self.registry, sid, {"guard_started_at": None, "guard_outcome": None})
+        log_fd = open_private_append(guard_log_path(registry_path, sid))
+        try:
+            proc = self._spawn_fn(
+                guard_command(sid, registry_path, deadline, self.colab_binary, self.auth_mode),
+                stdin=subprocess.DEVNULL,
+                stdout=log_fd,
+                stderr=log_fd,
+                start_new_session=True,
+                close_fds=True,
+                env=child_env(),
+            )
+        except Exception as exc:
+            raise AllocationError(f"Could not spawn lease guard for '{sid}': {type(exc).__name__}") from exc
+        finally:
+            os.close(log_fd)
+
+        pid = int(proc.pid)
+        merge_guard_metadata(self.registry, sid, {
+            "guard_pid": pid,
+            "guard_deadline": datetime.fromtimestamp(deadline, timezone.utc).isoformat(),
+            "guard_spawned_at": _iso_now(),
+        })
+        # Confirmation: the child is still running AND the guard itself wrote its startup marker.
+        end = time.monotonic() + confirm_timeout
+        while True:
+            if proc.poll() is not None:
+                raise AllocationError(f"Lease guard for '{sid}' exited during startup (code {proc.returncode}).")
+            info = self.registry.get_all_managed().get(sid, {})
+            meta = info.get("metadata") or {}
+            if is_process_running(pid) and self._guard_pid_of(sid) == pid and meta.get("guard_started_at"):
+                return pid
+            if time.monotonic() >= end:
+                if guard_process_matches(pid, sid):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                raise AllocationError(f"Lease guard for '{sid}' was not confirmed alive within {confirm_timeout}s.")
+            time.sleep(0.1)
+
+    def ensure_lease_guard(self, session_id: str) -> Dict[str, Any]:
+        """Idempotently make sure exactly one live lease guard exists for an active managed lease.
+
+        Respawns a dead guard once. Raises RemoteExecutionError if the guard cannot be (re)started, so
+        callers refuse remote work rather than run without a deadline guard.
+        """
+        if not self.registry.is_managed(session_id):
+            raise UnmanagedSessionError(
+                f"Refusing lease guard for unmanaged session '{session_id}'.",
+                details={"session_id": session_id},
+            )
+        validate_session_id(session_id)
+        with guard_spawn_lock(Path(self.registry.registry_path), session_id):
+            info = self.registry.get_all_managed().get(session_id, {})
+            session = ProjectSession.from_dict(info)
+            if not session.is_lease_active():
+                raise LeaseExpiredError(
+                    f"Session '{session_id}' lease expired at {session.expires_at}.",
+                    details={"session_id": session_id, "expires_at": session.expires_at},
+                )
+            pid = self._guard_pid_of(session_id)
+            if guard_process_matches(pid, session_id):
+                return {"guard_pid": pid, "guard_alive": True, "respawned": False}
+            try:
+                new_pid = self.start_lease_guard(session)
+            except Exception as exc:
+                raise RemoteExecutionError(
+                    f"Lease guard for '{session_id}' is not running and could not be restarted "
+                    f"({type(exc).__name__}); refusing remote work without a deadline guard."
+                ) from exc
+            return {"guard_pid": new_pid, "guard_alive": True, "respawned": True}
+
+    def _guard_or_fail_closed(self, session: ProjectSession) -> None:
+        """Used by up(): if the guard cannot be started, stop the session and raise AllocationError."""
+        try:
+            self.ensure_lease_guard(session.session_id)
+        except Exception as exc:
+            try:
+                self.stop(session.session_id, terminate_guard=False)
+                outcome = "stopped"
+            except Exception:
+                outcome = "stop failed; session flagged NEEDS_RECONCILIATION by the stop path"
+            raise AllocationError(
+                f"Lease guard could not be started for '{session.session_id}' ({type(exc).__name__}); "
+                f"the session was {outcome}. The approval stays consumed."
+            ) from exc
 
     def close_session(self, session_id: str) -> bool:
         """Safely close, stop and tear down a managed project session (alias for stop)."""
@@ -564,6 +768,11 @@ class ProjectSessionManager:
             "lease_active": session.is_lease_active(),
             "remote_root": session.remote_root,
             "managed": True,
+            "guard_pid": self._guard_pid_of(session_id),
+            "guard_alive": guard_process_matches(self._guard_pid_of(session_id), session_id),
+            "guard_deadline": (info.get("metadata") or {}).get("guard_deadline"),
+            "guard_outcome": (info.get("metadata") or {}).get("guard_outcome"),
+            "seconds_remaining": round(session.time_remaining(), 1),
         }
 
     def reconcile_leases(self, auto_stop: bool = True) -> Dict[str, Any]:
@@ -582,6 +791,7 @@ class ProjectSessionManager:
                         if auto_stop:
                             try:
                                 self._stop_locked(session_id, session)
+                                self._terminate_guard(session_id)
                                 stopped.append(session_id)
                             except Exception as e:
                                 failed.append({"session_id": session_id, "error": str(e)})

@@ -34,7 +34,7 @@ from colab_adapter.project_sessions import (
     VALID_TRANSITIONS,
 )
 from colab_adapter.provider import ColabProcessLock, ManagedSessionRegistry
-from tests.approval_helpers import grant_v2
+from tests.approval_helpers import fake_guard_spawner, grant_v2
 
 
 class TestProjectSessions(unittest.TestCase):
@@ -105,7 +105,7 @@ class TestProjectSessions(unittest.TestCase):
     def test_offline_plan_session_does_not_invoke_cli_or_registry(self):
         """Q03: Planning a session must generate collision-resistant IDs and touch 0 cloud resources."""
         mock_run = MagicMock()
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run,
@@ -134,7 +134,7 @@ class TestProjectSessions(unittest.TestCase):
                 recorded_states.append(info.get("state"))
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Session created", stderr="")
 
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run_cmd,
@@ -155,7 +155,7 @@ class TestProjectSessions(unittest.TestCase):
         def mock_run_fail(cmd, **kwargs):
             return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Quota exceeded for GPU T4")
 
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run_fail,
@@ -173,7 +173,7 @@ class TestProjectSessions(unittest.TestCase):
     def test_up_reuses_existing_active_session_idempotently(self):
         """Multiple calls to up() for the same project reuse active valid lease without re-allocating."""
         mock_run = MagicMock(return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr=""))
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run,
@@ -190,7 +190,7 @@ class TestProjectSessions(unittest.TestCase):
 
     def test_q08_attach_refuses_unmanaged_session(self):
         """Q08: Refuses to attach to unmanaged or unknown sessions."""
-        manager = ProjectSessionManager(registry=self.registry, lock=self.lock)
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), registry=self.registry, lock=self.lock)
 
         with self.assertRaises(UnmanagedSessionError) as ctx:
             manager.attach("colab-unmanaged-external-session")
@@ -216,7 +216,7 @@ class TestProjectSessions(unittest.TestCase):
             }
             self.registry._atomic_write_locked(data)
 
-        manager = ProjectSessionManager(registry=self.registry, lock=self.lock)
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), registry=self.registry, lock=self.lock)
         with self.assertRaises(LeaseExpiredError) as ctx:
             manager.attach(session_id)
         self.assertIn("lease expired", str(ctx.exception))
@@ -250,7 +250,7 @@ class TestProjectSessions(unittest.TestCase):
             "has_traceback": False,
         }
 
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             transport=mock_transport,
@@ -266,7 +266,7 @@ class TestProjectSessions(unittest.TestCase):
     def test_q08_stop_refuses_unmanaged_session(self):
         """Q08: stop() strictly refuses to touch unmanaged sessions; 0 CLI commands dispatched."""
         mock_run = MagicMock()
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run,
@@ -299,7 +299,7 @@ class TestProjectSessions(unittest.TestCase):
             self.registry._atomic_write_locked(data)
 
         mock_run = MagicMock(return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""))
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run,
@@ -308,7 +308,7 @@ class TestProjectSessions(unittest.TestCase):
         ok = manager.stop(session_id)
         self.assertTrue(ok)
         mock_run.assert_called_once_with(
-            ["colab", "stop", "-s", session_id],
+            ["colab", "--auth=oauth2", "stop", "-s", session_id],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -359,7 +359,7 @@ class TestProjectSessions(unittest.TestCase):
             stopped_calls.append(cmd)
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run_cmd,
@@ -368,7 +368,7 @@ class TestProjectSessions(unittest.TestCase):
         report = manager.reconcile_leases(auto_stop=True)
         self.assertEqual(report["stopped"], [expired_id])
         self.assertEqual(report["active"], [active_id])
-        self.assertEqual(stopped_calls, [["colab", "stop", "-s", expired_id]])
+        self.assertEqual(stopped_calls, [["colab", "--auth=oauth2", "stop", "-s", expired_id]])
 
         # Expired is now terminated, active remains ready
         self.assertEqual(self.registry.get_all_managed()[expired_id]["state"], ProjectSessionState.TERMINATED.value)

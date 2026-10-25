@@ -59,6 +59,7 @@ V2 adds project workspace workflows (`python3 -m colab_adapter.cli project ...`)
 5. **Read-only monitoring:**
    `python3 -m colab_adapter.cli usage` and `python3 -m colab_adapter.cli monitor` query account usage without provisioning resources. The monitor web dashboard is strictly read-only: do not construct or expose mutating endpoints.
 6. **Backward compatibility & host safety:**
+7. **Lease guard is best effort.** `project up` starts a host-side guard that stops only its own session at the lease deadline and verifies removal with `sessions`. It is not a billing cap and not a guarantee (no survival across reboot, `kill -9` or OAuth loss). Operators must still check `project status`, `sessions` and `usage` after every test; `project reconcile` is the backstop. `project exec --timeout` (default 600 s) bounds each remote run.
    Ensure `colab_adapter` remains compatible with standard Python 3.8+ on the host. Upstream `google-colab-cli` remains isolated in Python >=3.12. Do not touch host GPU drivers.
 
 ### V2 M8 monitor guardrails

@@ -152,6 +152,11 @@ def build_parser() -> argparse.ArgumentParser:
     exec_p.add_argument("exec_cmd", help="Command or code to execute remotely.")
     exec_p.add_argument("--session-id", required=True, help="Target session ID.")
     exec_p.add_argument("--working-dir", default=None, help="Remote working directory.")
+    exec_p.add_argument(
+        "--timeout", type=float, default=600.0,
+        help="Execution budget in seconds (default 600). Passed to 'colab exec --timeout' (minus a margin) "
+             "and clamped to the remaining lease.",
+    )
     exec_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
 
     # project status
@@ -168,6 +173,17 @@ def build_parser() -> argparse.ArgumentParser:
     rec_p = proj_subs.add_parser("reconcile", help="Reconcile and cleanup expired session leases.")
     rec_p.add_argument("--no-auto-stop", action="store_true", help="Only audit without stopping.")
     rec_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
+
+    # project lease-guard (internal: spawned by 'project up'/'exec'/'sync'; not for direct use)
+    lg_p = proj_subs.add_parser(
+        "lease-guard",
+        help="internal: host-side lease deadline guard for one session (spawned automatically).",
+    )
+    lg_p.add_argument("--session-id", required=True, help="internal: managed session id.")
+    lg_p.add_argument("--registry-path", required=True, help="internal: managed session registry path.")
+    lg_p.add_argument("--deadline-ts", required=True, type=float, help="internal: absolute lease deadline (epoch s).")
+    lg_p.add_argument("--colab-binary", default="colab", help="internal: upstream colab executable.")
+    lg_p.add_argument("--auth-mode", default="oauth2", help="internal: upstream auth mode.")
 
     # V2 Monitor Dashboard Command (M8)
     mon_parser = subs.add_parser("monitor", help="Start the cross-device training & compute monitor server.")
@@ -199,6 +215,17 @@ def handle_project_command(args: argparse.Namespace) -> int:
     is_json = getattr(args, "json", False)
 
     try:
+        if action == "lease-guard":
+            from .lease_guard import run_guard
+
+            return run_guard(
+                session_id=args.session_id,
+                registry_path=Path(args.registry_path),
+                colab_binary=args.colab_binary,
+                auth_mode=args.auth_mode,
+                deadline_ts=args.deadline_ts,
+            )
+
         if action == "init":
             target = init_project(
                 target_dir=args.root,
@@ -287,6 +314,7 @@ def handle_project_command(args: argparse.Namespace) -> int:
                     return 1
                 s_id = active.session_id
 
+            mgr.ensure_lease_guard(s_id)
             sync_engine = WorkspaceSyncEngine(transport=mgr.transport)
             res = sync_engine.apply_sync(spec, session_id=s_id)
             if is_json:
@@ -299,6 +327,7 @@ def handle_project_command(args: argparse.Namespace) -> int:
             res = mgr.exec(
                 session_id=args.session_id,
                 command_or_code=args.exec_cmd,
+                timeout=args.timeout,
                 working_dir=args.working_dir,
             )
             if is_json:
@@ -317,6 +346,7 @@ def handle_project_command(args: argparse.Namespace) -> int:
                 print(f"Managed: {stat.get('managed')}")
                 print(f"GPU:     {stat.get('accelerator')}")
                 print(f"Lease:   {stat.get('time_remaining_seconds', 0):.0f}s remaining (active: {stat.get('lease_active')})")
+                print(f"Guard:   {'alive' if stat.get('guard_alive') else 'dead'} (pid: {stat.get('guard_pid')}, deadline: {stat.get('guard_deadline')}, outcome: {stat.get('guard_outcome')})")
             return 0
 
         elif action == "stop":
