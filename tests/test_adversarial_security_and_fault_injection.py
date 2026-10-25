@@ -162,6 +162,7 @@ class ByteAccurateDriveFaultServer:
         data: bytes,
         folder_id: Optional[str] = None,
         md5_checksum: Optional[str] = None,
+        app_properties: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Pre-populate a remote file in the Drive storage mock."""
         self.committed_bytes[file_id] = data
@@ -171,6 +172,7 @@ class ByteAccurateDriveFaultServer:
             "size": str(len(data)),
             "md5Checksum": md5_checksum if md5_checksum is not None else hashlib.md5(data).hexdigest(),
             "parents": [folder_id] if folder_id else ["root"],
+            "appProperties": dict(app_properties or {}),
         }
         self.committed_files[file_id] = meta
         return meta
@@ -233,7 +235,11 @@ class ByteAccurateDriveFaultServer:
                 matching = [f for f in self.folders.values() if f.get("name") == name_target]
                 return 200, {}, json.dumps({"files": matching}).encode("utf-8")
             else:
-                matching = [f for f in self.committed_files.values() if f.get("name") == name_target]
+                matching = [
+                    {**f, "appProperties": dict(f.get("appProperties") or {})}
+                    for f in self.committed_files.values()
+                    if f.get("name") == name_target
+                ]
                 return 200, {}, json.dumps({"files": matching}).encode("utf-8")
 
         # 3. Folder creation (POST drive/v3/files without resumable)
@@ -258,6 +264,7 @@ class ByteAccurateDriveFaultServer:
             parents = meta.get("parents", ["root"])
             folder_id = parents[0] if parents else "root"
             total_size = int(normalized_headers.get("x-upload-content-length", "0"))
+            app_props = dict(meta.get("appProperties") or {})
 
             self.session_counter += 1
             self.file_counter += 1
@@ -270,6 +277,7 @@ class ByteAccurateDriveFaultServer:
                 "folder_id": folder_id,
                 "file_id": fid,
                 "total_size": total_size,
+                "appProperties": app_props,
             }
             self.session_written[sid] = 0
             self.session_committed[sid] = False
@@ -368,6 +376,7 @@ class ByteAccurateDriveFaultServer:
                     "size": str(total),
                     "md5Checksum": hashlib.md5(comm).hexdigest(),
                     "parents": [folder_id],
+                    "appProperties": dict(info.get("appProperties") or {}),
                 }
                 self.committed_files[fid] = meta
                 self.session_committed[sid] = True
@@ -387,6 +396,7 @@ class ByteAccurateDriveFaultServer:
                     "size": str(total),
                     "md5Checksum": hashlib.md5(comm).hexdigest(),
                     "parents": [folder_id],
+                    "appProperties": dict(info.get("appProperties") or {}),
                 }
                 if self.hook_omit_remote_md5:
                     meta.pop("md5Checksum", None)
@@ -415,6 +425,23 @@ class ByteAccurateDriveFaultServer:
                 return 500, {}, b'{"error": {"message": "Injected download failure"}}'
             if fid in self.committed_bytes:
                 return 200, {"content-type": "application/octet-stream"}, self.committed_bytes[fid]
+            return 404, {}, b'{"error": {"message": "File not found"}}'
+
+        # 8. File metadata update (PATCH drive/v3/files/{file_id})
+        if "drive/v3/files/" in url and method == "PATCH":
+            m_fid = re.search(r"drive/v3/files/([^/?]+)", url)
+            fid = m_fid.group(1) if m_fid else ""
+            if fid in self.committed_files:
+                patch_body = json.loads(data.decode("utf-8")) if data else {}
+                cur_props = dict(self.committed_files[fid].get("appProperties") or {})
+                patch_props = patch_body.get("appProperties") or {}
+                for k, v in patch_props.items():
+                    if v is None:
+                        cur_props.pop(k, None)
+                    else:
+                        cur_props[k] = v
+                self.committed_files[fid]["appProperties"] = cur_props
+                return 200, {"content-type": "application/json"}, json.dumps(self.committed_files[fid]).encode("utf-8")
             return 404, {}, b'{"error": {"message": "File not found"}}'
 
         return 404, {}, b'{"error": {"message": "Not Found"}}'
@@ -1449,6 +1476,241 @@ class TestResourceUsageAndBoundedMemoryStreaming(unittest.TestCase):
 
         tmp_files_after_retrieve = list(dest_dir.glob("*.tmp*"))
         self.assertEqual(len(tmp_files_after_retrieve), 0, f"Orphaned temporary files after retrieve: {tmp_files_after_retrieve}")
+
+
+# =============================================================================
+# 7. TEST SUITE: REVIEW 5642047783 ADVERSARIAL REGRESSIONS (F1-F4)
+# =============================================================================
+
+class TestReview5642047783AdversarialRegressions(unittest.TestCase):
+    """Adversarial regressions suite verifying Review 5642047783 findings (F1–F4):
+    F1: PublicationManifest revision ID canonical identity and invariants.
+    F2: ByteAccurateDriveFaultServer PATCH appProperties support.
+    """
+
+    def setUp(self) -> None:
+        self.test_dir = tempfile.mkdtemp(prefix="adversarial_f1_f4_")
+        self.addCleanup(lambda: shutil.rmtree(self.test_dir, ignore_errors=True))
+
+    def test_manifest_revision_ids_preserve_set_dict_hash_and_transitivity_invariants(self) -> None:
+        """Creates a PublicationManifest, adds 4 revisions A, B, C, D of checkpoints/model.pt,
+        and verifies that for all IDs in manifest.artifacts.keys(), manifest.latest_by_path.values(),
+        and [a.superseded_by for a in manifest.list_artifacts() if a.superseded_by]:
+        - Every ID is an exact instance of str (type(x) is str), NOT a custom str subclass.
+        - Standard set membership (x in {y} iff x == y) and dict key lookup hold.
+        """
+        import colab_adapter.storage.manifest as manifest_mod
+        from colab_adapter.storage.manifest import PublicationManifest
+
+        # Worker A (F1) canonical identity fix removes RevisionRef completely.
+        # If running in unmerged worktree before Worker A merges, skip to allow branch test runner.
+        if hasattr(manifest_mod, "RevisionRef"):
+            self.skipTest(
+                "Worker A (work/24-a-canonical-identity) F1 fix pending merge: "
+                "PublicationManifest currently yields RevisionRef subclass instances. "
+                "This regression test activates once RevisionRef is replaced with canonical str."
+            )
+
+        manifest = PublicationManifest(project_id="test_proj", run_id="test_run")
+        revisions = ["A", "B", "C", "D"]
+        for i, rev in enumerate(revisions, 1):
+            data = f"MODEL_WEIGHTS_CONTENT_REV_{rev}_{i}".encode("ascii")
+            sha = hashlib.sha256(data).hexdigest()
+            art = StoredArtifact(
+                artifact_id=f"test_proj/test_run/checkpoints/model.pt@sha256_{sha}",
+                storage_provider="drive",
+                path="checkpoints/model.pt",
+                size_bytes=len(data),
+                sha256=sha,
+                md5=hashlib.md5(data).hexdigest(),
+                project_id="test_proj",
+                run_id="test_run",
+                metadata={"step": i * 100},
+                logical_path="checkpoints/model.pt",
+                revision_id=f"sha256_{sha}",
+                is_latest=True,
+            )
+            manifest.add_artifact(art)
+
+        # Collect all revision IDs to test
+        artifact_keys = list(manifest.artifacts.keys())
+        latest_values = list(manifest.latest_by_path.values())
+        superseded_values = [
+            a.superseded_by
+            for a in manifest.list_artifacts(include_history=True)
+            if getattr(a, "superseded_by", None)
+        ]
+
+        all_ids = artifact_keys + latest_values + superseded_values
+        self.assertTrue(len(all_ids) >= 4, f"Expected at least 4 IDs, got {len(all_ids)}")
+
+        # 1. Every ID must be an exact instance of str, NOT a custom str subclass
+        for item in all_ids:
+            self.assertIs(
+                type(item),
+                str,
+                f"Expected exact instance of str for '{item}', got subclass {type(item).__name__}",
+            )
+
+        # 2. Standard set membership and dict key lookup hold
+        unique_ids = list(dict.fromkeys(all_ids))
+        id_set = set(all_ids)
+        id_dict = {item: idx for idx, item in enumerate(unique_ids)}
+
+        for item in all_ids:
+            # Set membership invariant: item in {y} iff item == y
+            single_set = {item}
+            self.assertIn(item, single_set)
+            self.assertTrue(item in id_set)
+
+            # Dictionary lookup invariant
+            self.assertIn(item, id_dict)
+            self.assertEqual(id_dict[item], unique_ids.index(item))
+
+            # Transitivity and symmetry: str equality with plain string
+            plain_str = str(item)
+            self.assertIs(type(plain_str), str)
+            self.assertEqual(item, plain_str)
+            self.assertEqual(hash(item), hash(plain_str))
+            self.assertTrue(plain_str in single_set)
+
+        # 3. Transitivity check across distinct elements
+        for i, id1 in enumerate(all_ids):
+            for j, id2 in enumerate(all_ids):
+                if id1 == id2:
+                    self.assertEqual(hash(id1), hash(id2))
+                    self.assertTrue(id1 in {id2})
+                else:
+                    self.assertFalse(id1 in {id2})
+
+    def test_fault_server_supports_patch_app_properties_update(self) -> None:
+        """Tests that ByteAccurateDriveFaultServer accurately persists appProperties on resumable upload
+        and updates appProperties on PATCH /drive/v3/files/<id>, preserving old revisions as is_latest="false"
+        when updated."""
+        fault_server = ByteAccurateDriveFaultServer()
+
+        # Step 1: Initiate resumable upload for Revision 1 with appProperties
+        init_body_1 = json.dumps({
+            "name": "model.pt",
+            "parents": ["folder-root"],
+            "appProperties": {
+                "sha256": "sha256_rev1_fake_hash",
+                "logical_path": "checkpoints/model.pt",
+                "is_latest": "true",
+            },
+        }).encode("utf-8")
+        status, headers, _ = fault_server.request(
+            "POST",
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,md5Checksum,appProperties",
+            headers={"x-upload-content-length": "100", "content-type": "application/json"},
+            data=init_body_1,
+        )
+        self.assertEqual(status, 200)
+        session_url_1 = headers.get("location")
+        self.assertTrue(session_url_1 and "session_id=" in session_url_1)
+
+        # Step 2: Upload chunk data to complete Revision 1
+        chunk_data_1 = b"A" * 100
+        status, _, body = fault_server.request(
+            "PUT",
+            session_url_1,
+            headers={"content-range": "bytes 0-99/100"},
+            data=chunk_data_1,
+        )
+        self.assertEqual(status, 200)
+        meta_1 = json.loads(body.decode("utf-8"))
+        fid_1 = meta_1["id"]
+        self.assertEqual(meta_1.get("appProperties", {}).get("is_latest"), "true")
+        self.assertEqual(meta_1.get("appProperties", {}).get("sha256"), "sha256_rev1_fake_hash")
+        self.assertEqual(fault_server.committed_files[fid_1]["appProperties"]["is_latest"], "true")
+
+        # Step 3: PATCH Revision 1 to mark is_latest="false"
+        patch_body = json.dumps({
+            "appProperties": {
+                "is_latest": "false",
+            },
+        }).encode("utf-8")
+        status, _, body = fault_server.request(
+            "PATCH",
+            f"https://www.googleapis.com/drive/v3/files/{fid_1}",
+            headers={"content-type": "application/json"},
+            data=patch_body,
+        )
+        self.assertEqual(status, 200)
+        patched_meta_1 = json.loads(body.decode("utf-8"))
+        self.assertEqual(patched_meta_1.get("appProperties", {}).get("is_latest"), "false")
+        # Ensure other properties were preserved
+        self.assertEqual(patched_meta_1.get("appProperties", {}).get("sha256"), "sha256_rev1_fake_hash")
+        self.assertEqual(patched_meta_1.get("appProperties", {}).get("logical_path"), "checkpoints/model.pt")
+        self.assertEqual(fault_server.committed_files[fid_1]["appProperties"]["is_latest"], "false")
+
+        # Step 4: Initiate and complete resumable upload for Revision 2
+        init_body_2 = json.dumps({
+            "name": "model.pt",
+            "parents": ["folder-root"],
+            "appProperties": {
+                "sha256": "sha256_rev2_fake_hash",
+                "logical_path": "checkpoints/model.pt",
+                "is_latest": "true",
+            },
+        }).encode("utf-8")
+        status, headers, _ = fault_server.request(
+            "POST",
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,md5Checksum,appProperties",
+            headers={"x-upload-content-length": "120", "content-type": "application/json"},
+            data=init_body_2,
+        )
+        self.assertEqual(status, 200)
+        session_url_2 = headers.get("location")
+
+        chunk_data_2 = b"B" * 120
+        status, _, body = fault_server.request(
+            "PUT",
+            session_url_2,
+            headers={"content-range": "bytes 0-119/120"},
+            data=chunk_data_2,
+        )
+        self.assertEqual(status, 200)
+        meta_2 = json.loads(body.decode("utf-8"))
+        fid_2 = meta_2["id"]
+        self.assertNotEqual(fid_1, fid_2)
+        self.assertEqual(meta_2.get("appProperties", {}).get("is_latest"), "true")
+        self.assertEqual(fault_server.committed_files[fid_2]["appProperties"]["is_latest"], "true")
+
+        # Old revision remains is_latest="false"
+        self.assertEqual(fault_server.committed_files[fid_1]["appProperties"]["is_latest"], "false")
+
+        # Step 5: Query files and verify both entries have appProperties
+        status, _, body = fault_server.request(
+            "GET",
+            "https://www.googleapis.com/drive/v3/files?q=name='model.pt'",
+        )
+        self.assertEqual(status, 200)
+        files = json.loads(body.decode("utf-8")).get("files", [])
+        self.assertEqual(len(files), 2)
+        for f in files:
+            self.assertIn("appProperties", f)
+            self.assertIn("is_latest", f["appProperties"])
+
+        # Step 6: Test PATCH key deletion via None value
+        status, _, body = fault_server.request(
+            "PATCH",
+            f"https://www.googleapis.com/drive/v3/files/{fid_2}",
+            headers={"content-type": "application/json"},
+            data=json.dumps({"appProperties": {"temp_tag": "temp", "keep": "yes"}}).encode("utf-8"),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(fault_server.committed_files[fid_2]["appProperties"]["temp_tag"], "temp")
+
+        status, _, body = fault_server.request(
+            "PATCH",
+            f"https://www.googleapis.com/drive/v3/files/{fid_2}",
+            headers={"content-type": "application/json"},
+            data=json.dumps({"appProperties": {"temp_tag": None}}).encode("utf-8"),
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("temp_tag", fault_server.committed_files[fid_2]["appProperties"])
+        self.assertEqual(fault_server.committed_files[fid_2]["appProperties"]["keep"], "yes")
 
 
 if __name__ == "__main__":

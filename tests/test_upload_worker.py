@@ -1423,6 +1423,71 @@ class TestUploadWorker(unittest.TestCase):
         self.assertIsNotNone(final_rec)
         self.assertEqual(final_rec.status, TransferStatus.PUBLISHED.value)
 
+    def test_upload_worker_retries_cleanly_on_transient_drive_errors(self):
+        """Verify that ArtifactUploadWorker handles multi-revision sequential publication
+        (rev1 then rev2) for the same checkpoint path without overwriting rev1 in the manifest,
+        and cleanly recovers / retries through transient store errors."""
+        store_dir = Path(self.test_dir) / "store_multi_rev"
+        store = MockStoreForWorker(manifest_dir=store_dir)
+        # Inject 1 transient failure so worker exercises its retry loop
+        store.fail_first_n = 1
+        store.error_message = "Transient 503 Service Unavailable"
+
+        worker = ArtifactUploadWorker(
+            store=store,
+            journal=self.journal,
+            max_workers=1,
+            initial_retry_delay_sec=0.05,
+        )
+        worker.start()
+        self.addCleanup(worker.stop)
+
+        f = Path(self.test_dir) / "model.pt"
+
+        # 1. Publish Revision 1
+        rev1_bytes = b"REVISION_1_WEIGHTS_CONTENT"
+        f.write_bytes(rev1_bytes)
+        sha_1 = compute_file_sha256(f)
+        rec_1 = worker.enqueue(f, project_id="p_seq", run_id="r_seq", category="checkpoints")
+        self.assertTrue(worker.wait_for_completion(timeout=5.0), "Worker did not complete rev1 upload after transient retry")
+
+        # 2. Publish Revision 2
+        rev2_bytes = b"REVISION_2_WEIGHTS_CONTENT_UPDATED_LARGER"
+        f.write_bytes(rev2_bytes)
+        sha_2 = compute_file_sha256(f)
+        rec_2 = worker.enqueue(f, project_id="p_seq", run_id="r_seq", category="checkpoints")
+        self.assertTrue(worker.wait_for_completion(timeout=5.0), "Worker did not complete rev2 upload")
+
+        # 3. Verify Manifest preserves both revisions without overwriting rev1
+        manifest = store.get_manifest("p_seq", "r_seq")
+        self.assertIsNotNone(manifest)
+        self.assertEqual(len(manifest.artifacts), 2, "Expected exactly 2 revisions in manifest")
+
+        art1 = manifest.get_artifact(rec_1.artifact_id)
+        art2 = manifest.get_artifact(rec_2.artifact_id)
+        self.assertIsNotNone(art1, f"Revision 1 ({rec_1.artifact_id}) missing from manifest!")
+        self.assertIsNotNone(art2, f"Revision 2 ({rec_2.artifact_id}) missing from manifest!")
+        self.assertEqual(art1.sha256, sha_1)
+        self.assertEqual(art2.sha256, sha_2)
+
+        # Logical path query returns latest revision (Revision 2)
+        latest_art = manifest.get_artifact("p_seq/r_seq/checkpoints/model.pt")
+        self.assertIsNotNone(latest_art)
+        self.assertEqual(latest_art.sha256, sha_2)
+
+        # 4. Both revisions present in journal
+        transfers = self.journal.list_transfers_for_run("p_seq", "r_seq")
+        self.assertEqual(len(transfers), 2)
+        self.assertEqual({t.sha256 for t in transfers}, {sha_1, sha_2})
+
+        # 5. Both revisions are retrievable
+        dest1 = Path(self.test_dir) / "retrieved_rev1.pt"
+        dest2 = Path(self.test_dir) / "retrieved_rev2.pt"
+        store.retrieve(rec_1.artifact_id, dest1)
+        store.retrieve(rec_2.artifact_id, dest2)
+        self.assertEqual(dest1.read_bytes(), rev1_bytes)
+        self.assertEqual(dest2.read_bytes(), rev2_bytes)
+
 
 if __name__ == "__main__":
     unittest.main()
