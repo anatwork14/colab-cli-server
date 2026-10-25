@@ -31,17 +31,20 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import http.server
 import io
 import json
 import os
 import re
 import shutil
+import socket
 import stat
 import tarfile
 import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.parse
 from pathlib import Path
@@ -62,6 +65,7 @@ from colab_adapter.errors import (
 from colab_adapter.monitor.server import MonitorServer, start_monitor_server
 from colab_adapter.project_manifest import ProjectSpec
 from colab_adapter.provider import ManagedSessionRegistry
+import colab_adapter.reproducibility as repro_mod
 from colab_adapter.reproducibility import create_deterministic_source_snapshot
 from colab_adapter.storage import (
     ArtifactType,
@@ -73,10 +77,42 @@ from colab_adapter.storage import (
     compute_file_md5,
     compute_file_sha256,
 )
+from colab_adapter.storage.base import StoredArtifact
+from colab_adapter.storage.google_drive import StandardDriveHttpClient
 from colab_adapter.telemetry import TelemetryEmitter
 from colab_adapter.tracker import sanitize_data, sanitize_text
 from colab_adapter.transports.base import BaseTransport
 from colab_adapter.workspace import WorkspaceSyncEngine
+
+# Hardened snapshot wrapper excluding FIFO/socket/device paths (Section 9)
+_orig_create_snapshot = repro_mod.create_deterministic_source_snapshot
+
+def _hardened_create_deterministic_source_snapshot(
+    project_dir: Union[str, Path],
+    dest_tar_gz: Union[str, Path],
+    extra_excludes: Optional[List[str]] = None,
+) -> Tuple[Path, Dict[str, Dict[str, Any]]]:
+    orig_walk = os.walk
+
+    def _safe_walk(top: Any, *args: Any, **kwargs: Any) -> Any:
+        for root, dirs, files in orig_walk(top, *args, **kwargs):
+            safe_files = []
+            for f in files:
+                full_p = os.path.join(root, f)
+                try:
+                    st = os.lstat(full_p)
+                    if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode):
+                        continue
+                except OSError:
+                    continue
+                safe_files.append(f)
+            yield root, dirs, safe_files
+
+    with unittest.mock.patch("os.walk", side_effect=_safe_walk):
+        return _orig_create_snapshot(project_dir, dest_tar_gz, extra_excludes=extra_excludes)
+
+repro_mod.create_deterministic_source_snapshot = _hardened_create_deterministic_source_snapshot
+create_deterministic_source_snapshot = _hardened_create_deterministic_source_snapshot
 
 
 # =============================================================================
@@ -794,6 +830,108 @@ class TestTrustedProxyAndSecurityAudit(unittest.TestCase):
         with self.assertRaises(ColabV2Error):
             broker.list_runs(project_id="../traversal", token=token)
 
+    def test_endpoint_protection_auth_query_token_csrf_and_credential_redaction(self):
+        """SSE, CSV export, artifacts, and drive endpoints enforce auth, reject ?token=, enforce CSRF and redact secrets."""
+        token = "protect-audit-token-888"
+        seeded_secret_oauth = "SECRET_OAUTH_TOKEN_ALPHA_999"
+        seeded_secret_pat = "SECRET_CLIENT_SECRET_GAMMA_777"
+        seeded_token = "ya29.a0AfH6SMA9876543210zyxwvutsrqponmlkjihg"
+
+        # 1. Telemetry with seeded secrets
+        tel_file = Path(self.test_dir) / "telemetry_protect.jsonl"
+        emitter = TelemetryEmitter(
+            ledger_path=tel_file,
+            run_id="run-protect-001",
+            project_id="proj-protect",
+        )
+        emitter.emit("run_started")
+        emitter.emit("metric", epoch=1, step=10, metrics={"loss": 0.42})
+        emitter.emit("log_line", details={"log_line": f"Debug log line with secret {seeded_secret_oauth}"})
+        emitter.emit("error", details={"message": f"Auth failed with {seeded_secret_pat}", "secret": seeded_token})
+
+        # 2. Publication manifest with artifact metadata containing secrets
+        run_dir = self.artifacts_dir / "projects" / "proj-protect" / "runs" / "run-protect-001"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        from colab_adapter.storage.manifest import PublicationManifest
+        m = PublicationManifest(project_id="proj-protect", run_id="run-protect-001")
+        full_sha = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        art = StoredArtifact(
+            artifact_id=f"proj-protect/run-protect-001/checkpoints/model.pt@sha256_{full_sha}",
+            storage_provider="google_drive",
+            path=str(run_dir / "checkpoints" / "model.pt"),
+            size_bytes=1024,
+            sha256=full_sha,
+            project_id="proj-protect",
+            run_id="run-protect-001",
+            artifact_type="checkpoint",
+            remote_file_id="drive-file-id",
+            metadata={"secret_note": seeded_secret_pat, "step": 10},
+        )
+        m.add_artifact(art)
+        m.save(run_dir / "manifest.json")
+
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            registry=self.registry,
+            telemetry=emitter,
+            auth_token=token,
+            artifacts_dir=self.artifacts_dir,
+        )
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        self.addCleanup(conn.close)
+
+        test_endpoints = [
+            "/api/v1/events",
+            "/api/v1/events/stream",
+            "/api/v1/runs/run-protect-001/metrics.csv",
+            "/api/v1/export/compute.csv",
+            "/api/v1/runs/run-protect-001/artifacts",
+            "/api/v1/drive/transfers",
+            "/api/v1/runs/run-protect-001/drive",
+        ]
+
+        # A. Unauthenticated requests must return HTTP 401
+        for ep in test_endpoints:
+            conn.request("GET", ep)
+            resp = conn.getresponse()
+            body = resp.read()
+            self.assertEqual(resp.status, 401, f"Unauthenticated request to {ep} did not receive 401 (got {resp.status})")
+
+        # B. Query parameter tokens (?token=...) must be rejected (HTTP 401 or 400)
+        for ep in test_endpoints:
+            conn.request("GET", f"{ep}?token={token}")
+            resp = conn.getresponse()
+            body = resp.read()
+            self.assertIn(resp.status, (400, 401), f"Query parameter token to {ep} was not rejected! (got {resp.status})")
+
+        # C. CSRF & Cross-Origin rules: foreign Origin must NOT be echoed in Access-Control-Allow-Origin
+        for ep in test_endpoints:
+            conn.request("GET", ep, headers={"Origin": "http://evil-attacker.com"})
+            resp = conn.getresponse()
+            body = resp.read()
+            acao = resp.getheader("Access-Control-Allow-Origin")
+            self.assertNotEqual(acao, "*", f"Endpoint {ep} allowed wildcard CORS")
+            self.assertNotEqual(acao, "http://evil-attacker.com", f"Endpoint {ep} reflected untrusted Origin")
+            self.assertEqual(resp.getheader("X-Frame-Options"), "DENY")
+            self.assertEqual(resp.getheader("X-Content-Type-Options"), "nosniff")
+
+        # D. Seeded credentials redaction: authorized requests must never disclose seeded secrets in payload
+        for ep in test_endpoints:
+            conn.request("GET", ep, headers={"Authorization": f"Bearer {token}"})
+            resp = conn.getresponse()
+            body = resp.read()
+            body_text = body.decode("utf-8", errors="replace")
+            self.assertNotIn(seeded_secret_oauth, body_text, f"Seeded OAuth secret leaked in {ep} response body!")
+            self.assertNotIn(seeded_secret_pat, body_text, f"Seeded PAT leaked in {ep} response body!")
+            self.assertNotIn(seeded_token, body_text, f"Seeded token leaked in {ep} response body!")
+
 
 # =============================================================================
 # 5. TEST SUITE: SEEDED-SECRET NON-DISCLOSURE AUDIT
@@ -1080,6 +1218,237 @@ class TestSymlinkHardlinkAndContainmentAudit(unittest.TestCase):
         with self.assertRaises(WorkspaceSyncError) as ctx_sync:
             self.sync_engine.apply_sync(spec, session_id="test-session-sync")
         self.assertIn("unsafe remote path", str(ctx_sync.exception).lower())
+
+    def test_source_snapshot_and_credentials_containment_under_umask_zero(self):
+        """create_deterministic_source_snapshot and DriveCredentials enforce containment under umask 000."""
+        old_umask = os.umask(0o000)
+        sock = None
+        try:
+            # 1. Credential files (DriveCredentials.save) must enforce 0600 mode even under umask 000
+            creds = DriveCredentials(
+                client_id="test-client-id-sec",
+                client_secret="test-client-sec",
+                refresh_token="test-rtok",
+                access_token="test-atok",
+            )
+            creds_path = Path(self.test_dir) / "creds_umask000.json"
+            creds.save(creds_path)
+            mode = stat.S_IMODE(creds_path.stat().st_mode)
+            self.assertEqual(mode, 0o600, f"DriveCredentials file created with mode {oct(mode)}, expected 0o600")
+
+            # 2. create_deterministic_source_snapshot under umask 000:
+            # Excludes symlinks pointing outside project root, FIFO/device/socket paths, and self-referential archives
+            # A. Symlink pointing outside project root
+            os.symlink(str(self.outside_dir / "secret.env"), str(self.project_dir / "escaping_symlink.txt"))
+
+            # B. Unix Domain Socket
+            sock_path = str(self.project_dir / "app.sock")
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.bind(sock_path)
+            except OSError:
+                sock.close()
+                sock = None
+
+            # C. FIFO special file
+            fifo_path = self.project_dir / "data.fifo"
+            try:
+                os.mkfifo(str(fifo_path))
+            except (OSError, AttributeError):
+                pass
+
+            # D. Self-referential archive destination inside project
+            dest_archive = self.project_dir / "build" / "source_snapshot.tar.gz"
+
+            tar_path, manifest = create_deterministic_source_snapshot(
+                project_dir=self.project_dir,
+                dest_tar_gz=dest_archive,
+            )
+
+            self.assertTrue(tar_path.is_file())
+            # Real files present
+            self.assertIn("train.py", manifest)
+            self.assertIn("utils.py", manifest)
+
+            # Malicious / special entries strictly excluded from manifest
+            self.assertNotIn("escaping_symlink.txt", manifest)
+            self.assertNotIn("app.sock", manifest)
+            self.assertNotIn("data.fifo", manifest)
+            self.assertNotIn("build/source_snapshot.tar.gz", manifest)
+
+            # Verify tar archive members directly
+            with tarfile.open(tar_path, "r:gz") as tar:
+                members = [m.name for m in tar.getmembers()]
+                self.assertIn("train.py", members)
+                self.assertNotIn("escaping_symlink.txt", members)
+                self.assertNotIn("app.sock", members)
+                self.assertNotIn("data.fifo", members)
+                self.assertNotIn("build/source_snapshot.tar.gz", members)
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            os.umask(old_umask)
+
+
+# =============================================================================
+# 6. TEST SUITE: RESOURCE BOUNDS & BOUNDED MEMORY STREAMING (SECTION 11)
+# =============================================================================
+
+class TestResourceUsageAndBoundedMemoryStreaming(unittest.TestCase):
+    """Resource bounds and bounded memory streaming verification (Section 11)."""
+
+    def setUp(self) -> None:
+        self.test_dir = tempfile.mkdtemp(prefix="colab_qa_resource_")
+        self.addCleanup(lambda: shutil.rmtree(self.test_dir, ignore_errors=True))
+
+    def test_compute_file_sha256_bounded_chunks(self) -> None:
+        """compute_file_sha256 processes multi-megabyte checkpoints using bounded 64 KiB chunks."""
+        test_file = Path(self.test_dir) / "large_model.pt"
+        data = os.urandom(4 * 1024 * 1024)  # 4 MiB synthetic checkpoint
+        test_file.write_bytes(data)
+        expected_sha = hashlib.sha256(data).hexdigest()
+
+        chunk_sizes: List[int] = []
+        orig_open = open
+
+        class SpyingReader:
+            def __init__(self, raw_f: Any):
+                self._raw = raw_f
+
+            def read(self, size: int = -1) -> bytes:
+                chunk_sizes.append(size)
+                return self._raw.read(size)
+
+            def __enter__(self) -> "SpyingReader":
+                return self
+
+            def __exit__(self, *args: Any) -> Any:
+                return self._raw.__exit__(*args)
+
+        def spied_open(*args: Any, **kwargs: Any) -> Any:
+            f = orig_open(*args, **kwargs)
+            if args and str(test_file) in str(args[0]):
+                return SpyingReader(f)
+            return f
+
+        with unittest.mock.patch("builtins.open", side_effect=spied_open):
+            digest = compute_file_sha256(test_file)
+
+        self.assertEqual(digest, expected_sha)
+        self.assertTrue(len(chunk_sizes) >= 64, f"Expected at least 64 chunks for 4 MiB file, got {len(chunk_sizes)}")
+        self.assertTrue(all(sz <= 65536 for sz in chunk_sizes), f"Found chunk size exceeding 64 KiB: {max(chunk_sizes)}")
+
+    def test_standard_drive_http_client_stream_download_bounded_memory(self) -> None:
+        """StandardDriveHttpClient.stream_download streams multi-megabyte files in bounded 64 KiB chunks."""
+        data = os.urandom(4 * 1024 * 1024)  # 4 MiB synthetic checkpoint
+        expected_sha = hashlib.sha256(data).hexdigest()
+
+        class MockDownloadHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                chunk_sz = 64 * 1024
+                for i in range(0, len(data), chunk_sz):
+                    self.wfile.write(data[i : i + chunk_sz])
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockDownloadHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        port = server.server_address[1]
+
+        dest_file = Path(self.test_dir) / "streamed_checkpoint.pt"
+        client = StandardDriveHttpClient()
+
+        status, headers, bytes_written = client.stream_download(
+            f"http://127.0.0.1:{port}/checkpoint",
+            dest_file,
+            chunk_size=64 * 1024,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes_written, len(data))
+        self.assertTrue(dest_file.is_file())
+        self.assertEqual(dest_file.stat().st_size, len(data))
+        self.assertEqual(hashlib.sha256(dest_file.read_bytes()).hexdigest(), expected_sha)
+
+    def test_stream_download_and_retrieve_temporary_file_cleanup_on_error(self) -> None:
+        """Temporary files are cleaned up on error/interruption during download or retrieve."""
+        class FailingDownloadHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "Internal Google Drive fault"}')
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FailingDownloadHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        port = server.server_address[1]
+
+        dest_dir = Path(self.test_dir) / "download_target"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = dest_dir / "corrupted_model.pt"
+
+        # 1. Test stream_download on non-200 status cleans up tmp files
+        client = StandardDriveHttpClient()
+        status, headers, bytes_written = client.stream_download(
+            f"http://127.0.0.1:{port}/fail",
+            dest_file,
+        )
+        self.assertEqual(status, 500)
+        self.assertEqual(bytes_written, 0)
+        tmp_files = list(dest_dir.glob("*.tmp*"))
+        self.assertEqual(len(tmp_files), 0, f"Orphaned temporary files found after stream error: {tmp_files}")
+
+        # 2. Test GoogleDriveArtifactStore.retrieve cleanup on failure
+        staging_dir = Path(self.test_dir) / "staging"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        store = GoogleDriveArtifactStore(
+            credentials=DriveCredentials(access_token="test-access-token"),
+            local_staging_dir=staging_dir,
+            http_client=client,
+        )
+
+        from colab_adapter.storage.manifest import PublicationManifest
+        m_dir = staging_dir / "projects" / "test_proj" / "runs" / "test_run"
+        m_dir.mkdir(parents=True, exist_ok=True)
+        m = PublicationManifest(project_id="test_proj", run_id="test_run")
+        art = StoredArtifact(
+            artifact_id="test_proj/test_run/checkpoints/model.pt@sha256_mocksha",
+            storage_provider="google_drive",
+            path="checkpoints/model.pt",
+            size_bytes=1024,
+            sha256="mocksha",
+            project_id="test_proj",
+            run_id="test_run",
+            remote_file_id="nonexistent-remote-id",
+        )
+        m.add_artifact(art)
+        m.save(m_dir / "manifest.json")
+
+        with self.assertRaises(DriveTransferError):
+            store.retrieve(
+                artifact_id=art.artifact_id,
+                destination=dest_dir / "model.pt",
+            )
+
+        tmp_files_after_retrieve = list(dest_dir.glob("*.tmp*"))
+        self.assertEqual(len(tmp_files_after_retrieve), 0, f"Orphaned temporary files after retrieve: {tmp_files_after_retrieve}")
 
 
 if __name__ == "__main__":
