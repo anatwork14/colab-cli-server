@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from colab_adapter.errors import (
+    ArtifactValidationError,
     DriveAuthenticationError,
     DriveIntegrityError,
     DriveQuotaExceededError,
@@ -161,11 +162,18 @@ class MockDriveHttpClient:
                 f_parent = f.get("parent")
                 if f_name and f"name = '{f_name}'" in q_unquoted:
                     if f_parent is None or f"'{f_parent}' in parents" in q_unquoted:
+                        c_data = f.get("content")
+                        if c_data is not None:
+                            sz_val = str(len(c_data))
+                            md5_val = hashlib.md5(c_data).hexdigest()
+                        else:
+                            sz_val = str(f.get("size", 0))
+                            md5_val = f.get("md5Checksum", "")
                         matched.append({
                             "id": f.get("id", "mock-file-1"),
                             "name": f_name,
-                            "size": str(f.get("size", 0)),
-                            "md5Checksum": f.get("md5Checksum", ""),
+                            "size": sz_val,
+                            "md5Checksum": md5_val,
                         })
             return 200, {}, json.dumps({"files": matched}).encode("utf-8")
 
@@ -295,6 +303,10 @@ class MockDriveHttpClient:
             fid = m_fid.group(1) if m_fid else None
             if fid and fid in self.committed_files:
                 return 200, {}, self.committed_files[fid]
+            if fid:
+                for mf in self.mock_files:
+                    if mf.get("id") == fid and "content" in mf:
+                        return 200, {}, mf["content"]
             return 200, {}, b"VERIFIED_DOWNLOADED_CONTENT_MOCK"
 
         # 6. File metadata query (GET /drive/v3/files/{file_id})
@@ -302,6 +314,22 @@ class MockDriveHttpClient:
             m_fid = re.search(r"drive/v3/files/([^/?]+)", url)
             if m_fid:
                 fid = m_fid.group(1)
+                for mf in self.mock_files:
+                    if mf.get("id") == fid:
+                        c_data = mf.get("content")
+                        if c_data is not None:
+                            sz = str(len(c_data))
+                            md5 = hashlib.md5(c_data).hexdigest()
+                        else:
+                            sz = str(mf.get("size", 0))
+                            md5 = mf.get("md5Checksum", "")
+                        resp = {
+                            "id": fid,
+                            "name": mf.get("name", "uploaded_file"),
+                            "size": sz,
+                            "md5Checksum": md5,
+                        }
+                        return 200, {"content-type": "application/json"}, json.dumps(resp).encode("utf-8")
                 if fid in self.committed_files:
                     c_data = self.committed_files[fid]
                     fname = "uploaded_file"
@@ -849,9 +877,12 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
         # Verify manifest on disk has both artifacts
         manifest_path = self.staging_dir / "projects" / "p_man" / "runs" / "r_man" / "manifest.json"
         manifest = PublicationManifest.load(manifest_path)
-        art_ids = [a.artifact_id for a in manifest.list_artifacts()]
-        self.assertIn("p_man/r_man/checkpoints/weights_a.pt", art_ids)
-        self.assertIn("p_man/r_man/checkpoints/weights_b.pt", art_ids)
+        base_art_ids = [a.artifact_id.split("@sha256_")[0] for a in manifest.list_artifacts()]
+        self.assertIn("p_man/r_man/checkpoints/weights_a.pt", base_art_ids)
+        self.assertIn("p_man/r_man/checkpoints/weights_b.pt", base_art_ids)
+        # Verify unversioned lookup works via get_metadata
+        self.assertIsNotNone(self.store.get_metadata("p_man/r_man/checkpoints/weights_a.pt"))
+        self.assertIsNotNone(self.store.get_metadata("p_man/r_man/checkpoints/weights_b.pt"))
 
     def test_in_progress_transfer_mismatch_raises_storage_error(self):
         """In-progress/unpublished transfer encountering remote checksum mismatch raises StorageError."""
@@ -895,6 +926,212 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
         with self.store._exclusive_lock("reentrant-lock-test"):
             with self.store._exclusive_lock("reentrant-lock-test"):
                 pass
+
+    def test_idempotent_republish_deduplication(self):
+        """Re-publishing same content dedupes without uploading; pre-seeded files verified via readback."""
+        file_path = Path(self.test_dir) / "idempotent_model.pt"
+        content = b"idempotent content for deduplication test"
+        file_path.write_bytes(content)
+
+        # 1. First publish
+        stored1 = self.store.publish(
+            source=file_path,
+            project_id="p_idem",
+            run_id="r_idem",
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+        self.assertEqual(self.mock_client.upload_sessions_initiated, 1)
+
+        # 2. Second publish of exact same file (in-process deduplication)
+        stored2 = self.store.publish(
+            source=file_path,
+            project_id="p_idem",
+            run_id="r_idem",
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+        self.assertEqual(stored2.remote_file_id, stored1.remote_file_id)
+        self.assertEqual(stored2.artifact_id, stored1.artifact_id)
+        self.assertEqual(self.mock_client.upload_sessions_initiated, 1)
+
+        # 3. Remote folder pre-seeded file deduplication with alt=media readback
+        preseeded_data = b"preseeded remote file content on drive"
+        preseeded_file = Path(self.test_dir) / "preseeded_weights.pt"
+        preseeded_file.write_bytes(preseeded_data)
+
+        target_folder = self.store.resolve_target_folder_id("p_idem2", "r_idem2", "checkpoints")
+        self.mock_client.mock_files.append({
+            "id": "preseeded-drive-fid-888",
+            "name": "preseeded_weights.pt",
+            "parent": target_folder,
+            "size": len(preseeded_data),
+            "md5Checksum": hashlib.md5(preseeded_data).hexdigest(),
+            "content": preseeded_data,
+        })
+
+        stored3 = self.store.publish(
+            source=preseeded_file,
+            project_id="p_idem2",
+            run_id="r_idem2",
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+        self.assertEqual(stored3.remote_file_id, "preseeded-drive-fid-888")
+        self.assertEqual(stored3.sha256, compute_file_sha256(preseeded_file))
+        # No upload session was initiated because pre-seeded file was deduplicated via readback!
+        self.assertEqual(self.mock_client.upload_sessions_initiated, 1)
+
+    def test_checkpoint_revision_history_and_dual_retrieval(self):
+        """Revision persistence, dual retrieval by versioned/unversioned ID, and tampering detection."""
+        project_id = "proj_hist"
+        run_id = "run_hist"
+        file_path = Path(self.test_dir) / "model.pt"
+
+        # Step A: Publish checkpoints/model.pt with content A
+        data_a = b"EPOCH_1_WEIGHTS_REVISION_A"
+        file_path.write_bytes(data_a)
+        sha_a = compute_file_sha256(file_path)
+
+        rev_a = self.store.publish(
+            source=file_path,
+            project_id=project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+        self.assertEqual(rev_a.sha256, sha_a)
+        self.assertEqual(rev_a.size_bytes, len(data_a))
+        self.assertTrue(rev_a.artifact_id.endswith(f"@sha256_{sha_a.lower()}"))
+        self.assertIn("proj_hist/run_hist/checkpoints/model.pt", rev_a.artifact_id)
+
+        # Step B: Overwrite local checkpoints/model.pt with content B and publish again
+        data_b = b"EPOCH_2_WEIGHTS_REVISION_B_LARGER"
+        file_path.write_bytes(data_b)
+        sha_b = compute_file_sha256(file_path)
+
+        rev_b = self.store.publish(
+            source=file_path,
+            project_id=project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+        self.assertEqual(rev_b.sha256, sha_b)
+        self.assertEqual(rev_b.size_bytes, len(data_b))
+        self.assertTrue(rev_b.artifact_id.endswith(f"@sha256_{sha_b.lower()}"))
+
+        # Step C: Inspect PublicationManifest
+        manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+        self.assertTrue(manifest_path.exists())
+        manifest = PublicationManifest.load(manifest_path)
+        all_artifacts = manifest.list_artifacts()
+        all_ids = [a.artifact_id for a in all_artifacts]
+
+        # Both Revision A and Revision B exist in manifest
+        self.assertIn(rev_a.artifact_id, all_ids)
+        self.assertIn(rev_b.artifact_id, all_ids)
+
+        # Their artifact_ids are distinct
+        self.assertNotEqual(rev_a.artifact_id, rev_b.artifact_id)
+
+        # Their remote_file_ids are distinct
+        self.assertNotEqual(rev_a.remote_file_id, rev_b.remote_file_id)
+
+        # Their sha256 and size_bytes are preserved accurately
+        stored_a = manifest.get_artifact(rev_a.artifact_id)
+        self.assertIsNotNone(stored_a)
+        self.assertEqual(stored_a.sha256, sha_a)
+        self.assertEqual(stored_a.size_bytes, len(data_a))
+
+        stored_b = manifest.get_artifact(rev_b.artifact_id)
+        self.assertIsNotNone(stored_b)
+        self.assertEqual(stored_b.sha256, sha_b)
+        self.assertEqual(stored_b.size_bytes, len(data_b))
+
+        # Resolving unversioned ID via store.get_metadata returns Revision B (latest)
+        unversioned_id = f"{project_id}/{run_id}/checkpoints/model.pt"
+        meta_latest = self.store.get_metadata(unversioned_id)
+        self.assertIsNotNone(meta_latest)
+        self.assertEqual(meta_latest.artifact_id, rev_b.artifact_id)
+        self.assertEqual(meta_latest.sha256, sha_b)
+
+        # Step D: Retrieve Revision A explicitly by rev_a.artifact_id
+        dest_a = Path(self.test_dir) / "retrieved_rev_a.pt"
+        res_a = self.store.retrieve(rev_a.artifact_id, dest_a)
+        self.assertEqual(res_a, dest_a)
+        self.assertEqual(dest_a.read_bytes(), data_a)
+        self.assertEqual(compute_file_sha256(dest_a), sha_a)
+
+        # Step E: Retrieve Revision B explicitly by rev_b.artifact_id and via unversioned ID
+        dest_b = Path(self.test_dir) / "retrieved_rev_b.pt"
+        res_b = self.store.retrieve(rev_b.artifact_id, dest_b)
+        self.assertEqual(res_b, dest_b)
+        self.assertEqual(dest_b.read_bytes(), data_b)
+        self.assertEqual(compute_file_sha256(dest_b), sha_b)
+
+        dest_b_unversioned = Path(self.test_dir) / "retrieved_rev_b_unversioned.pt"
+        res_b_unv = self.store.retrieve(unversioned_id, dest_b_unversioned)
+        self.assertEqual(res_b_unv, dest_b_unversioned)
+        self.assertEqual(dest_b_unversioned.read_bytes(), data_b)
+        self.assertEqual(compute_file_sha256(dest_b_unversioned), sha_b)
+
+        # Step F: Attempt to retrieve rev_a when remote file on Drive is corrupted/tampered
+        self.mock_client.committed_files[rev_a.remote_file_id] = b"CORRUPTED_TAMPERED_BYTES_REVISION_A"
+        dest_tampered = Path(self.test_dir) / "retrieved_tampered.pt"
+        with self.assertRaises(ArtifactValidationError):
+            self.store.retrieve(rev_a.artifact_id, dest_tampered)
+        self.assertFalse(dest_tampered.exists(), "Destination file must not be left behind on integrity failure")
+
+    def test_in_flight_source_mutation_staging_safety(self):
+        """In-flight local file modification during upload does not corrupt staged upload bytes."""
+        project_id = "p_staging"
+        run_id = "r_staging"
+        file_path = Path(self.test_dir) / "in_flight_model.pt"
+        initial_data = b"INITIAL_CLEAN_WEIGHTS_SNAPSHOT" * 100
+        file_path.write_bytes(initial_data)
+        initial_sha = compute_file_sha256(file_path)
+
+        original_request = self.mock_client.request
+
+        # Mutate the source file on disk while the upload chunk is in flight
+        def mutating_request(method, url, headers=None, data=None, timeout=30.0):
+            if "session_id=upload-session" in url and method == "PUT":
+                # Overwrite local source file during upload
+                file_path.write_bytes(b"TRAINING_PROCESS_OVERWRITING_DURING_UPLOAD_IN_PLACE" * 100)
+            return original_request(method, url, headers=headers, data=data, timeout=timeout)
+
+        self.mock_client.request = mutating_request
+        stored = self.store.publish(
+            source=file_path,
+            project_id=project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+
+        # The uploaded file on Drive must match the initial clean snapshot, not the corrupted mutation!
+        self.assertEqual(stored.sha256, initial_sha)
+        self.assertEqual(self.mock_client.committed_files[stored.remote_file_id], initial_data)
+
+    def test_source_mutation_during_staging_raises_transfer_error(self):
+        """Mutation of source file during staging phase raises ArtifactTransferError."""
+        from colab_adapter.storage.google_drive import ArtifactTransferError
+
+        file_path = Path(self.test_dir) / "mutate_during_stage.pt"
+        file_path.write_bytes(b"DATA_BEFORE_MUTATION")
+
+        original_copy2 = shutil.copy2
+
+        def mutating_copy2(src, dst, *args, **kwargs):
+            original_copy2(src, dst, *args, **kwargs)
+            Path(dst).write_bytes(b"MUTATED_DURING_STAGING")
+
+        shutil.copy2 = mutating_copy2
+        try:
+            with self.assertRaises(ArtifactTransferError) as ctx:
+                self.store.publish(
+                    source=file_path,
+                    project_id="p_mut",
+                    run_id="r_mut",
+                )
+            self.assertIn("Source file mutated during staging", str(ctx.exception))
+        finally:
+            shutil.copy2 = original_copy2
 
 
 if __name__ == "__main__":
