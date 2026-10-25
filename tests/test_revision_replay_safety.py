@@ -605,9 +605,12 @@ class TestRevisionReplaySafety(unittest.TestCase):
         )
         self.store.journal.record_transfer(rec)
 
-        # Publishing should fail closed with DriveTransferError
-        with self.assertRaises(DriveTransferError):
+        # Publishing should fail closed with a typed error (journal points at a remote file that
+        # no longer exists -> ArtifactNotFoundError; transient lookup faults -> DriveTransferError)
+        with self.assertRaises((DriveTransferError, ArtifactNotFoundError)):
             self.store.publish(src_file, self.project_id, self.run_id, ArtifactType.CHECKPOINT.value)
+        manifest = self.store._load_or_recover_manifest(self.project_id, self.run_id)
+        self.assertTrue(manifest is None or not manifest.artifacts)
 
 
 if __name__ == "__main__":
