@@ -44,3 +44,12 @@ These controls are implemented in `colab_adapter/storage/` and are verified only
 - **Monitor.** The monitor remains read-only. Its selectors are validated and its listings skip symlinks and internal directories. See `docs/MONITORING_DASHBOARD_V2.md` section 8.
 
 Limit: the Drive store has no compare-and-swap. Its guarantees hold only when every writer to the folder uses this host's locks (see `docs/GOOGLE_DRIVE_ARTIFACTS.md`, "Drive Store Hardening", section 5).
+
+
+## OAuth token file writes (PR #24 follow-up, offline-verified)
+
+- `DriveCredentials.save()` and the workspace broker's token file save never write secret bytes into an existing file. They create a fresh temp file in the same directory (`O_EXCL|O_NOFOLLOW`, mode `0600`, `fchmod(0600)` before the first byte), fsync it, and `os.replace` it over the target. A pre-existing `0644`/`0666`/`0777` token file therefore ends up `0600`, and a failed write leaves the previous file intact with no temp file left behind.
+- A symlink at the Drive credentials path is *replaced* by a regular `0600` file (never written through). If you deliberately symlinked that file elsewhere, the link is replaced after the next token refresh. The broker resolves its operator-configured `tokens_file` once at construction, so a symlinked path means "use that target" for both load and save, and the target ends up `0600`.
+- Parent directories are created `0700` only when the call creates them; existing directories are never re-chmodded.
+- Limitation: a process killed (`SIGKILL`) between the temp write and the rename can leave a `0600` `.<name>.tmp.<pid>.<hex>` file holding tokens in the token directory. Nothing sweeps it; delete such files manually. A failed save after a successful token refresh fails closed (the refresh raises `DriveAuthenticationError`) rather than continuing with an unpersisted token.
+- POSIX only (`fchmod`, `O_NOFOLLOW`). Parent-chain symlinks are still resolved; keep the token directory private to the service user.

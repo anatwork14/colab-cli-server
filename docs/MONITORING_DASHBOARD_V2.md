@@ -353,3 +353,8 @@ Implemented in `colab_adapter/monitor/server.py` and `colab_adapter/telemetry.py
 - Hashing is repeated on every request, up to 8 MiB per file. This is a known cost, not a cache.
 - The SSE stream (`/api/v1/events/stream`) is unfiltered when `?project=` is omitted, so it carries events from every project. Clients that need isolation must pass `?project=`.
 - No live Colab or Drive data has been validated through this path.
+
+
+### Latest-revision state is never guessed (PR #24 follow-up)
+
+`is_latest` is derived only from the manifest's `latest_by_path`. When the head is missing, names no listed revision, or names more than one, every revision of that path gets `is_latest: null` and `latest_state: "unknown"` (`"known"` when a head matched); the dashboard shows `UNKNOWN`. The run list sets `latest_checkpoint_name`/`latest_checkpoint_sha256` only from a revision whose latest flag is true, otherwise `null` with `latest_checkpoint_state: "unknown"`. Remote `is_latest` flags carried inside manifest entries are not authoritative for display. Run counts (`/runs`, `/summary`) are computed after legacy keyless phantom entries are dropped, so they agree for event-backed runs; runs found only on disk (no telemetry) are listed by `/runs` but not counted in `/summary.total_runs`.

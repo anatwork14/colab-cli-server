@@ -243,7 +243,7 @@ Scope: branch `fix/v2-postmerge-hardening-23` (PR #24). The evidence below is of
 **Offline test evidence**
 
 - Test command: `python3 -m unittest discover -s tests -v`
-- Result (Python 3.8.10): 594 tests run, 593 passed, 1 skipped, 0 failed. Result (Python 3.12.14): 594 tests run, 594 passed, 0 skipped, 0 failed. Command: `python3 -m unittest discover -s tests -p "test_*.py"`. Baseline before PR #24 hardening: 381 tests (1 skipped).
+- Result (Python 3.8.10): 619 tests run, 618 passed, 1 skipped, 0 failed. Result (Python 3.12.14): see CI and the final report for the post-follow-up count; before the follow-up it was 594 passed, 0 skipped, 0 failed. Command: `python3 -m unittest discover -s tests -p "test_*.py"`. Baseline before PR #24 hardening: 381 tests (1 skipped).
 - Python versions: 3.8.10 and 3.12.14 executed. Python 3.13 was not available on the test host and was not run.
 - Browser test (`tests/test_browser_xss_and_cross_process_qa.py`, requires `COLAB_REQUIRE_BROWSER_TESTS=1`): real Chromium was not available on the test host; only the portable structural fallback ran. The real-browser job was not run locally.
 
@@ -264,7 +264,7 @@ Mock support changed in `tests/drive_api_mock.py`.
 
 **Evidence status**
 
-- Offline mock tests: 594 (Python 3.8 and 3.12), see above.
+- Offline mock tests: 619 on Python 3.8.10 after the OAuth-file and monitor follow-ups.
 - Live Google Drive: not run. Live validation requires explicit owner approval.
 - Live Colab: not run. Live validation requires explicit owner approval.
 - Live OAuth: not run. Live validation requires explicit owner approval.

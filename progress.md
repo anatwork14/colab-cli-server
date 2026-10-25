@@ -65,7 +65,7 @@ For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial,
   - **Input validation** (`docs/ARCHITECTURE_V2.md` section 15, `docs/SECURITY.md`): ASCII ids, NFC Unicode file names, validation before side effects, hashed staging names, Drive read-path validation, and project-name validation at manifest load.
   - **Project-scoped monitoring** (`docs/MONITORING_DASHBOARD_V2.md` section 8): RunKey `(project_id, run_id)`, `?project=` selector, HTTP 409 `ambiguous_run`, filtered telemetry, symlink skipping, `.locks` excluded, account-wide counters labelled, conservative `is_runtime_active`.
   - **Drive rate limits** (`docs/GOOGLE_DRIVE_ARTIFACTS.md` section 7): 403 reasons are classified as quota, rate or auth. `Retry-After` is honoured as seconds or HTTP-date, capped at 60 s. `dailyLimitExceeded` is treated as quota and is not retried.
-  - **Offline test evidence:** 594 tests on Python 3.8.10 (593 passed, 1 skipped) and 594 on Python 3.12.14 (all passed); Python 3.13 and real Chromium were not run (not available on the host). See `docs/EXPECTED_RESULTS_V2.md` section 11.
+  - **Offline test evidence:** 619 tests on Python 3.8.10 (618 passed, 1 skipped) after the follow-ups; 594 passed on Python 3.12.14 before them (CI covers 3.8/3.12/3.13); Python 3.13 and real Chromium were not run (not available on the host). See `docs/EXPECTED_RESULTS_V2.md` section 11.
   - **Known limitations** (`docs/EXPECTED_RESULTS_V2.md` section 11): per-request hashing up to 8 MiB in the monitor, unfiltered SSE without `?project=`, no live Drive or Colab validation, Python 3.13 and real Chromium not run on this host, rollback not implemented.
   - **ACTUAL LIVE VM USAGE: NONE** (documentation only; no runtime, Drive or OAuth call was made).
 - **2026-10-25 — Compact Schema v2, 124-Byte Drive Property Limits & Replay Safety (branch `work/25-e`):**
@@ -315,3 +315,5 @@ For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial,
 - [Agent implementation contract](docs/AGENT_IMPLEMENTATION_V2.md)
 - [Secure training / compute monitor specification](docs/MONITORING_DASHBOARD_V2.md)
 - [Original adapter](docs/ADAPTER.md)
+
+- **2026-10-25 — PR #24 follow-up (P1 token file permissions, P2 monitor latest state and counts):** `DriveCredentials.save()` and the broker token file now use an atomic `0600` temp-file replace (the original `O_CREAT` mode only applied on creation, so an existing `0644` file received new tokens). Monitor `is_latest` is derived only from `latest_by_path` (otherwise `unknown`); phantom legacy run keys are dropped before active-run and summary counts. Offline tests only; no live Colab, Drive or OAuth; not merged.
