@@ -71,6 +71,9 @@ class MockDriveHttpClient:
         self.fail_download_network_error = False
         self.corrupt_download_bytes: Optional[bytes] = None
         self.truncate_download_bytes_to: Optional[int] = None
+        self.fail_next_n_patches: int = 0
+        self.patch_status_code: int = 503
+        self.abort_before_promote_patch: bool = False
 
     def _get_session_buffer(self, url: str) -> Optional[bytearray]:
         if url in self.session_buffers:
@@ -296,7 +299,7 @@ class MockDriveHttpClient:
                 md5_hex = hashlib.md5(committed).hexdigest()
                 fname = self.session_to_filename.get(url, "uploaded_file")
                 fparent = self.session_to_parent.get(url, None)
-                fapp_props = self.session_to_app_props.get(url, {})
+                fapp_props = dict(self.session_to_app_props.get(url, {}))
                 self.mock_files.append({
                     "id": file_id,
                     "name": fname,
@@ -378,6 +381,59 @@ class MockDriveHttpClient:
                         "appProperties": fprops,
                     }
                     return 200, {"content-type": "application/json"}, json.dumps(resp).encode("utf-8")
+
+        # 7. File patch (PATCH /drive/v3/files/{file_id})
+        if re.search(r"drive/v3/files/[^/?]+", url) and method == "PATCH":
+            m_fid = re.search(r"drive/v3/files/([^/?]+)", url)
+            if not m_fid:
+                return 404, {}, b'{"error": "Not Found"}'
+            fid = m_fid.group(1)
+
+            if self.fail_next_n_patches > 0:
+                self.fail_next_n_patches -= 1
+                return self.patch_status_code, {}, b'{"error": {"message": "Simulated PATCH failure"}}'
+
+            patch_data = json.loads(data.decode("utf-8")) if data else {}
+            new_app_props = patch_data.get("appProperties")
+
+            if self.abort_before_promote_patch and new_app_props and new_app_props.get("is_latest") == "true":
+                raise ConnectionResetError("Simulated crash before promotion PATCH")
+
+            found_file = None
+            for mf in self.mock_files:
+                if mf.get("id") == fid:
+                    found_file = mf
+                    break
+
+            if found_file is None:
+                return 404, {}, b'{"error": "Not Found"}'
+
+            if "appProperties" not in found_file or not isinstance(found_file["appProperties"], dict):
+                found_file["appProperties"] = {}
+
+            if new_app_props and isinstance(new_app_props, dict):
+                for k, v in new_app_props.items():
+                    if v is None:
+                        found_file["appProperties"].pop(k, None)
+                    else:
+                        found_file["appProperties"][k] = v
+
+            c_data = found_file.get("content")
+            if c_data is not None:
+                sz = str(len(c_data))
+                md5 = hashlib.md5(c_data).hexdigest()
+            else:
+                sz = str(found_file.get("size", 0))
+                md5 = found_file.get("md5Checksum", "")
+
+            resp = {
+                "id": fid,
+                "name": found_file.get("name", "uploaded_file"),
+                "size": sz,
+                "md5Checksum": md5,
+                "appProperties": dict(found_file["appProperties"]),
+            }
+            return 200, {"content-type": "application/json"}, json.dumps(resp).encode("utf-8")
 
         return 404, {}, b'{"error": "Not Found"}'
 
@@ -664,6 +720,8 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
         def missing_md5_success_request(method, url, headers=None, data=None, timeout=30.0):
             status, resp_headers, body = original_request(method, url, headers=headers, data=data, timeout=timeout)
             if "session_id=upload-session" in url and status == 200:
+                if self.mock_client.mock_files:
+                    self.mock_client.mock_files[-1]["id"] = "file-no-md5"
                 resp = {"id": "file-no-md5", "name": "uploaded_file", "size": str(len(payload_data))}
                 return 200, resp_headers, json.dumps(resp).encode("utf-8")
             if "drive/v3/files/file-no-md5" in url and method == "GET" and "alt=media" not in url:
@@ -1571,6 +1629,209 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
             self.assertFalse(self.store._is_trusted_staged_file(fake_file))
         finally:
             os.umask(old_umask)
+
+    def test_14_remote_latest_revision_coordination_on_success(self):
+        """14. Remote latest revision coordination demotes earlier revisions and promotes latest."""
+        project_id = "proj_m14"
+        run_id = "run_m14"
+        file_path = Path(self.test_dir) / "model.pt"
+
+        # Publish revision A
+        data_a = b"REVISION_A_WEIGHTS_111"
+        file_path.write_bytes(data_a)
+        art_a = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Publish revision B
+        data_b = b"REVISION_B_WEIGHTS_222_LONGER"
+        file_path.write_bytes(data_b)
+        art_b = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Publish revision C
+        data_c = b"REVISION_C_WEIGHTS_333_LATEST"
+        file_path.write_bytes(data_c)
+        art_c = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        self.assertNotEqual(art_a.remote_file_id, art_b.remote_file_id)
+        self.assertNotEqual(art_b.remote_file_id, art_c.remote_file_id)
+
+        # Inspect mock_client.mock_files
+        mf_map = {f["id"]: f for f in self.mock_client.mock_files if f.get("id")}
+        self.assertIn(art_a.remote_file_id, mf_map)
+        self.assertIn(art_b.remote_file_id, mf_map)
+        self.assertIn(art_c.remote_file_id, mf_map)
+
+        mf_a = mf_map[art_a.remote_file_id]
+        mf_b = mf_map[art_b.remote_file_id]
+        mf_c = mf_map[art_c.remote_file_id]
+
+        # Revision C is latest
+        self.assertEqual(mf_c["appProperties"].get("is_latest"), "true")
+        self.assertNotIn("superseded_by", mf_c["appProperties"])
+
+        # Revisions A and B have is_latest == "false" and correct superseded_by
+        self.assertEqual(mf_a["appProperties"].get("is_latest"), "false")
+        self.assertEqual(mf_a["appProperties"].get("superseded_by"), art_b.artifact_id)
+
+        self.assertEqual(mf_b["appProperties"].get("is_latest"), "false")
+        self.assertEqual(mf_b["appProperties"].get("superseded_by"), art_c.artifact_id)
+
+        # Verify ONLY revision C has is_latest == "true" among all model.pt files in the target folder
+        target_folder_id = self.store.resolve_target_folder_id(project_id, run_id, "checkpoints")
+        model_files = [
+            f for f in self.mock_client.mock_files
+            if f.get("name") == "model.pt" and f.get("parent") == target_folder_id
+        ]
+        latest_files = [f for f in model_files if f.get("appProperties", {}).get("is_latest") == "true"]
+        self.assertEqual(len(latest_files), 1)
+        self.assertEqual(latest_files[0]["id"], art_c.remote_file_id)
+
+    def test_15_unversioned_latest_recovery_from_remote_after_manifest_and_journal_loss(self):
+        """15. Remote unversioned latest recovery succeeds when local manifest and journal are completely lost."""
+        project_id = "proj_m15"
+        run_id = "run_m15"
+        file_path = Path(self.test_dir) / "model.pt"
+
+        data_a = b"REV_A_DATA_FOR_LOSS_TEST"
+        file_path.write_bytes(data_a)
+        art_a = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        data_b = b"REV_B_DATA_FOR_LOSS_TEST"
+        file_path.write_bytes(data_b)
+        art_b = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        data_c = b"REV_C_DATA_FOR_LOSS_TEST_FINAL"
+        file_path.write_bytes(data_c)
+        art_c = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Delete local manifest.json, manifest.json.bak, and journal
+        manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+        bak_path = manifest_path.with_suffix(".json.bak")
+        manifest_path.unlink(missing_ok=True)
+        bak_path.unlink(missing_ok=True)
+
+        if self.store.journal.path.exists():
+            self.store.journal.path.unlink()
+        self.store.journal.path.with_suffix(".json.bak").unlink(missing_ok=True)
+
+        fresh_store = GoogleDriveArtifactStore(
+            credentials=self.creds,
+            credentials_file=self.credentials_file,
+            local_staging_dir=self.staging_dir,
+            http_client=self.mock_client,
+            chunk_size=1024 * 1024,
+            initial_backoff_sec=0.01,
+        )
+
+        # Unversioned retrieval returns exact bytes of C
+        dest_unv = Path(self.test_dir) / "recovered_unv_c.pt"
+        fresh_store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_unv)
+        self.assertEqual(dest_unv.read_bytes(), data_c)
+
+        # Historical retrieval by @sha256_<digest> returns each exact historical revision
+        dest_a = Path(self.test_dir) / "recovered_hist_a.pt"
+        fresh_store.retrieve(art_a.artifact_id, dest_a)
+        self.assertEqual(dest_a.read_bytes(), data_a)
+
+        dest_b = Path(self.test_dir) / "recovered_hist_b.pt"
+        fresh_store.retrieve(art_b.artifact_id, dest_b)
+        self.assertEqual(dest_b.read_bytes(), data_b)
+
+        dest_c = Path(self.test_dir) / "recovered_hist_c.pt"
+        fresh_store.retrieve(art_c.artifact_id, dest_c)
+        self.assertEqual(dest_c.read_bytes(), data_c)
+
+    def test_16_transient_patch_failure_retries_and_succeeds(self):
+        """16. Transient HTTP 503 on PATCH during revision coordination retries and succeeds."""
+        project_id = "proj_m16"
+        run_id = "run_m16"
+        file_path = Path(self.test_dir) / "model.pt"
+        data = b"TRANSIENT_PATCH_DATA_RETRY"
+        file_path.write_bytes(data)
+
+        # Simulate 1 transient PATCH failure
+        self.mock_client.fail_next_n_patches = 1
+        stored = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        self.assertEqual(self.mock_client.fail_next_n_patches, 0)
+        self.assertIsNotNone(stored.remote_file_id)
+
+        mf = next(f for f in self.mock_client.mock_files if f.get("id") == stored.remote_file_id)
+        self.assertEqual(mf["appProperties"].get("is_latest"), "true")
+
+        dest = Path(self.test_dir) / "dest_m16.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest)
+        self.assertEqual(dest.read_bytes(), data)
+
+    def test_17_crash_before_promote_patch_fails_closed_and_recovers_on_retry(self):
+        """17. Crash before promotion PATCH marks file is_latest=false, unversioned retrieve fails closed, and retry reconciles."""
+        project_id = "proj_m17"
+        run_id = "run_m17"
+        file_path = Path(self.test_dir) / "model.pt"
+
+        # Publish revision A successfully
+        data_a = b"DATA_REVISION_A_INITIAL"
+        file_path.write_bytes(data_a)
+        art_a = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Attempt to publish revision B, but crash before promotion PATCH
+        data_b = b"DATA_REVISION_B_INTERRUPTED_BEFORE_PROMOTE"
+        file_path.write_bytes(data_b)
+        self.mock_client.abort_before_promote_patch = True
+
+        with self.assertRaises(Exception):
+            self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Check remote files before retry:
+        # Revision B was uploaded but never promoted -> is_latest == "false"
+        target_folder_id = self.store.resolve_target_folder_id(project_id, run_id, "checkpoints")
+        model_files = [
+            f for f in self.mock_client.mock_files
+            if f.get("name") == "model.pt" and f.get("parent") == target_folder_id
+        ]
+        self.assertEqual(len(model_files), 2)
+        mf_b = next(f for f in model_files if f.get("id") != art_a.remote_file_id)
+        self.assertEqual(mf_b["appProperties"].get("is_latest"), "false")
+
+        # When 0 remote files have is_latest == "true" (A was demoted, B never promoted):
+        # Unversioned retrieve without local manifest or journal must raise DriveIntegrityError
+        manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+        manifest_path.unlink(missing_ok=True)
+        manifest_path.with_suffix(".json.bak").unlink(missing_ok=True)
+        self.store._manifest_cache.clear()
+        if self.store.journal.path.exists():
+            self.store.journal.path.unlink()
+        self.store.journal.path.with_suffix(".json.bak").unlink(missing_ok=True)
+
+        dest_fail_0 = Path(self.test_dir) / "dest_fail_0.pt"
+        with self.assertRaises(DriveIntegrityError) as ctx_0:
+            self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_fail_0)
+        self.assertIn("Ambiguous unversioned Drive recovery", str(ctx_0.exception))
+        self.assertFalse(dest_fail_0.exists())
+
+        # When 2 remote files have is_latest == "true":
+        # Unversioned retrieve must also fail closed with DriveIntegrityError
+        mf_a = next(f for f in model_files if f.get("id") == art_a.remote_file_id)
+        mf_a["appProperties"]["is_latest"] = "true"
+        mf_b["appProperties"]["is_latest"] = "true"
+
+        dest_fail_2 = Path(self.test_dir) / "dest_fail_2.pt"
+        with self.assertRaises(DriveIntegrityError) as ctx_2:
+            self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_fail_2)
+        self.assertIn("Ambiguous unversioned Drive recovery", str(ctx_2.exception))
+        self.assertFalse(dest_fail_2.exists())
+
+        # Reset abort_before_promote_patch and retry publishing revision B
+        self.mock_client.abort_before_promote_patch = False
+        art_b = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Remote properties are now reconciled: only B is latest
+        self.assertEqual(mf_b["appProperties"].get("is_latest"), "true")
+        self.assertEqual(mf_a["appProperties"].get("is_latest"), "false")
+
+        # Unversioned retrieve now succeeds and recovers revision B
+        dest_success = Path(self.test_dir) / "dest_recovered_b.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_success)
+        self.assertEqual(dest_success.read_bytes(), data_b)
 
 
 if __name__ == "__main__":
