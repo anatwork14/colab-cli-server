@@ -763,6 +763,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     const SVG_NS = 'http://www.w3.org/2000/svg';
 
     function getHeaders() {
+      if (!token) {
+        token = sessionStorage.getItem('colab_monitor_token') || '';
+      }
       return token ? { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' } : { 'Accept': 'application/json' };
     }
 
@@ -822,6 +825,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     function updateAuthButtonState() {
+      if (!token) {
+        token = sessionStorage.getItem('colab_monitor_token') || '';
+      }
       const btn = document.getElementById('btn-set-token') || document.getElementById('btn-auth');
       if (!btn) return;
       if (token) {

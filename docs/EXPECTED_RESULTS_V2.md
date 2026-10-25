@@ -120,4 +120,7 @@ For each claim, add a result row to progress.md:
 | **Q44** | Same-name/same-size MD5 collision & readback | Rejects stale files with mismatched MD5; verifies content via `alt=media` readback if MD5 omitted | Confirmed in `test_google_drive_store.py` & `test_adversarial_security_and_fault_injection.py` | PASS |
 | **Q45** | Seeded secret non-disclosure audit | 0 seeded tokens/secrets/session URLs leaked across tracker, journal, collector, artifacts, or API | Confirmed in `test_adversarial_security_and_fault_injection.py` | PASS |
 | **Q46** | 13-stage end-to-end V2 + Drive pipeline | Full offline pipeline from manifest/plan through sync, telemetry, Drive publish, teardown & attach | Confirmed in `test_project_e2e.py` | PASS |
+| **Q47** | Stored DOM XSS & inline handler elimination | 0 `.innerHTML` assignments, 0 inline handlers (`onclick`, `oninput`, `onchange`), safe `textContent` DOM nodes | Confirmed in `test_dashboard_ui_integration.py` & `test_browser_xss_and_cross_process_qa.py` | PASS |
+| **Q48** | Per-response cryptographic CSP nonce | `script-src 'self' 'nonce-...'` without `'unsafe-inline'`; blocks un-nonced script in headless Chromium | Confirmed in `test_monitor_backend.py` & `test_browser_xss_and_cross_process_qa.py` | PASS |
+| **Q49** | Cross-process Drive publication atomicity | 2 simultaneous OS processes (`subprocess.Popen`) initiate exactly 1 Drive upload session and 1 remote object | Confirmed in `test_upload_worker.py`, `test_google_drive_store.py` & `test_browser_xss_and_cross_process_qa.py` | PASS |
 

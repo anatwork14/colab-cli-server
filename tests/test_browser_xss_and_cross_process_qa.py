@@ -103,121 +103,6 @@ def resolve_browser_test_binaries() -> Tuple[Optional[str], Optional[str], Optio
     return node_bin, pw_path, chrome_bin
 
 
-def get_hardened_test_dashboard_html() -> str:
-    """Return dashboard HTML with defensive escaping and inline-handler hardening.
-
-    If DASHBOARD_HTML in ui.py has already removed inline handlers and added escapeHtml,
-    uses it directly. Otherwise applies transformations to ensure zero XSS and zero syntax errors.
-    """
-    html = DASHBOARD_HTML
-    if "escapeHtml" in html and 'onclick="selectRun(\'' not in html:
-        return html
-
-    # 1. Fix unescaped Python newline in JS logsList.join('\n')
-    html = html.replace("logsList.join('\n')", "logsList.join('\\n')")
-
-    # 2. Ensure getHeaders checks sessionStorage dynamically
-    old_get_headers = (
-        "function getHeaders() {\n"
-        "      return token ? { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' } : { 'Accept': 'application/json' };\n"
-        "    }"
-    )
-    new_get_headers = (
-        "function getHeaders() {\n"
-        "      const currentToken = token || sessionStorage.getItem('colab_monitor_token') || '';\n"
-        "      return currentToken ? { 'Authorization': 'Bearer ' + currentToken, 'Accept': 'application/json' } : { 'Accept': 'application/json' };\n"
-        "    }"
-    )
-    if old_get_headers in html:
-        html = html.replace(old_get_headers, new_get_headers)
-
-    # 3. Inject escapeHtml helper
-    escape_fn = """
-    function escapeHtml(str) {
-      if (str == null) return "";
-      return String(str)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/\"/g, "&quot;")
-        .replace(/\\'/g, "&#39;");
-    }
-    """
-    if "function escapeHtml" not in html:
-        html = html.replace("function formatBytes(bytes) {", escape_fn + "\n    function formatBytes(bytes) {")
-
-    # 4. Add sha-badge class and testing data-attributes
-    html = html.replace('class="sha-tag"', 'class="sha-tag sha-badge"')
-    html = html.replace('id="inspector-content"', 'id="inspector-content" data-panel="inspector-panel"')
-    html = html.replace('id="log-error-banner"', 'id="log-error-banner" data-banner="error-banner"')
-    html = html.replace('id="log-console"', 'id="log-console" data-container="logs-container"')
-
-    # 5. Sanitize error banner interpolation
-    old_err = "const msgs = errorEvents.map(e => e.details?.message || e.details?.error || JSON.stringify(e.details || {})).join('<br>');"
-    new_err = "const msgs = errorEvents.map(e => escapeHtml(e.details?.message || e.details?.error || JSON.stringify(e.details || {}))).join('<br>');"
-    html = html.replace(old_err, new_err)
-
-    # 6. Sanitize renderSha256
-    old_sha = 'return `<span class="sha-tag" title="Click to copy SHA-256: ${hash}" onclick="navigator.clipboard.writeText(\'${hash}\')">${short} 📋</span>`;'
-    new_sha = 'return `<span class="sha-tag sha-badge" title="Click to copy SHA-256: ${escapeHtml(hash)}" data-sha="${escapeHtml(hash)}">${escapeHtml(short)} 📋</span>`;'
-    html = html.replace(old_sha, new_sha)
-
-    # 7. Safe runs table row interpolation and removal of inline onclick
-    pattern_run_row = re.compile(
-        r'<tr class="clickable \$\{isSelected\}" data-run-id="\$\{r\.run_id\}" onclick="selectRun\(\'\$\{r\.run_id\}\'\)">.*?</tr>',
-        re.DOTALL,
-    )
-    safe_run_row = (
-        '<tr class="clickable ${isSelected}" data-run-id="${escapeHtml(r.run_id)}">\n'
-        '            <td class="mono"><strong>${escapeHtml(r.run_id)}</strong></td>\n'
-        '            <td class="mono">${escapeHtml(r.project_id || \'-\')}</td>\n'
-        '            <td><span class="badge ${statusClass}">${s}</span></td>\n'
-        '            <td><span class="badge ${rtClass}">${rtText}</span></td>\n'
-        '            <td class="mono">${epStep}</td>\n'
-        '            <td class="mono" style="font-size: 0.78rem;">${metricsStr}</td>\n'
-        '            <td>${chkCount > 0 ? chkCount + (r.latest_checkpoint_name ? \' (\' + escapeHtml(r.latest_checkpoint_name) + \')\' : \'\') : \'0\'}</td>\n'
-        '            <td><span class="badge ${driveClass}">${dStatus}</span></td>\n'
-        '            <td>${srcBadge}</td>\n'
-        '          </tr>'
-    )
-    html = pattern_run_row.sub(safe_run_row, html)
-
-    # 8. Safe artifacts table row interpolation
-    pattern_art_row = re.compile(
-        r'<td class="mono"><strong>\$\{a\.artifact_id \|\| \'-\'\}</strong></td>.*?<td class="mono">\$\{a\.remote_file_id \|\| \'-\'\}</td>',
-        re.DOTALL,
-    )
-    safe_art_row = (
-        '<td class="mono"><strong>${escapeHtml(a.artifact_id || \'-\')}</strong></td>\n'
-        '            <td><span class="badge badge-info">${escapeHtml(a.artifact_type || \'artifact\')}</span></td>\n'
-        '            <td>${formatBytes(a.size_bytes)}</td>\n'
-        '            <td>${renderSha256(a.sha256)}</td>\n'
-        '            <td>${provBadge}</td>\n'
-        '            <td class="mono">${escapeHtml(a.remote_file_id || \'-\')}</td>'
-    )
-    html = pattern_art_row.sub(safe_art_row, html)
-
-    # 9. Global event delegation for clicks on runs-tbody and sha-badge
-    delegation = """
-    document.body.addEventListener("click", (e) => {
-      const tr = e.target.closest("tr[data-run-id]");
-      if (tr && tr.closest("#runs-tbody")) {
-        const runId = tr.getAttribute("data-run-id");
-        if (runId) selectRun(runId);
-      }
-      const sha = e.target.closest(".sha-badge, .sha-tag");
-      if (sha) {
-        const h = sha.getAttribute("data-sha");
-        if (h && navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(h).catch(() => {});
-        }
-      }
-    });
-    """
-    html = html.replace("</script>", delegation + "\n  </script>")
-    return html
-
-
 # =============================================================================
 # Byte-Accurate Loopback Google Drive v3 API Server
 # =============================================================================
@@ -376,38 +261,23 @@ class LoopbackDriveHandler(http.server.BaseHTTPRequestHandler):
                 })
 
                 if end_byte + 1 >= total:
-                    # Final chunk: commit file
+                    # Final chunk: commit file (no server-side deduplication so duplicate client uploads are caught!)
                     full_buf = bytes(session["buffer"][:total])
                     md5_hash = hashlib.md5(full_buf).hexdigest()
                     sha256_hash = hashlib.sha256(full_buf).hexdigest()
 
-                    # Deduplicate if exact same file already committed
-                    existing_id = None
-                    for fid, meta in server.committed_checkpoints.items():
-                        if (
-                            meta.get("name") == filename
-                            and meta.get("md5Checksum") == md5_hash
-                            and int(meta.get("size")) == total
-                        ):
-                            existing_id = fid
-                            break
-
-                    if existing_id:
-                        fid = existing_id
-                        file_meta = server.committed_checkpoints[fid]
-                    else:
-                        server.file_counter += 1
-                        fid = f"drive-file-{server.file_counter}"
-                        file_meta = {
-                            "id": fid,
-                            "name": filename,
-                            "size": str(total),
-                            "md5Checksum": md5_hash,
-                            "sha256": sha256_hash,
-                            "parents": [folder_id],
-                        }
-                        server.committed_checkpoints[fid] = file_meta
-                        server.committed_bytes[fid] = full_buf
+                    server.file_counter += 1
+                    fid = f"drive-file-{server.file_counter}"
+                    file_meta = {
+                        "id": fid,
+                        "name": filename,
+                        "size": str(total),
+                        "md5Checksum": md5_hash,
+                        "sha256": sha256_hash,
+                        "parents": [folder_id],
+                    }
+                    server.committed_checkpoints[fid] = file_meta
+                    server.committed_bytes[fid] = full_buf
 
                     session["file_id"] = fid
                     session["committed"] = True
@@ -631,8 +501,7 @@ class TestRealHeadlessBrowserDashboardSecurity(unittest.TestCase):
         m_adv.save(run_adv_dir / "manifest.json")
 
     def _start_server(self) -> None:
-        """Start real loopback MonitorServer."""
-        dashboard_content = get_hardened_test_dashboard_html()
+        """Start real loopback MonitorServer serving production render_dashboard_html with CSP nonces."""
         self.server = start_monitor_server(
             host="127.0.0.1",
             port=0,
@@ -642,7 +511,6 @@ class TestRealHeadlessBrowserDashboardSecurity(unittest.TestCase):
             auth_token=self.api_token,
             allow_external=False,
             artifacts_dir=self.artifacts_dir,
-            dashboard_html=dashboard_content,
         )
         self.port = self.server.server_port
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -734,15 +602,22 @@ class TestRealHeadlessBrowserDashboardSecurity(unittest.TestCase):
 
             const injectedImg = document.querySelectorAll("#runs-table img, #artifacts-table img, #log-error-banner img, #error-banner img");
             const injectedSvg = document.querySelectorAll("#runs-table svg:not([data-icon]):not(.svg-icon), #artifacts-table svg, #log-error-banner svg, #error-banner svg");
+            const normalCspViolations = [...(window.__csp_violations || [])];
+
+            // Also verify that CSP actively blocks an un-nonced inline <script> injection
+            const rogueScript = document.createElement("script");
+            rogueScript.textContent = "window.__xss_csp = true;";
+            document.body.appendChild(rogueScript);
 
             return {{
               xssValue: window.__xss,
+              xssCspValue: window.__xss_csp,
               injectedImgCount: injectedImg.length,
               injectedSvgCount: injectedSvg.length,
               runsTableText: runsTable ? runsTable.textContent : "",
               errorBannerText: errorBanner ? errorBanner.textContent : "",
               artifactsTableText: artifactsTable ? artifactsTable.textContent : "",
-              cspViolations: window.__csp_violations || []
+              cspViolations: normalCspViolations
             }};
           }});
 
@@ -769,8 +644,10 @@ class TestRealHeadlessBrowserDashboardSecurity(unittest.TestCase):
         self.assertIsNotNone(m_res, f"Could not find TEST_RESULT in output: {res.stdout}\n{res.stderr}")
         data = json.loads(m_res.group(1))
 
-        # 1. Zero XSS execution
+        # 1. Zero XSS execution & CSP enforcement
         self.assertIsNone(data.get("xssValue"), "Adversarial script executed in browser context (window.__xss was defined)!")
+        self.assertIsNone(data.get("xssCspValue"), "CSP failed to block un-nonced inline script injection!")
+        self.assertEqual(len(data.get("cspViolations", [])), 0, f"CSP violations during normal UI operation: {data.get('cspViolations')}")
 
         # 2. Zero unhandled page errors
         self.assertEqual(len(data.get("pageErrors", [])), 0, f"Unhandled JavaScript errors observed: {data.get('pageErrors')}")
@@ -1191,7 +1068,12 @@ class TestCrossProcessDrivePublication(unittest.TestCase):
         self.assertEqual(res2["sha256"], self.expected_sha256)
         self.assertEqual(res1["size_bytes"], 512 * 1024)
 
-        # 3. Loopback Drive server recorded at most 1 committed checkpoint file
+        # 3. Loopback Drive server recorded exactly 1 upload session and 1 committed checkpoint file
+        self.assertEqual(
+            self.drive_server.session_counter,
+            1,
+            f"Expected exactly 1 resumable upload session, got {self.drive_server.session_counter}",
+        )
         self.assertEqual(
             len(self.drive_server.committed_checkpoints),
             1,
@@ -1273,6 +1155,7 @@ class TestCrossProcessDrivePublication(unittest.TestCase):
         self.assertEqual(res1["status"], TransferStatus.PUBLISHED.value)
         self.assertEqual(res2["status"], TransferStatus.PUBLISHED.value)
         self.assertEqual(res1["remote_file_id"], res2["remote_file_id"])
+        self.assertEqual(self.drive_server.session_counter, 1)
         self.assertEqual(len(self.drive_server.committed_checkpoints), 1)
 
     def test_process_abort_mid_upload_and_resumable_recovery(self) -> None:

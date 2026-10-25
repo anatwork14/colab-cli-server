@@ -260,27 +260,29 @@ if _EMBEDDED_HTML_DASHBOARD is None:
       try {
         const res = await fetch('/api/v1/summary', { headers: getHeaders() });
         if (res.status === 401) {
-          document.getElementById('header-meta').innerText = '401 Unauthorized: Authorization token required.';
+          document.getElementById('header-meta').textContent = '401 Unauthorized: Authorization token required.';
           const badge = document.getElementById('health-badge');
-          badge.innerText = 'AUTH REQUIRED';
+          badge.textContent = 'AUTH REQUIRED';
           badge.className = 'badge stale';
           badge.style.cursor = 'pointer';
-          badge.onclick = promptForToken;
+          badge.addEventListener('click', promptForToken, { once: true });
           return;
         }
         const data = await res.json();
-        document.getElementById('val-cu').innerText = data.current_balance_cu != null ? data.current_balance_cu.toFixed(2) : 'N/A';
-        document.getElementById('val-rate').innerText = data.current_rate_cu_per_hour != null ? data.current_rate_cu_per_hour.toFixed(2) : '0.00';
-        document.getElementById('val-assignments').innerText = data.active_assignments || 0;
-        document.getElementById('val-runs').innerText = (data.managed_running_runs || 0) + ' / ' + (data.total_runs || 0);
-        document.getElementById('header-meta').innerText = 'Monitoring since ' + (data.monitoring_since || 'now').slice(0, 19);
+        const cu = Number(data.current_balance_cu);
+        const rate = Number(data.current_rate_cu_per_hour);
+        document.getElementById('val-cu').textContent = (data.current_balance_cu != null && Number.isFinite(cu)) ? cu.toFixed(2) : 'N/A';
+        document.getElementById('val-rate').textContent = (data.current_rate_cu_per_hour != null && Number.isFinite(rate)) ? rate.toFixed(2) : '0.00';
+        document.getElementById('val-assignments').textContent = String(data.active_assignments || 0);
+        document.getElementById('val-runs').textContent = String(data.managed_running_runs || 0) + ' / ' + String(data.total_runs || 0);
+        document.getElementById('header-meta').textContent = 'Monitoring since ' + String(data.monitoring_since || 'now').slice(0, 19);
 
         const badge = document.getElementById('health-badge');
         if (data.is_stale) {
-          badge.innerText = 'STALE';
+          badge.textContent = 'STALE';
           badge.className = 'badge stale';
         } else {
-          badge.innerText = 'HEALTHY';
+          badge.textContent = 'HEALTHY';
           badge.className = 'badge active';
         }
       } catch (e) {

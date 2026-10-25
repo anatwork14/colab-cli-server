@@ -68,45 +68,7 @@ from tests.test_google_drive_store import MockDriveHttpClient
 
 class E2EMockDriveHttpClient(MockDriveHttpClient):
     """MockDriveHttpClient with automatic metadata cataloging for idempotency testing."""
-
-    def __init__(self):
-        super().__init__()
-        self.session_to_metadata: dict[str, dict] = {}
-
-    def request(self, method: str, url: str, headers=None, data=None, timeout: float = 30.0):
-        if "uploadType=resumable" in url and method == "POST" and data:
-            try:
-                meta = json.loads(data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else data)
-                next_file_id = f"file-{self.file_id_counter + 1}"
-                next_session_id = f"upload-session-{self.file_id_counter + 1}"
-                self.session_to_metadata[next_file_id] = meta
-                self.session_to_metadata[next_session_id] = meta
-            except Exception:
-                pass
-
-        status, resp_headers, body = super().request(method, url, headers=headers, data=data, timeout=timeout)
-
-        if method == "PUT" and "session_id=upload-session" in url and status in (200, 201):
-            try:
-                res = json.loads(body.decode("utf-8"))
-                fid = res.get("id")
-                meta = self.session_to_metadata.get(fid, {})
-                fname = meta.get("name", "uploaded_file")
-                c_data = self.committed_files.get(fid, b"")
-                import hashlib
-                md5_val = hashlib.md5(c_data).hexdigest()
-                res["name"] = fname
-                body = json.dumps(res).encode("utf-8")
-                self.mock_files.append({
-                    "id": fid,
-                    "name": fname,
-                    "size": len(c_data),
-                    "md5Checksum": md5_val,
-                })
-            except Exception:
-                pass
-
-        return status, resp_headers, body
+    pass
 
 
 def _future_iso(seconds: float = 3600.0) -> str:
@@ -840,6 +802,18 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             remote_files_after_first,
             "Re-publishing an already-published artifact must not create duplicate remote files on Drive",
         )
+
+        # Publishing a new revision of the same filename with updated bytes produces a distinct verified sha256 and remote entry
+        idem_artifact_path.write_bytes(b"EVAL_WEIGHTS_UPDATED_REVISION_V3_PAYLOAD" * 40)
+        pub3 = drive_store.publish(
+            source=idem_artifact_path,
+            project_id=project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+        self.assertNotEqual(pub3.sha256, pub1.sha256)
+        self.assertNotEqual(pub3.remote_file_id, pub1.remote_file_id)
+        self.assertEqual(len(mock_http.mock_files), remote_files_after_first + 1)
 
         # =====================================================================
         # Stage 12: Remote session cleanup
