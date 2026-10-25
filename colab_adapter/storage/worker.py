@@ -28,6 +28,13 @@ from ..tracker import sanitize_text
 from .base import ArtifactStore, ArtifactType, StoredArtifact
 from .manifest import compute_file_md5, compute_file_sha256
 from .transfer import TransferJournal, TransferRecord, TransferStatus, _is_pid_alive
+from .validation import (
+    validate_artifact_type,
+    validate_filename,
+    validate_logical_path,
+    validate_project_id,
+    validate_run_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +219,35 @@ class ArtifactUploadWorker:
                     self._queued_ids.add(rec.transfer_id)
                     self._queue.put(rec)
 
+    def _resolve_staging_dir(self, project_id: str, run_id: str, sha256: str) -> Path:
+        """Return the staging directory for an already-validated revision, without touching the filesystem.
+
+        Rejects a symlinked staging root or staging directory and any path whose resolved location
+        escapes the resolved staging root.
+        """
+        staging_root = self.journal.path.parent / ".staged_uploads"
+        if staging_root.is_symlink():
+            raise ArtifactValidationError(
+                "Refusing to stage uploads through a symlinked staging root.",
+                details={"staging_root": str(staging_root)},
+            )
+        # Hash the key instead of joining raw ids with '_' so distinct (project, run) pairs can never collide.
+        key = "\0".join((project_id, run_id, sha256.lower())).encode("utf-8")
+        staging_dir = staging_root / ("stg-" + hashlib.sha256(key).hexdigest()[:40])
+        if staging_dir.is_symlink():
+            raise ArtifactValidationError(
+                "Refusing to stage uploads into a symlinked staging directory.",
+                details={"staging_dir": str(staging_dir)},
+            )
+        try:
+            staging_dir.resolve().relative_to(staging_root.resolve())
+        except ValueError:
+            raise ArtifactValidationError(
+                "Staging directory escapes the staging root.",
+                details={"staging_dir": str(staging_dir)},
+            )
+        return staging_dir
+
     def enqueue(
         self,
         local_path: Optional[Union[str, Path]] = None,
@@ -264,6 +300,12 @@ class ArtifactUploadWorker:
         if not proj_arg or not run_arg:
             raise ArtifactValidationError("Missing project_id or run_id for enqueue.")
 
+        # Validate every caller-supplied identifier before the source is touched and before any
+        # lock path, staging directory, journal record or remote call is derived from it.
+        validate_project_id(proj_arg)
+        validate_run_id(run_arg)
+        validate_artifact_type(type_arg)
+
         raw_p = Path(src_arg)
         if ".." in raw_p.parts:
             raise ArtifactValidationError(f"Path traversal sequence rejected in source path: {raw_p}")
@@ -293,10 +335,13 @@ class ArtifactUploadWorker:
         if not src.exists() or not stat.S_ISREG(src.stat().st_mode):
             raise ArtifactValidationError(f"Artifact source file does not exist or is non-regular: {src}")
 
+        validate_filename(src.name)
+        rel_path = f"{cat_arg}/{src.name}" if cat_arg else src.name
+        validate_logical_path(rel_path)
+
         current_sha256 = ArtifactStore.compute_sha256(src)
         current_size = src.stat().st_size
 
-        rel_path = f"{cat_arg}/{src.name}" if cat_arg else src.name
         artifact_id = f"{proj_arg}/{run_arg}/{rel_path}@sha256_{current_sha256.lower()}"
         transfer_id = f"{self.store.provider_name}-{proj_arg}-{run_arg}-{src.name}-{current_sha256.lower()[:12]}"
 
@@ -327,10 +372,11 @@ class ArtifactUploadWorker:
         if cat_arg:
             meta_arg["category"] = cat_arg
 
+        staging_dir = self._resolve_staging_dir(proj_arg, run_arg, current_sha256)
+
         with self.journal.acquire_artifact_lock(self.store.provider_name, proj_arg, run_arg, src.name):
             # Protect against in-place source file mutation after enqueue() using atomic 0600 temp copy under lock:
             trusted_staging_root = self._ensure_trusted_staging_root()
-            staging_dir = trusted_staging_root / f"{proj_arg}_{run_arg}_{current_sha256[:16]}"
             if staging_dir.is_symlink():
                 raise ArtifactValidationError("Symlinked staging directory rejected")
             staging_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -487,6 +533,10 @@ class ArtifactUploadWorker:
 
     def _process_task(self, task: UploadTask) -> bool:
         """Process an individual upload task with cross-process artifact locking and lease fencing."""
+        # Journal records may be tampered with or written by an older version: re-validate ids
+        # before they are used to build the lock path or the remote publish request.
+        validate_project_id(task.project_id)
+        validate_run_id(task.run_id)
         src = Path(getattr(task, "source_path", None) or task.local_path)
         task_expected_sha = getattr(task, "expected_sha256", None) or task.sha256
 

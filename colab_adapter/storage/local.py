@@ -6,7 +6,6 @@ manifest updates, and multi-tier checksum verification.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import uuid
 from pathlib import Path
@@ -22,17 +21,11 @@ from .base import (
     parse_artifact_id,
 )
 from .manifest import PublicationManifest, compute_file_md5, compute_file_sha256
-
-_SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+from .validation import validate_identifier
 
 
 def _validate_safe_id(name: str, field: str = "identifier") -> str:
-    if not name or not isinstance(name, str) or not _SAFE_ID_PATTERN.match(name) or ".." in name or "/" in name or "\\" in name:
-        raise ArtifactValidationError(
-            f"Invalid {field} '{name}': contains illegal characters or path traversal sequence.",
-            details={field: str(name)},
-        )
-    return name
+    return validate_identifier(name, field)
 
 
 class LocalArtifactStore:
