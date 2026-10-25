@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import ssl
+import stat
 import threading
 import time
 import urllib.parse
@@ -297,12 +298,16 @@ if _EMBEDDED_HTML_DASHBOARD is None:
 """
 
 
-_IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9_\-\.]{1,128}$")
+# Unmanifested local files above this size are listed with size only (no sha256).
+_LOCAL_HASH_MAX_BYTES = 8 * 1024 * 1024
+
+# fullmatch (not match with "$") so a trailing newline is rejected; ASCII only.
+_IDENTIFIER_RE = re.compile(r"[a-zA-Z0-9_\-\.]{1,128}")
 
 
 def _is_valid_identifier(value: Optional[str]) -> bool:
-    """Validate a project/run selector: bounded charset, no path traversal."""
-    return bool(value) and bool(_IDENTIFIER_RE.match(value)) and ".." not in value
+    """Validate a project/run selector: bounded ASCII charset, no path traversal."""
+    return bool(value) and _IDENTIFIER_RE.fullmatch(value) is not None and ".." not in value
 
 
 def _event_run_key(ev: Dict[str, Any]) -> Tuple[str, str]:
@@ -686,12 +691,17 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             current_rate_cu_per_hour=latest.rate_cu_per_hour if latest else None,
             active_assignments=latest.active_assignments if latest else 0,
             managed_running_runs=running_count,
-            total_runs=max(unique_runs, len(all_managed)),
+            total_runs=unique_runs if project is not None else max(unique_runs, len(all_managed)),
             monitoring_since=col.monitoring_since,
             last_sample_time=latest.observed_at if latest else None,
             is_stale=col.is_stale,
         )
-        self._send_json(summary.to_dict())
+        body = summary.to_dict()
+        # Managed sessions carry no project id, so balance/rate/managed counts stay
+        # account-wide; only run counts are narrowed by the project filter.
+        body["managed_counts_scope"] = "account"
+        body["project_filter"] = project
+        self._send_json(body)
 
     def _handle_compute_samples(self, query: Dict[str, List[str]]) -> None:
         from_ts = query.get("from", [None])[0]
@@ -842,10 +852,16 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         all_managed = self.server.registry.get_all_managed()
         active_session_ids = {s_id for s_id, s_info in all_managed.items() if s_info.get("state") in ("READY", "RUNNING", "ACTIVE")}
 
+        # The registry records no project/run id per session, so a session id is
+        # attributed to a run only when exactly one run key carries that run id.
+        run_id_counts: Dict[str, int] = {}
+        for key in runs_map:
+            run_id_counts[key[1]] = run_id_counts.get(key[1], 0) + 1
+
         ordered_keys = sorted(runs_map)
         for key in ordered_keys:
             run = runs_map[key]
-            run["is_runtime_active"] = key[1] in active_session_ids
+            run["is_runtime_active"] = key[1] in active_session_ids and run_id_counts.get(key[1], 0) == 1
             if "drive_publication_status" not in run:
                 run["drive_publication_status"] = "PENDING"
             if "source_snapshot_available" not in run:
@@ -965,7 +981,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                         pass
 
             for root, dirs, files in os.walk(run_path):
-                dirs[:] = [d for d in dirs if d not in (".revisions", ".upload_staging", ".staged_uploads", ".transfer_locks")]
+                dirs[:] = [d for d in dirs if d not in (".revisions", ".upload_staging", ".staged_uploads", ".transfer_locks", ".locks")]
                 for fname in files:
                     if (
                         fname in ("manifest.json", "manifest.json.bak")
@@ -979,23 +995,31 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                         continue  # Skip internal revision-staged files
                     fpath = Path(root) / fname
                     try:
+                        # Regular files only: never follow or describe a symlink, which may
+                        # point into another project's storage.
+                        st = os.lstat(fpath)
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
                         resolved_fpath = fpath.resolve()
                         if resolved_fpath in known_paths:
                             continue
-                        hasher = hashlib.sha256()
-                        with open(fpath, "rb") as f:
-                            for chunk in iter(lambda: f.read(65536), b""):
-                                hasher.update(chunk)
-                        f_sha = hasher.hexdigest()
-                        if f_sha in known_shas:
-                            continue
+                        f_size = st.st_size
+                        f_sha: Optional[str] = None
+                        if f_size <= _LOCAL_HASH_MAX_BYTES:
+                            hasher = hashlib.sha256()
+                            with open(fpath, "rb") as f:
+                                for chunk in iter(lambda: f.read(65536), b""):
+                                    hasher.update(chunk)
+                            f_sha = hasher.hexdigest()
+                            if f_sha in known_shas:
+                                continue
 
-                        f_size = fpath.stat().st_size
                         rel = str(fpath.relative_to(run_path))
                         local_art = {
-                            "artifact_id": f"{run_id}/{rel}",
+                            # Prefixed exactly once with "<project>/<run>/" below.
+                            "artifact_id": rel if project_id else f"{run_id}/{rel}",
                             "logical_path": rel,
-                            "revision_id": f"sha256_{f_sha[:12]}",
+                            "revision_id": f"sha256_{f_sha[:12]}" if f_sha else "unversioned",
                             "is_latest": True,
                             "step": None,
                             "size_bytes": f_size,
@@ -1045,6 +1069,10 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         keys.update(self._disk_run_dirs(project_filter=project, run_filter=run_id).keys())
         if project is not None:
             keys = {k for k in keys if k[0] == project}
+        # Legacy keyless events ("" project) never make a named-project run ambiguous;
+        # they only resolve when no named project owns the run.
+        if any(k[0] for k in keys):
+            keys = {k for k in keys if k[0]}
         if not keys:
             body: Dict[str, Any] = {"error": "Run not found", "run_id": run_id}
             if project is not None:
@@ -1062,7 +1090,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Invalid run endpoint"}, status=400)
             return
         run_id = parts[3]
-        if not re.match(r"^[a-zA-Z0-9_\-\.]+$", run_id) or ".." in run_id:
+        if not _is_valid_identifier(run_id):
             self._send_json(
                 {"error": "Invalid run_id", "message": "Identifier contains illegal characters or path traversal."},
                 status=400,
