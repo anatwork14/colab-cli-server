@@ -77,6 +77,7 @@ from .drive_metadata import (
     successor_sha256,
     validate_drive_properties,
 )
+from .locking import manifest_lock
 from .validation import validate_project_id, validate_run_id
 from .manifest import PublicationManifest, compute_file_md5, compute_file_sha256
 from .transfer import TransferJournal, TransferRecord, TransferStatus
@@ -441,6 +442,11 @@ class GoogleDriveArtifactStore:
     def _compute_md5(self, file_path: Union[str, Path]) -> str:
         """Compute streaming MD5 of local file for Drive v3 comparison."""
         return compute_file_md5(file_path)
+
+    def _manifest_lock(self, project_id: str, run_id: str, timeout: float = 60.0):
+        """Shared per-manifest lock; the local store contends on the very same lock file."""
+        manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+        return manifest_lock(manifest_path, timeout=timeout)
 
     @contextlib.contextmanager
     def _exclusive_lock(self, lock_name: str, timeout: float = 60.0):
@@ -2089,7 +2095,7 @@ class GoogleDriveArtifactStore:
         """Merge one published revision into the manifest under the shared manifest lock."""
         m_key = (project_id, run_id)
         local_manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
-        with self._exclusive_lock(f"manifest-{project_id}-{run_id}"):
+        with self._manifest_lock(project_id, run_id):
             manifest = self._load_or_recover_manifest(project_id, run_id)
             if manifest is None:
                 manifest = PublicationManifest(project_id=project_id, run_id=run_id)
@@ -2163,7 +2169,6 @@ class GoogleDriveArtifactStore:
         rev_transfer_id = f"{base_transfer_id}-{local_sha256.lower()[:12]}"
         transfer_id = rev_transfer_id
         lock_name = f"artifact-{self.provider_name}-{project_id}-{run_id}-{src.name}"
-        manifest_lock_name = f"manifest-{project_id}-{run_id}"
         m_key = (project_id, run_id)
 
         staged_src = src
@@ -2213,7 +2218,7 @@ class GoogleDriveArtifactStore:
 
                 # 2. Load PublicationManifest under manifest lock
                 local_manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
-                with self._exclusive_lock(manifest_lock_name):
+                with self._manifest_lock(project_id, run_id):
                     manifest = self._load_or_recover_manifest(project_id, run_id)
                     if manifest is None:
                         manifest = PublicationManifest(project_id=project_id, run_id=run_id)

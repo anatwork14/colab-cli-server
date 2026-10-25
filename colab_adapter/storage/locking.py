@@ -91,6 +91,8 @@ def _ensure_lock_dir(lock_dir: Path) -> None:
         st = os.lstat(str(lock_dir))
     except FileNotFoundError:
         try:
+            # The run directory may not exist yet (first publish through the Drive store).
+            os.makedirs(str(lock_dir.parent), mode=0o700, exist_ok=True)
             os.mkdir(str(lock_dir), 0o700)
         except FileExistsError:
             pass
