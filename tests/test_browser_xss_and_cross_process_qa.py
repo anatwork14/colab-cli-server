@@ -539,7 +539,7 @@ class TestPortableStructuralDashboardSecurity(unittest.TestCase):
         self.emitter_adv = TelemetryEmitter(
             ledger_path=self.telemetry_path,
             run_id=self.run_adv_id,
-            project_id=f"proj_{self.payload_script}",
+            project_id="proj-adv",
         )
         self.emitter_adv.emit("run_started")
         self.emitter_adv.emit("metric", epoch=1, step=10, metrics={"loss": 0.55})
@@ -735,7 +735,10 @@ class TestPortableStructuralDashboardSecurity(unittest.TestCase):
             self.assertIn(self.raw_xss_run_id, run_ids)
 
             adv_run = next(r for r in runs if r.get("run_id") == self.run_adv_id)
-            self.assertIn(self.payload_script, adv_run.get("project_id", ""))
+            self.assertEqual(adv_run.get("project_id"), "proj-adv")
+            # Payload carried in project_id stays a separate RunKey entry (C4 isolation)
+            xss_run = next(r for r in runs if r.get("run_id") == self.raw_xss_run_id)
+            self.assertIn(self.payload_script, xss_run.get("project_id", ""))
 
         # 2. GET /api/v1/runs/<id>/logs
         with urllib.request.urlopen(urllib.request.Request(f"{self.base_url}/api/v1/runs/{self.run_adv_id}/logs", headers=headers)) as resp:
@@ -906,7 +909,7 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
         self.emitter_adv = TelemetryEmitter(
             ledger_path=self.telemetry_path,
             run_id=self.run_adv_id,
-            project_id=f"proj_{self.payload_script}",
+            project_id="proj-adv",
         )
         self.emitter_adv.emit("run_started")
         self.emitter_adv.emit("metric", epoch=1, step=10, metrics={"loss": 0.42})

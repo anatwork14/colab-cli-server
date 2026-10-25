@@ -57,6 +57,7 @@ from .drive_metadata import (
     build_revision_properties,
     revision_state,
 )
+from .validation import validate_project_id, validate_run_id
 from .manifest import PublicationManifest, compute_file_md5, compute_file_sha256
 from .transfer import TransferJournal, TransferRecord, TransferStatus
 from .drive_metadata import (
@@ -1769,6 +1770,9 @@ class GoogleDriveArtifactStore:
         expected_sha256: Optional[str] = None,
     ) -> StoredArtifact:
         """Publish a local file to Google Drive through verified resumable upload."""
+        # Validate identifiers before any lock path, staging file, journal write or remote request.
+        project_id = validate_project_id(project_id)
+        run_id = validate_run_id(run_id)
         p_src = Path(source)
         if p_src.is_symlink() or not p_src.is_file():
             raise ArtifactValidationError(f"Source file must be a regular file, not a symlink or missing: {source}")
