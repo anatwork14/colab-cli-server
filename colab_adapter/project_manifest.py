@@ -141,6 +141,17 @@ def _parse_raw_manifest(raw: Dict[str, Any], base_dir: Path) -> ProjectSpec:
     name = proj_sec.get("name") or raw.get("name")
     if not name or not isinstance(name, str) or not name.strip():
         raise ManifestValidationError("Project 'name' is required.")
+    # The default storage project id is "proj-<name>"; reject unusable names here, not at publish time.
+    from .errors import ArtifactValidationError
+    from .storage.validation import validate_project_id
+
+    try:
+        validate_project_id(f"proj-{name.strip()}")
+    except ArtifactValidationError as exc:
+        raise ManifestValidationError(
+            f"Project 'name' {name.strip()!r} cannot be used as a storage project identifier "
+            "(use letters, digits, '_', '-' or '.', at most 128 characters in total)."
+        ) from exc
 
     raw_root = proj_sec.get("root") or raw.get("root") or "."
     resolved_root = (base_dir / raw_root).resolve()

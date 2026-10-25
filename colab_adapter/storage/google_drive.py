@@ -78,7 +78,13 @@ from .drive_metadata import (
     validate_drive_properties,
 )
 from .locking import manifest_lock
-from .validation import validate_project_id, validate_run_id
+from .validation import (
+    validate_artifact_type,
+    validate_filename,
+    validate_identifier,
+    validate_project_id,
+    validate_run_id,
+)
 from .manifest import PublicationManifest, compute_file_md5, compute_file_sha256
 from .transfer import TransferJournal, TransferRecord, TransferStatus
 
@@ -160,12 +166,7 @@ def _sanitize_drive_error(raw: Union[str, bytes], url: str = "") -> str:
 
 
 def _validate_safe_id(name: str, field: str = "identifier") -> str:
-    if not name or not isinstance(name, str) or not _SAFE_ID_PATTERN.match(name) or ".." in name or "/" in name or "\\" in name:
-        raise ArtifactValidationError(
-            f"Invalid {field} '{name}': contains illegal characters or path traversal sequence.",
-            details={field: str(name)},
-        )
-    return name
+    return validate_identifier(name, field)
 
 
 
@@ -798,8 +799,8 @@ class GoogleDriveArtifactStore:
     ) -> List[Dict[str, Any]]:
         """Query for all non-trashed files with matching name in folder across pages."""
         target_folder = parent_id if parent_id is not None else folder_id
-        safe_name = filename.replace("'", "\\'")
-        safe_folder = target_folder.replace("'", "\\'")
+        safe_name = filename.replace("\\", "\\\\").replace("'", "\\'")
+        safe_folder = target_folder.replace("\\", "\\\\").replace("'", "\\'")
         query = f"name = '{safe_name}' and trashed = false and '{safe_folder}' in parents"
         fields = "nextPageToken,files(id,name,size,md5Checksum,appProperties,description,createdTime)"
 
@@ -2135,6 +2136,8 @@ class GoogleDriveArtifactStore:
         # Validate identifiers before any lock path, staging file, journal write or remote request.
         project_id = validate_project_id(project_id)
         run_id = validate_run_id(run_id)
+        artifact_type = validate_artifact_type(artifact_type)
+        validate_filename(Path(source).name)
 
         p_src = Path(source)
         if p_src.is_symlink() or not p_src.is_file():
@@ -2814,6 +2817,7 @@ class GoogleDriveArtifactStore:
                 raise ArtifactValidationError("Versioned Drive retrieval requires a full 64-hex sha256 identity")
         else:
             base_art_id = artifact_id
+        self._validated_artifact_ids(base_art_id)
 
         if expected_sha256 is not None:
             target_sha = expected_sha256.strip().lower()
@@ -3113,11 +3117,19 @@ class GoogleDriveArtifactStore:
                 return False
         return False
 
+    @staticmethod
+    def _validated_artifact_ids(base_artifact_id: str) -> Tuple[str, str]:
+        """Validate the project/run segments of ``project/run/path`` before any filesystem or network use."""
+        parts = base_artifact_id.split("/")
+        if len(parts) < 3:
+            raise ArtifactValidationError(f"Invalid artifact ID format: '{base_artifact_id}'")
+        return validate_project_id(parts[0]), validate_run_id(parts[1])
+
     def get_metadata(self, artifact_id: str) -> Optional[StoredArtifact]:
         parts = artifact_id.split("@sha256_")[0].split("/")
         if len(parts) < 3:
             return None
-        project_id, run_id = parts[0], parts[1]
+        project_id, run_id = self._validated_artifact_ids(artifact_id.split("@sha256_")[0])
         manifest = self._load_or_recover_manifest(project_id, run_id)
         if manifest:
             return self._resolve_artifact_from_manifest(manifest, artifact_id)
@@ -3128,7 +3140,9 @@ class GoogleDriveArtifactStore:
         project_id: str,
         run_id: Optional[str] = None,
     ) -> List[StoredArtifact]:
+        project_id = validate_project_id(project_id)
         if run_id:
+            run_id = validate_run_id(run_id)
             manifest = self._load_or_recover_manifest(project_id, run_id)
             if manifest:
                 return manifest.list_artifacts()
