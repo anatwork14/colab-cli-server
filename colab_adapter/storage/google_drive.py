@@ -1737,19 +1737,6 @@ class GoogleDriveArtifactStore:
                 except OSError:
                     pass
 
-    # -------------------------------------------------------------------------
-    # STUB for Worker A until merged: _remote_revision_state
-    # -------------------------------------------------------------------------
-    def _remote_revision_state(self, remote_id: str) -> Tuple[str, Dict[str, str]]:
-        """Query remote file appProperties and determine revision state."""
-        url = f"https://www.googleapis.com/drive/v3/files/{remote_id}?fields=id,name,appProperties"
-        status, _, body = self._request_with_retry("GET", url)
-        if status != 200:
-            raise DriveTransferError(f"Failed to fetch remote revision state for {remote_id} (HTTP {status})")
-        data = json.loads(body.decode("utf-8"))
-        props = dict(data.get("appProperties") or {})
-        return revision_state(props), props
-
     def publish(
         self,
         source: Union[str, Path],
