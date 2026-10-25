@@ -121,45 +121,49 @@ Expected: the guard is reported alive with a deadline about 900 s after the allo
 
 ```
 python3 -m colab_adapter.cli project sync --manifest examples/live-smoke/colab-project.json --session-id <SID> --json
-python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --timeout 120 --json "python3 gpu_probe.py --require-gpu"
+python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --shell --timeout 120 --json "python3 gpu_probe.py --require-gpu"
 ```
 
+`project exec` without `--shell` runs PYTHON code in the remote kernel; the commands below use `--shell` so they run as shell commands on the managed VM. The upstream `colab exec` exit status is **not** the command's exit status, so every `--shell` step must be judged from the printed `EXIT_CODE <n>` marker (and the output markers), never from the adapter's own exit code.
+
 Expected output markers (all must appear in the captured output):
+- a final line `EXIT_CODE 0`
 - `CUDA available: True`
 - `GPU name:` with a T4 device name
 - `GPU_PROBE_OK device=cuda:0 checksum=<integer>`
 
-The checksum is exact (small-integer inputs), so the same integer must be reported on every run. Record it. Exit code 2 means CUDA is missing: abort.
+The checksum is exact (small-integer inputs), so the same integer must be reported on every run. Record it. `EXIT_CODE 2` means CUDA is missing, and a missing `EXIT_CODE` line means the result is unknown: abort in both cases. Also run `usage` once after G4 and confirm `Active assignments` still equals the single session this plan created (no extra assignment).
 
 ### G5: tiny training run
 
 ```
-python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --timeout 300 --json "python3 train_tiny.py --steps 60 --require-gpu"
+python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --shell --timeout 300 --json "python3 train_tiny.py --steps 60 --require-gpu"
 ```
 
 Expected output:
+- a final line `EXIT_CODE 0`
 - `CUDA available: True` and `Device: cuda:0`
 - 60 lines beginning with `TELEMETRY {` whose `event_type` is `metric`, with steps 1 to 60 and a `loss` metric that is finite
 - one `checkpoint_saved` telemetry line and one `run_finished` telemetry line
 - `FINAL_LOSS <number>`
 - `DONE_OK steps=60 device=cuda:0 final_loss=<number> checkpoint=artifacts/checkpoints/model.pt sha256=<64 hex>`
 
-Verify the DONE_OK line; do not treat exit code 0 alone as success (AGENTS.md rule 9). The final loss should be clearly lower than the first step's loss. A final loss that is not lower is recorded as a finding, not as a failure of the plan.
+Verify the DONE_OK line and the `EXIT_CODE 0` marker; do not treat the adapter's exit code alone as success (AGENTS.md rule 9). The final loss should be clearly lower than the first step's loss. A final loss that is not lower is recorded as a finding, not as a failure of the plan.
 
 ### G6: checkpoint retrieval and hash compare
 
 ```
-python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --timeout 120 --json "sha256sum artifacts/checkpoints/model.pt && cat artifacts/checkpoints/model.pt.sha256 && base64 -w0 artifacts/checkpoints/model.pt"
+python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --shell --timeout 120 --json "sha256sum artifacts/checkpoints/model.pt && cat artifacts/checkpoints/model.pt.sha256 && base64 -w0 artifacts/checkpoints/model.pt"
 ```
 
 Procedure:
-1. Save the JSON output to `<SCRATCH>/g6_exec.json`.
+1. Save the JSON output to `<SCRATCH>/g6_exec.json`. It must contain a final `EXIT_CODE 0` line; otherwise G6 failed.
 2. Extract the base64 payload and decode it to `<SCRATCH>/model.pt`. If the output is truncated or the payload is incomplete, mark G6 as failed and do not retry with a new allocation.
 3. Compute the local SHA-256 of `<SCRATCH>/model.pt`.
 4. Compare three values: the local digest, the remote `sha256sum` digest, and the digest in the `.sha256` sidecar. All three must be identical and equal the `sha256=` value printed by G5.
 5. Optional: load the file with `torch.load(..., map_location="cpu")` on a machine that has torch, and confirm the keys `model_state_dict`, `step` (60) and `seed` (1234). Skip this if torch is not installed locally.
 
-Assumption to verify at execution: `project exec` takes PYTHON code (kernel semantics), so a shell command must be passed with `--shell`, which prints an `EXIT_CODE <n>` marker that must be read. If the command does not return the marker, record the limitation; do not switch to another allocation.
+Assumption to verify at execution: `--shell` output (stdout, a `[stderr]` block, then `EXIT_CODE <n>`) is returned in full by `colab exec` for a few-KB base64 payload. If the payload is truncated or the marker is missing, record the limitation; do not switch to another allocation. `--shell` has no VM-side timeout: if a step hangs, the adapter stops waiting but the child process may keep running until the session is stopped, which is another reason the teardown and the lease guard matter.
 
 ## 6. Teardown (mandatory)
 
