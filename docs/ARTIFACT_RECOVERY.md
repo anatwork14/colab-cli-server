@@ -190,15 +190,51 @@ When viewing recovered artifacts, logs, and experiment provenance through the mo
      - Production reverse-proxy deployment with TLS termination.
    - Strictly excluded from automated CI runs pending owner authorization.
 
-### PR Review Stack Status
+### Release & Merge Status
 
-The artifact recovery and reproducibility subsystem is part of a reconciled review stack:
+The artifact recovery and reproducibility subsystem was merged into `main` via **PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`)**:
 - **PR #3**: Initial Project Workspace Architecture Proposal.
 - **PRs #13–#20**: Milestones M1–M8 implementations (including M6 reproducibility and M7 durable artifact store).
 - **PR #22**: Multi-worker integration, fault-injection tests, and documentation reconciliation.
 
-> [!IMPORTANT]
-> PRs #3, #13–#20, and #22 form a reconciled review stack and **remain unmerged into `main`** pending final owner approval and completion of Tier 3 live environment checks.
+Post-merge hardening under **Issue #23 (`fix/v2-postmerge-hardening-23`)** delivers:
+- **P1 Verified 3-Case Retrieval Resolution**:
+  1. Exact historical revision recovery via canonical `@sha256_<HASH>` identifier.
+  2. Verified latest revision recovery via local `PublicationManifest` or backup cache pointer.
+  3. Fail-closed rejection (`ArtifactNotFoundError` / `DriveIntegrityError`) on ambiguous or unverified remote folder matches when the local manifest is absent.
+- **P1 Private Checkpoint Staging**: Staging directories created with `0700` and files with `0600` permissions and explicit `os.fsync()`, rejecting symlinks and special files.
+- **P2 Local Artifact Size-Mismatch Error Handling**: Captures `actual_size` before unlinking partial `.part.` temp file, raising `ArtifactValidationError` deterministically.
+- **P2 Controlled Colab HTTP 500 Upload Recovery**: Validates remote path and parent directory existence, retrying at most once if newly created.
+- **Mandatory 21-Stage Offline Pipeline**: Complete end-to-end verification passing in `tests/test_project_e2e.py`.
+
+> [!NOTE]
+> All automated tests execute in offline/mock mode (`OFFLINE_RELEASE_READY`). Real cloud operations remain gated on explicit operator approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
+
+## 20-Step Operator Guide for Artifact Recovery & Lifecycle
+
+A comprehensive runbook using strictly real, supported CLI commands (`python3 colab_server.py ...` and `python3 -m colab_adapter.cli ...`):
+
+1. **Host Python & Toolchain Verification**: `python3 --version && uv --version` (no sudo required).
+2. **User-Space Upstream CLI Install**: `bash scripts/install.sh`.
+3. **Headless OAuth Configuration**: `bash scripts/authenticate.sh`.
+4. **Diagnostic Pre-Flight**: `python3 colab_server.py doctor` (or `python3 -m colab_adapter.cli doctor`).
+5. **Account & Compute-Unit Audit**: `python3 colab_server.py usage` and `python3 -m colab_adapter.cli sessions`.
+6. **Project Workspace Init**: `python3 -m colab_adapter.cli project init ./research-project --name research-project`.
+7. **Local Code & Excludes Setup**: Place code in project directory; verify `.env` is excluded in `colab-project.json`.
+8. **Manifest Validation**: `python3 -m colab_adapter.cli project validate ./research-project --json`.
+9. **Offline Execution Plan**: `python3 -m colab_adapter.cli project plan ./research-project --json` (0 cloud allocations).
+10. **Approval-Gated Session Allocation**:
+    `python3 -m colab_adapter.cli project up ./research-project --gpu T4 --lease 3600 --approval-token "ALLOCATE T4 $(date +%s)" --json`.
+11. **Initial Workspace Sync**: `python3 -m colab_adapter.cli project sync ./research-project --json`.
+12. **Remote Training Execution**: `python3 -m colab_adapter.cli project exec ./research-project -- --epochs 10 --batch-size 32 --json`.
+13. **Incremental Code Hot-Reload**: Modify local source code and run `python3 -m colab_adapter.cli project sync ./research-project --json`.
+14. **Monitoring Dashboard Launch**: `python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080 --auth-token "<SECRET_TOKEN>"`.
+15. **Drive Credential Security (0600)**: Configure `~/.config/colab-cli/drive_credentials.json` with permissions `chmod 0600 ~/.config/colab-cli/drive_credentials.json`.
+16. **Multi-Revision Checkpoint Publishing**: Verify `LocalArtifactStore` and `GoogleDriveArtifactStore` preserve all revisions under immutable `@sha256_<HASH>` identities in `PublicationManifest` v2.
+17. **Historical & Latest Checkpoint Retrieval**: Retrieve latest checkpoint via logical path `research-project/<run_id>/checkpoints/model.pt` or historical revision via canonical `@sha256_<HASH>` identity.
+18. **Cross-Device Recovery Node Attachment**: Attach secondary workstation to inspect artifacts and download checkpoints with zero VM re-allocation.
+19. **Managed Session Stop**: `python3 -m colab_adapter.cli project stop ./research-project --json`.
+20. **Lease Reconciliation & Rollback**: `python3 -m colab_adapter.cli project reconcile --auto-stop --json`. If corruption or network failure occurs, restore from immutable local staging directory (`./artifacts/projects/<project>/runs/<run>/checkpoints/.revisions/<sha16>/model.pt`).
 
 ### Operational Rollback Instructions
 

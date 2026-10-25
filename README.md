@@ -152,9 +152,11 @@ This wrapper and its documentation are licensed under [MIT](LICENSE). Google's `
 
 ## V2 — VKong-Inspired Project Workspaces and Training Monitor
 
+> **Status:** Colab CLI Server V2 (Milestones M1–M8, Google Drive Durable Storage & Cross-Device Workspaces) was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Post-merge hardening and end-to-end verification are delivered in **Issue #23 (`fix/v2-postmerge-hardening-23`)**.
+
 The V2 implementation extends the original one-shot adapter into a comprehensive project-centric remote GPU workspace system and real-time training monitor:
 
-- **Declarative Project Manifests (`colab_project.json`):** Declare source patterns, entrypoints, target accelerators, and artifact rules with offline validation and path escape rejection.
+- **Declarative Project Manifests (`colab-project.json`):** Declare source patterns, entrypoints, target accelerators, and artifact rules with offline validation and path escape rejection.
 - **Content-Addressed Incremental Sync:** Two-phase workspace synchronization transfers only modified files via streaming chunked SHA-256 diffing, with atomic commit and opt-in remote file deletion.
 - **Collision-Resistant Session Lifecycle:** Project runtime leases (`colab-v2-<name>-<uuid>`) prevent collisions, enforce state machine transitions, lock against concurrent allocations, and fail-closed on unmanaged user sessions.
 - **Multi-Tier Checkpoint & Immutable Revision Recovery:** Staged atomic download with integrity checksums, ZIP header verification, safe PyTorch `weights_only=True` inspection, and immutable `@sha256_<digest>` revision history (`PublicationManifest` v2) preserving both latest and historical checkpoints across local and Google Drive storage.
@@ -164,31 +166,31 @@ The V2 implementation extends the original one-shot adapter into a comprehensive
 
 ```bash
 # Initialize a new project directory with template manifest and entrypoint
-colab-adapter project init ./my-project --name my-project
+python3 -m colab_adapter.cli project init ./my-project --name my-project
 
 # Validate manifest schema, path safety, and file existence
-colab-adapter project validate ./my-project
+python3 -m colab_adapter.cli project validate ./my-project --json
 
 # Compute dry-run file sync diff and session plan without allocating compute
-colab-adapter project plan ./my-project
+python3 -m colab_adapter.cli project plan ./my-project --json
 
 # Provision or attach to a remote project session under cross-process lock
-colab-adapter project up ./my-project --gpu T4
+python3 -m colab_adapter.cli project up ./my-project --gpu T4 --approval-token "ALLOCATE T4 $(date +%s)" --json
 
 # Incrementally sync workspace source tree to the remote session
-colab-adapter project sync ./my-project
+python3 -m colab_adapter.cli project sync ./my-project --json
 
 # Execute project entrypoint with optional runtime arguments
-colab-adapter project exec ./my-project -- --epochs 10 --batch-size 32
+python3 -m colab_adapter.cli project exec ./my-project -- --epochs 10 --batch-size 32 --json
 
 # Inspect remote project session status and lease TTL
-colab-adapter project status ./my-project
+python3 -m colab_adapter.cli project status ./my-project --json
 
 # Safely terminate project session
-colab-adapter project stop ./my-project
+python3 -m colab_adapter.cli project stop ./my-project --json
 
 # Reconcile expired project leases and release resources
-colab-adapter project reconcile
+python3 -m colab_adapter.cli project reconcile --auto-stop --json
 ```
 
 All commands support `--json` for machine-readable output by autonomous agents and scripts.
@@ -197,13 +199,115 @@ All commands support `--json` for machine-readable output by autonomous agents a
 
 ```bash
 # Start local authenticated monitoring server with web dashboard (loopback default)
-colab-adapter monitor --host 127.0.0.1 --port 8080 --auth-token <SECRET_TOKEN>
+python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080 --auth-token "<SECRET_TOKEN>"
 
 # Start monitoring server with TLS encryption or behind a verified identity proxy
-colab-adapter monitor --host 0.0.0.0 --port 8443 --allow-external \
-  --auth-token <SECRET_TOKEN> --require-tls \
+python3 -m colab_adapter.cli monitor --host 0.0.0.0 --port 8443 --allow-external \
+  --auth-token "<SECRET_TOKEN>" --require-tls \
   --tls-certfile /path/to/cert.pem --tls-keyfile /path/to/key.pem
 ```
+
+## V2 Operator Experience Runbook (20-Step Guide)
+
+A step-by-step operator guide using strictly real, supported CLI commands (`python3 colab_server.py ...` and `python3 -m colab_adapter.cli ...`):
+
+1. **Host Environment Verification (No sudo)**:
+   Verify host Python version and uv toolchain:
+   ```bash
+   python3 --version
+   uv --version
+   ```
+2. **Automated Upstream CLI Installation (User Mode)**:
+   Install the official upstream `google-colab-cli` in user space without root:
+   ```bash
+   bash scripts/install.sh
+   ```
+3. **Headless OAuth Account Authentication**:
+   Perform browserless terminal-based Google authentication:
+   ```bash
+   bash scripts/authenticate.sh
+   ```
+4. **Environment & Diagnostic Health Inspection (Zero Compute Allocation)**:
+   Verify local Python environment, CLI capability detection, and account readiness:
+   ```bash
+   python3 colab_server.py doctor
+   # or: python3 -m colab_adapter.cli doctor
+   ```
+5. **Compute Units & Session Balance Audit**:
+   Inspect current account compute-unit balance and running sessions without allocating:
+   ```bash
+   python3 colab_server.py usage
+   python3 -m colab_adapter.cli sessions
+   ```
+6. **Project Workspace Initialization**:
+   Create a structured research project directory with manifest template:
+   ```bash
+   python3 -m colab_adapter.cli project init ./research-project --name research-project
+   ```
+7. **Source & Dependency Preparation**:
+   Populate local project code (`train.py`, `model.py`, `requirements.txt`). Excluded secrets (e.g. `.env`) remain strictly local.
+8. **Project Manifest Validation**:
+   Validate manifest schema, root path containment, and secret exclusion rules:
+   ```bash
+   python3 -m colab_adapter.cli project validate ./research-project --json
+   ```
+9. **Zero-Allocation Offline Execution Plan**:
+   Generate deterministic transfer diff, file count, and payload size without cloud allocation:
+   ```bash
+   python3 -m colab_adapter.cli project plan ./research-project --json
+   ```
+10. **Human-Approval-Gated Session Provisioning**:
+    Provision or attach to a remote Colab session with an explicit approval token:
+    ```bash
+    python3 -m colab_adapter.cli project up ./research-project --gpu T4 --lease 3600 \
+      --approval-token "ALLOCATE T4 $(date +%s)" --json
+    ```
+11. **Initial Workspace Incremental Synchronization**:
+    Sync workspace sources to the remote session with streaming SHA256 content indexing:
+    ```bash
+    python3 -m colab_adapter.cli project sync ./research-project --json
+    ```
+12. **Remote Training Execution**:
+    Execute the remote training entrypoint with live streaming output:
+    ```bash
+    python3 -m colab_adapter.cli project exec ./research-project -- --epochs 10 --batch-size 32 --json
+    ```
+13. **Incremental Code Synchronization (Hot Updates)**:
+    Modify local code and re-synchronize; only modified files transfer:
+    ```bash
+    python3 -m colab_adapter.cli project sync ./research-project --json
+    ```
+14. **Cross-Device Monitoring Dashboard Startup**:
+    Launch the read-only web monitoring server with per-response CSP nonces:
+    ```bash
+    python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080 --auth-token "<SECRET_TOKEN>"
+    ```
+15. **Google Drive Credential Setup (0600 Permissions)**:
+    Set up Google Drive API credentials with private filesystem permissions:
+    ```bash
+    # Stored at ~/.config/colab-cli/drive_credentials.json with mode 0600
+    chmod 0600 ~/.config/colab-cli/drive_credentials.json
+    ```
+16. **Multi-Revision Checkpoint Publishing**:
+    Publish successive training epochs (`model.pt`) to Google Drive; each revision is preserved under immutable `@sha256_<HASH>` identity in `PublicationManifest` v2.
+17. **Historical & Latest Checkpoint Recovery**:
+    Retrieve latest weights or a specific historical checkpoint revision (`@sha256_<HASH>`) with bitwise verification:
+    ```bash
+    python3 -c "from colab_adapter.storage import GoogleDriveArtifactStore, DriveCredentials; store = GoogleDriveArtifactStore(credentials_file='~/.config/colab-cli/drive_credentials.json'); store.retrieve('research-project/<run_id>/checkpoints/model.pt', './model_latest.pt')"
+    ```
+18. **Cross-Device Workspace Attachment**:
+    Attach a secondary terminal or developer machine to observe training runs via the authenticated Workspace Broker without creating duplicate Colab VMs.
+19. **Managed Session Teardown**:
+    Safely stop the active project session and release cloud resources:
+    ```bash
+    python3 -m colab_adapter.cli project stop ./research-project --json
+    ```
+20. **Lease Reconciliation & Rollback / Troubleshooting**:
+    Reconcile expired sessions and release orphan compute:
+    ```bash
+    python3 -m colab_adapter.cli project reconcile --auto-stop --json
+    ```
+    Rollback: If network or recovery fails, inspect `transfer_journal.json`, verify hashes, and fall back to local staged checkpoints.
 
 **Security & Account Protection:**
 - Poller executes strictly read-only official CLI queries (`colab usage`, `colab sessions`) and **never** provisions cloud VMs.

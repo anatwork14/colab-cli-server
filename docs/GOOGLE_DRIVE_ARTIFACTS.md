@@ -235,15 +235,113 @@ When loading older `manifest_version: 1` files where `artifacts` keys lacked `@s
      - Production reverse-proxy deployment with TLS termination.
    - Strictly excluded from automated CI runs pending owner authorization.
 
-### PR Review Stack Status
+### Release & Merge Status
 
-The Google Drive durable artifact storage engine is integrated within a reconciled PR review stack:
+The Google Drive durable artifact storage engine was merged into `main` via **PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`)**:
 - **PR #3**: Initial Project Workspace Architecture Proposal.
 - **PRs #13–#20**: Milestones M1–M8 implementations (including M7 Google Drive store and M8 telemetry visualization).
 - **PR #22**: Multi-worker integration, fault-injection tests, and documentation reconciliation.
 
-> [!IMPORTANT]
-> PRs #3, #13–#20, and #22 form a reconciled review stack and **remain unmerged into `main`** pending final owner approval and completion of Tier 3 live environment checks.
+Post-merge hardening delivered under **Issue #23 (`fix/v2-postmerge-hardening-23`)** includes:
+- **P1 Verified 3-Case Google Drive Recovery**: Exact revision `@sha256_<HASH>`, verified latest pointer via manifest/backup, and fail-closed rejection on ambiguous/unverified fallback.
+- **P1 Private Checkpoint Staging**: `0700` staging directories, `0600` temporary/staged files with `fsync`, symlink/special-file rejection, canonical staging-root containment validation.
+- **P2 Local Artifact Retrieval Size-Mismatch Error Handling**: Capturing `actual_size` before unlinking `.part.` temp file so `ArtifactValidationError` is always raised instead of `FileNotFoundError`.
+- **P2 Controlled Colab HTTP 500 Upload Recovery**: Validating remote paths, probing missing parent directories via bounded `exec_code`, and retrying at most once if newly created.
+- **Mandatory 21-Stage Offline E2E Pipeline Verification**: Full lifecycle pass in `tests/test_project_e2e.py`.
+
+> [!NOTE]
+> All automated tests execute in strictly offline/mock environments (`OFFLINE_RELEASE_READY`). Any live cloud GPU allocation or live Google Drive API requests require explicit human operator approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
+
+## Human-Approval-Gated Live Smoke-Test Procedures
+
+These procedures are **strictly manual and require explicit operator authorization and valid credentials**. They are never executed in automated CI.
+
+### Verification Categories
+- **`OFFLINE_RELEASE_READY`**: Automated unit tests, integration tests, mock Drive uploads/downloads, mock Colab sessions, and headless Chromium browser tests pass completely (100% pass) in offline/CI environments with 0 cloud spending.
+- **`LIVE_VALIDATION_REQUIRES_APPROVAL`**: Real cloud Colab GPU allocation and real Google Drive API requests require human operator approval, valid credentials, budget authorization, and are executed manually using the smoke-test procedures below.
+
+---
+
+### Procedure A: Google Drive Live Smoke Test (11 Steps)
+**Mode: `LIVE_VALIDATION_REQUIRES_APPROVAL`**
+**Prerequisites**: Google Drive API credentials file with permissions `0600` at `~/.config/colab-cli/drive_credentials.json`.
+
+1. **Prerequisites & Permission Verification**:
+   Verify credentials file exists and has private permissions:
+   `test -f ~/.config/colab-cli/drive_credentials.json && ls -l ~/.config/colab-cli/drive_credentials.json` (must be `-rw-------`).
+2. **Dry-Run OAuth Token Exchange**:
+   Run token refresh routine to ensure valid access token can be acquired without creating remote files.
+3. **Remote Folder Structure Discovery**:
+   Resolve target root folder `ColabCLI_Artifacts/smoke-test-run/` on Google Drive, verifying folder creation idempotency.
+4. **Seed Synthetic Checkpoint (Revision A)**:
+   Create local test checkpoint `model.pt` (e.g. 512 KiB synthetic weights, Step 100):
+   `dd if=/dev/urandom of=./smoke_model.pt bs=1024 count=512`.
+5. **Resumable Upload Execution (Revision A)**:
+   Publish Revision A via `GoogleDriveArtifactStore.publish()`; verify HTTP 308 range handling and chunk progression.
+6. **Authoritative Remote Verification (Revision A)**:
+   Query Drive v3 `files.get` endpoint for `size`, `md5Checksum`, and `sha256` matching local file.
+7. **PublicationManifest v2 Verification (Revision A)**:
+   Verify local `manifest.json` records Revision A under `smoke-test-run/checkpoints/model.pt@sha256_<HASH_A>` with `is_latest=True`.
+8. **Local In-Place Overwrite (Revision B)**:
+   Overwrite `smoke_model.pt` with distinct weights (Step 200, distinct SHA256) and publish Revision B to the same logical path `checkpoints/model.pt`.
+9. **Multi-Revision Preservation Audit**:
+   Verify `manifest.json` contains BOTH Revision A (`is_latest=False`) and Revision B (`is_latest=True`), with `latest_by_path["checkpoints/model.pt"]` pointing to Revision B.
+10. **Dual Retrieval & Bitwise Hash Verification**:
+    Retrieve latest weights using logical path and Revision A using `@sha256_<HASH_A>`, verifying bitwise equality against original sources.
+11. **Transfer Journal Audit & Teardown**:
+    Inspect `transfer_journal.json` to confirm both transfers have status `PUBLISHED` with 0 uncommitted records; delete test folder on Drive if desired.
+
+---
+
+### Procedure B: Colab GPU Live Smoke Test (12 Steps)
+**Mode: `LIVE_VALIDATION_REQUIRES_APPROVAL`**
+**Prerequisites**: Explicit human budget authorization (e.g., T4 GPU, max 15-minute lease, max 1.0 compute unit cap).
+
+1. **Operator Consent & Budget Cap Authorization**:
+   Record human operator approval string, target GPU (`T4`), maximum lease time (`900` seconds), and compute unit cap.
+2. **Pre-Flight Diagnostic & Baseline Usage Check**:
+   Run `python3 colab_server.py doctor` and `python3 colab_server.py usage` to log initial compute-unit balance.
+3. **Project Workspace Setup**:
+   Create a test workspace with entrypoint `gpu_probe.py` verifying `torch.cuda.is_available()`, device name, and memory.
+4. **Manifest Validation**:
+   Validate project manifest with `python3 -m colab_adapter.cli project validate ./gpu-smoke-test --json`.
+5. **Zero-Allocation Offline Execution Plan**:
+   Generate plan with `python3 -m colab_adapter.cli project plan ./gpu-smoke-test --json` (verifying 0 VMs allocated).
+6. **Explicit Approval Token Provisioning**:
+   Provision session: `python3 -m colab_adapter.cli project up ./gpu-smoke-test --gpu T4 --lease 900 --approval-token "ALLOCATE T4 $(date +%s)" --json`.
+7. **Incremental Workspace Source Sync**:
+   Synchronize sources: `python3 -m colab_adapter.cli project sync ./gpu-smoke-test --json`.
+8. **Remote Training Execution**:
+   Run GPU probe: `python3 -m colab_adapter.cli project exec ./gpu-smoke-test --json`.
+9. **Execution Output & CUDA Device Verification**:
+   Inspect output logs to confirm remote GPU was active, executed under assigned PID, and emitted training metrics.
+10. **Output Artifact Pull & Verification**:
+    Retrieve generated output/checkpoint and verify SHA256 checksum against execution record.
+11. **Graceful Session Teardown**:
+    Terminate session: `python3 -m colab_adapter.cli project stop ./gpu-smoke-test --json`.
+12. **Post-Execution Account Audit & CU Accounting**:
+    Run `python3 colab_server.py usage` to verify final compute unit spend and confirm `python3 -m colab_adapter.cli sessions` reports 0 active sessions.
+
+---
+
+### Procedure C: Cross-Device Authenticated Access Test (7 Steps)
+**Mode: `LIVE_VALIDATION_REQUIRES_APPROVAL`**
+**Prerequisites**: Two machines or loopback test environments with SSH or TLS certificates.
+
+1. **Secure Monitoring Server Startup**:
+   Start server: `python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8443 --auth-token "<MONITOR_AUTH_TOKEN>"`.
+2. **Secure Client Tunnel / TLS Connection**:
+   Establish SSH port-forwarding from secondary device (`ssh -NL 8443:127.0.0.1:8443 user@server`) or access TLS endpoint.
+3. **Negative Control (Unauthenticated Access Rejection)**:
+   Attempt `curl -i http://127.0.0.1:8443/api/v1/runs` without token; verify HTTP 401 Unauthorized is returned.
+4. **Authenticated REST API Verification**:
+   Query `curl -i -H "Authorization: Bearer <TOKEN>" http://127.0.0.1:8443/api/v1/runs` and `/api/v1/summary`; verify HTTP 200 and JSON schema.
+5. **Headless Browser Web Dashboard & CSP Inspection**:
+   Open dashboard in browser; inspect console to verify per-response CSP nonce, zero inline handler warnings, and proper rendering of `LATEST` and `HISTORICAL` badges.
+6. **Cross-Device Artifact Retrieval**:
+   From secondary client, retrieve checkpoint artifact via WorkspaceBroker or DriveStore; verify SHA256 checksum matches primary node.
+7. **Client Disconnect & Teardown Audit**:
+   Close client connection, stop monitor server, and verify server logs contain zero exposed tokens or secrets.
 
 ### Operational Rollback Instructions
 
