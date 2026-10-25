@@ -79,7 +79,7 @@ python3 -m colab_adapter.cli usage
 python3 -m colab_adapter.cli sessions
 ```
 
-Record the output verbatim (CU balance and the list of existing sessions). Note any managed `live-smoke` session that already exists. Do not touch any session in this step.
+Record the output verbatim (CU balance, **`Active assignments: N` (the baseline; expected 0)**, and the list of existing sessions). The owner keeps the Colab web UI's runtime list open during the whole test so a stray runtime can be stopped by hand. Note any managed `live-smoke` session that already exists. Do not touch any session in this step.
 
 ### G3: approval and the single allocation
 
@@ -107,7 +107,7 @@ The operator reads the summary and plan digest, then types the phrase exactly. E
 python3 -m colab_adapter.cli project up --manifest examples/live-smoke/colab-project.json --lease-seconds 900 --approval-id <APPROVAL_ID> --json
 ```
 
-Expected: exactly one new managed session whose `session_id` is `<SID>` and whose `state` is `READY`; the lease guard has been started (exit code 0). Exit code 3 means the approval was refused (zero `colab new` calls); exit code 4 means the global cap of one active managed session is reached (the approval is not consumed). If `up` fails after the approval was consumed (allocation error, timeout, or the guard could not start, in which case `up` stops the new session itself), the approval is **spent**: run teardown, report, and do **not** request a new approval without the owner's fresh instruction. Never run `project up` a second time.
+Expected: exactly one new managed session whose `session_id` is `<SID>` and whose `state` is `READY`; the lease guard has been started (exit code 0). Exit code 3 means the approval was refused (zero `colab new` calls); exit code 4 means the global cap of one active managed session is reached (the approval is not consumed). If `up` fails after the approval was consumed (allocation error, timeout, or the guard could not start, in which case `up` stops the new session itself), the approval is **spent**: run teardown, report, and do **not** request a new approval without the owner's fresh instruction. Never run `project up` a second time. **Do not press Ctrl-C or kill `project up` while it runs**: upstream `colab new` assigns the VM before it records the local session name, so an interrupted or timed-out `up` can leave an *orphan* runtime that no local name refers to. The adapter then keeps the record `NEEDS_RECONCILIATION` (it still counts toward the cap) and prints an orphan warning; treat that as a live billing risk and use the teardown checks below and the Colab UI.
 
 **G3d (verify the guard before any workload; read-only):**
 
@@ -178,6 +178,7 @@ python3 -m colab_adapter.cli usage
 
 - `status` records the remaining lease and the guard state for the report (at most 3 status calls in the whole plan).
 - `stop` targets only `<SID>` (and terminates that session's guard after a successful stop).
+- After `stop`, `usage` must show `Active assignments` equal to the G2 baseline (the server-side count and the strongest evidence), and `sessions` must not list `<SID>`. **Any `[?] <endpoint>` line in `sessions` (a runtime with no local name), or an assignment count above the baseline, is a possible orphan: stop, tell the owner immediately, and have them stop it in the Colab UI.** Upstream `colab stop` exits 0 even for a name it does not know, so a successful `stop` alone proves nothing.
 - After `stop`, `sessions` must not list `<SID>`. If it still does, retry `project stop --session-id <SID> --json` once and report the result; if it is still listed, tell the owner immediately so they can stop it from the Colab UI. Do not stop any other session.
 - If `up` failed in a way that may have left a runtime (timeout, nonzero exit after `new` started), `sessions` is the source of truth: report any unexpected session id to the owner; do not stop sessions this plan did not create.
 - If the guard is not alive and the session cannot be stopped, the operator runs `python3 -m colab_adapter.cli project reconcile --json` (this auto-stops expired leases and `NEEDS_RECONCILIATION`/`STOPPING`/stale `PROVISIONING` records, managed ids only; read every `WARNING:` line) and then re-checks `sessions` and `usage`.
@@ -217,6 +218,7 @@ Abort the plan, run teardown (section 6), and stop further steps when any of the
 - G5 exits with a non-zero code, or the `DONE_OK` marker is missing.
 - The remaining lease from `status` is below 300 s before G5.
 - A command outside this plan is needed to proceed.
+- `usage` shows `Active assignments` above the G2 baseline at any check, or `sessions` shows a `[?]` line.
 - Any output shows a credential, token or account identifier. Stop and report it; do not paste it into the report.
 - `sessions` lists sessions that the plan did not create and the owner has not approved touching them.
 
