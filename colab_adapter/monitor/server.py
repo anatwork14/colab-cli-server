@@ -976,6 +976,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             run_path = Path(run_dir).resolve()
             known_shas = {a["sha256"] for a in parsed_artifacts if a.get("sha256")}
             known_paths = set()
+            # The mutable alias (checkpoints/<name>) is a cache of a manifest head; never list it as a second artifact.
+            known_logical = {str(a.get("logical_path")).lstrip("/") for a in parsed_artifacts if a.get("logical_path")}
             for a in parsed_artifacts:
                 p_str = a.get("path")
                 if p_str and not p_str.startswith("http"):
@@ -1006,6 +1008,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                             continue
                         resolved_fpath = fpath.resolve()
                         if resolved_fpath in known_paths:
+                            continue
+                        if fpath.relative_to(run_path).as_posix() in known_logical:
                             continue
                         f_size = st.st_size
                         f_sha: Optional[str] = None

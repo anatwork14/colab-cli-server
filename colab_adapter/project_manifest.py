@@ -146,7 +146,9 @@ def _parse_raw_manifest(raw: Dict[str, Any], base_dir: Path) -> ProjectSpec:
     from .storage.validation import validate_project_id
 
     try:
+        # Both spellings are used as storage project ids (default "proj-<name>", and the bare name by the broker).
         validate_project_id(f"proj-{name.strip()}")
+        validate_project_id(name.strip())
     except ArtifactValidationError as exc:
         raise ManifestValidationError(
             f"Project 'name' {name.strip()!r} cannot be used as a storage project identifier "

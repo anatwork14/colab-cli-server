@@ -510,7 +510,7 @@ If unexpected transfer issues occur in staging or production:
 
 ## Drive Store Hardening: Pending Revisions, Locks and Rate Limits (PR #24, offline)
 
-This section describes `colab_adapter/storage/google_drive.py`, `drive_metadata.py` and `worker.py` at commit `108f052`. Everything here is verified only by offline tests with a mock Drive client. No live Google Drive or OAuth validation has been performed, and live validation requires explicit owner approval.
+This section describes `colab_adapter/storage/google_drive.py`, `drive_metadata.py` and `worker.py` on branch `fix/v2-postmerge-hardening-23` (PR #24). Everything here is verified only by offline tests with a mock Drive client. No live Google Drive or OAuth validation has been performed, and live validation requires explicit owner approval.
 
 ### 1. Shared per-manifest lock
 

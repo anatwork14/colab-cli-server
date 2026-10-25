@@ -322,7 +322,7 @@ In the event of an operational issue or security regression in production or sta
 
 ## 8. Project-Scoped Monitoring Identity (PR #24, offline)
 
-Implemented in `colab_adapter/monitor/server.py` and `colab_adapter/telemetry.py` at commit `108f052`. Offline tests only; the dashboard has not been validated against a live Colab account.
+Implemented in `colab_adapter/monitor/server.py` and `colab_adapter/telemetry.py` on branch `fix/v2-postmerge-hardening-23` (PR #24). Offline tests only; the dashboard has not been validated against a live Colab account.
 
 **Run identity.** A run is identified by a RunKey `(project_id, run_id)`. The key comes from telemetry events (`project_id`, `run_id`) and from the on-disk layout `projects/<project>/runs/<run>`. A bare `run_id` is never treated as unique.
 
@@ -336,7 +336,7 @@ Implemented in `colab_adapter/monitor/server.py` and `colab_adapter/telemetry.py
 
 **Filesystem safety.** The run scanner skips symlinked project directories, runs directories and run directories, so one project cannot alias another. It skips symlinked `manifest.json` files and symlinked artifact files. It excludes the internal directories `.revisions`, `.upload_staging`, `.staged_uploads`, `.transfer_locks` and `.locks` from artifact listings.
 
-**Artifact ids.** Artifact ids shown by the monitor are always prefixed `<project>/<run>/`, so the same logical path in two projects is two distinct entries.
+**Artifact ids.** Artifact ids shown by the monitor are prefixed `<project>/<run>/` for every run that has a project (legacy runs with no project key get `<run>/...` only), so the same logical path in two projects is two distinct entries. Files under a run directory that match a manifest `logical_path` (the mutable latest alias) are never listed a second time.
 
 **Account-wide versus per-run counters**
 

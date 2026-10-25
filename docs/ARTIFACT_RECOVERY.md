@@ -283,7 +283,7 @@ If an issue occurs during artifact recovery or migration:
 
 ## Local Store: Exact-Revision and Latest-Alias Semantics (PR #24, offline)
 
-This section describes `colab_adapter/storage/local.py` at commit `108f052`. All evidence is offline (temporary directories and mock clients). No live Colab or Google Drive run has been validated against this behaviour.
+This section describes `colab_adapter/storage/local.py` on branch `fix/v2-postmerge-hardening-23` (PR #24). All evidence is offline (temporary directories and mock clients). No live Colab or Google Drive run has been validated against this behaviour.
 
 ### Layout per run
 
@@ -311,7 +311,8 @@ projects/<project>/runs/<run>/
 
 - `manifest.json` is authoritative. Its `latest_by_path` map is the only source of the head.
 - The alias `checkpoints/<name>` is a recoverable cache: a verified copy of the head revision. It is rewritten only while the manifest lock is held, by staging a verified copy and atomically replacing the alias.
-- Unversioned reads resolve the head from the manifest, verify the head revision file, and repair the alias under the lock if its content does not match. A missing head revision file raises `ArtifactNotFoundError`. The alias is never used in its place.
+- Unversioned reads resolve the head from the manifest, verify the head revision file, and repair the alias under the lock if its content does not match. A missing head revision file raises `ArtifactNotFoundError`; the alias is never used in its place. Exception: when the head was published into the shared manifest by another provider (for example Google Drive, `remote_file_id` set, no local bytes), the local store returns the manifest metadata with an empty `path`, `exists()` is False and `retrieve()` raises `ArtifactNotFoundError`; the alias is not touched.
+- **Mixed providers on one run (scope limit).** The local and Drive stores share one manifest and one lock, so no entry is lost. They do not coordinate the *remote head*: a local publish of bytes that Drive holds as a stale pending revision is a local decision, and the local alias is reconciled only for heads that have local bytes. Consumers must use `get_metadata()`/`retrieve()` for the head, not the alias file.
 - Publishing a new revision runs under one locked read-modify-write: install the immutable revision, add it to the manifest, save the manifest, then reconcile the alias. A crash between the manifest save and the alias write is repaired on the next publish or unversioned read.
 - Replay of a historical revision (a publish whose digest is already in the manifest but is not the head) verifies the immutable file and returns the record with `is_latest=False`. It leaves the manifest and the alias untouched, so the head never moves.
 - Republishing the current head is idempotent. It re-verifies the immutable file and repairs only the alias.

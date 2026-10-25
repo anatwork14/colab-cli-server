@@ -238,14 +238,14 @@ These procedures are **strictly manual and require explicit operator authorizati
 
 ## 11. PR #24 Offline Verification Evidence and Known Limitations
 
-Scope: commit `108f052` (branch of PR #24). The evidence below is offline only, using temporary directories and a mock Drive client. Nothing here is live Colab, Google Drive or OAuth validation, and no result in this section is a production or live-verified claim.
+Scope: branch `fix/v2-postmerge-hardening-23` (PR #24). The evidence below is offline only, using temporary directories and a mock Drive client. Nothing here is live Colab, Google Drive or OAuth validation, and no result in this section is a production or live-verified claim.
 
 **Offline test evidence**
 
 - Test command: `python3 -m unittest discover -s tests -v`
-- Result: `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>` tests run, `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>` passed, `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>` skipped, `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>` failed.
-- Python versions: `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>`.
-- Browser test (`tests/test_browser_xss_and_cross_process_qa.py`, requires `COLAB_REQUIRE_BROWSER_TESTS=1`): `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>`.
+- Result (Python 3.8.10): 594 tests run, 593 passed, 1 skipped, 0 failed. Result (Python 3.12.14): 594 tests run, 594 passed, 0 skipped, 0 failed. Command: `python3 -m unittest discover -s tests -p "test_*.py"`. Baseline before PR #24 hardening: 381 tests (1 skipped).
+- Python versions: 3.8.10 and 3.12.14 executed. Python 3.13 was not available on the test host and was not run.
+- Browser test (`tests/test_browser_xss_and_cross_process_qa.py`, requires `COLAB_REQUIRE_BROWSER_TESTS=1`): real Chromium was not available on the test host; only the portable structural fallback ran. The real-browser job was not run locally.
 
 **Test modules added or changed in PR #24**
 
@@ -264,7 +264,7 @@ Mock support changed in `tests/drive_api_mock.py`.
 
 **Evidence status**
 
-- Offline mock tests: `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>` (placeholder).
+- Offline mock tests: 594 (Python 3.8 and 3.12), see above.
 - Live Google Drive: not run. Live validation requires explicit owner approval.
 - Live Colab: not run. Live validation requires explicit owner approval.
 - Live OAuth: not run. Live validation requires explicit owner approval.
