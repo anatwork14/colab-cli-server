@@ -157,8 +157,8 @@ The V2 implementation extends the original one-shot adapter into a comprehensive
 - **Declarative Project Manifests (`colab_project.json`):** Declare source patterns, entrypoints, target accelerators, and artifact rules with offline validation and path escape rejection.
 - **Content-Addressed Incremental Sync:** Two-phase workspace synchronization transfers only modified files via streaming chunked SHA-256 diffing, with atomic commit and opt-in remote file deletion.
 - **Collision-Resistant Session Lifecycle:** Project runtime leases (`colab-v2-<name>-<uuid>`) prevent collisions, enforce state machine transitions, lock against concurrent allocations, and fail-closed on unmanaged user sessions.
-- **Multi-Tier Checkpoint & Artifact Recovery:** Staged atomic download with integrity checksums, ZIP header verification, and safe PyTorch `weights_only=True` inspection.
-- **Private Cross-Device Training & Compute Monitor:** Read-only HTTP/SSE dashboard displaying compute unit balance, burn rates, top-up detection, unattributed spend alerts, and run loss/step charts.
+- **Multi-Tier Checkpoint & Immutable Revision Recovery:** Staged atomic download with integrity checksums, ZIP header verification, safe PyTorch `weights_only=True` inspection, and immutable `@sha256_<digest>` revision history (`PublicationManifest` v2) preserving both latest and historical checkpoints across local and Google Drive storage.
+- **Private Cross-Device Training & Compute Monitor:** Read-only HTTP/SSE dashboard displaying compute unit balance, burn rates, top-up detection, unattributed spend alerts, run loss/step charts, and checkpoint revision history (`LATEST` vs `HISTORICAL`), hardened with per-response cryptographic CSP nonces and verified in headless Chromium CI.
 
 ### Project Workspace CLI Commands
 

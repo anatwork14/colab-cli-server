@@ -1251,16 +1251,19 @@ class GoogleDriveArtifactStore:
                     return existing_art
 
                 # 4. Check journal for this exact revision or pre-enqueued in-progress transfer
-                base_rec = self.journal.get_transfer(base_transfer_id)
-                if base_rec is not None and (
-                    base_rec.status != TransferStatus.PUBLISHED.value
-                    or (base_rec.sha256 and base_rec.sha256.lower() == local_sha256.lower())
-                ):
-                    transfer_id = base_transfer_id
-                    record = base_rec
+                record = self.journal.get_transfer(rev_transfer_id)
+                if record is not None:
+                    transfer_id = record.transfer_id
                 else:
-                    transfer_id = rev_transfer_id
-                    record = self.journal.get_transfer(transfer_id)
+                    base_rec = self.journal.get_transfer(base_transfer_id)
+                    if base_rec is not None and (
+                        base_rec.status != TransferStatus.PUBLISHED.value
+                        or (base_rec.sha256 and base_rec.sha256.lower() == local_sha256.lower())
+                    ):
+                        record = base_rec
+                        transfer_id = base_rec.transfer_id
+                    else:
+                        transfer_id = rev_transfer_id
 
                 if record is None:
                     # Scan journal for any published record for (project_id, run_id) with matching sha256

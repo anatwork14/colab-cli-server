@@ -504,9 +504,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="header-actions">
         <span id="health-badge" class="badge badge-info">INITIALIZING</span>
         <span id="header-meta" class="header-meta">Checking health...</span>
-        <input type="password" id="auth-token-input" class="hidden" placeholder="Bearer Token" autocomplete="off" />
-        <button id="connect-btn" class="hidden" title="Connect">Connect</button>
-        <button id="logout-btn" class="hidden" title="Logout">Logout</button>
+        <input type="password" id="auth-token-input" class="filter-input" style="max-width: 160px;" placeholder="Bearer Token" autocomplete="off" />
+        <button id="connect-btn" class="btn btn-primary btn-sm" title="Connect">Connect</button>
+        <button id="logout-btn" class="btn btn-secondary btn-sm" title="Logout">Logout</button>
         <button id="btn-refresh" class="btn btn-secondary btn-sm" title="Refresh all telemetry data">Refresh Now</button>
         <button id="btn-export-csv" class="btn btn-secondary" title="Export compute usage snapshots to CSV">Export Compute CSV</button>
         <button id="btn-set-token" data-testid="btn-auth" class="btn btn-primary" title="Set or manage Bearer token">Auth / Token</button>
@@ -1452,6 +1452,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           fetch(`/api/v1/runs/${encodedId}/artifacts`, { headers: getHeaders() }),
         ]);
 
+        if (selectedRunId !== safeRunId) return;
         if (detailRes.status === 401) { showAuthBanner(); return; }
 
         const detail = detailRes.ok ? await detailRes.json() : {};
@@ -1459,6 +1460,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const logs = logsRes.ok ? await logsRes.json() : {};
         const drive = driveRes.ok ? await driveRes.json() : {};
         const artifacts = artifactsRes.ok ? await artifactsRes.json() : {};
+        if (selectedRunId !== safeRunId) return;
 
         renderMetricsChart(Array.isArray(metrics) ? metrics : []);
         const errEvents = (detail.events || []).filter(e => e.event_type === 'error');

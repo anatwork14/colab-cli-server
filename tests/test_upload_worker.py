@@ -104,21 +104,6 @@ class MockStoreForWorker:
                 else:
                     manifest = PublicationManifest(project_id=project_id, run_id=run_id)
                 manifest.add_artifact(stored)
-                if "@sha256_" in artifact_id:
-                    base_id = artifact_id.split("@sha256_")[0]
-                    base_stored = StoredArtifact(
-                        artifact_id=base_id,
-                        storage_provider=self.provider_name,
-                        path=str(latest_file),
-                        size_bytes=p.stat().st_size,
-                        sha256=sha256,
-                        project_id=project_id,
-                        run_id=run_id,
-                        artifact_type=artifact_type,
-                        remote_file_id=f"cloud-id-{p.name}-{sha256[:8]}",
-                        metadata=meta,
-                    )
-                    manifest.add_artifact(base_stored)
                 manifest.save(manifest_file)
             finally:
                 if fcntl:

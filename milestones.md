@@ -1,6 +1,6 @@
 # Colab CLI Server V2 — Milestones & Release Gates
 
-> Status as of 2026-10-25: M0–M8 & V2-Drive COMPLETE (Offline & local headless browser verified; 240/240 tests passing on Python 3.12, 239/240 + 1 skip on Python 3.8); M9 DEFERRED. PRs #3, #13–#20, and #22 form a reconciled review stack and remain unmerged into `main` pending owner approval. Scope is interactive human-approved research workflows, NOT an unrestricted autonomous cloud provisioning platform. No deadline or engineering estimate is promised.
+> Status as of 2026-10-25: M0–M8 & V2-Drive COMPLETE (Offline, local headless Chromium & GitHub Actions `browser-security` CI verified; 266/266 tests passing on Python 3.12, 265/266 + 1 skip on Python 3.8); M9 DEFERRED. PRs #3, #13–#20, and #22 form a reconciled review stack and remain unmerged into `main` pending owner approval. Scope is interactive human-approved research workflows, NOT an unrestricted autonomous cloud provisioning platform. No deadline or engineering estimate is promised.
 
 ## Definition of Done (applies to every milestone)
 
@@ -141,8 +141,8 @@
   - Implemented in-process background retry scheduler for transient failures without worker restart.
   - Hardened reproducible source snapshots against symlinks and self-referential output archives.
 - Added comprehensive offline and local browser test suites in `tests/test_storage_abstraction.py`, `tests/test_google_drive_store.py`, `tests/test_reproducibility.py`, `tests/test_checkpoint_policy.py`, `tests/test_upload_worker.py`, `tests/test_workspace_broker.py`, `tests/test_drive_and_broker_e2e.py`, `tests/test_v2_security_and_resumable_recovery.py`, `tests/test_dashboard_ui_integration.py`, `tests/test_adversarial_security_and_fault_injection.py`, and `tests/test_browser_xss_and_cross_process_qa.py`.
-- **Full test suite: 240/240 tests passing on Python 3.12 (239/240 passed + 1 skipped on Python 3.8; 0 failures, 0 errors).**
-- **Gate G-Drive Satisfied:** 0 runtime spend, 0 cloud VMs allocated, 100% offline mocked + local headless Chromium browser + two-OS-process concurrency verification. Live Drive validation pending user approval.
+- **Full test suite: 266/266 tests passing on Python 3.12 (265/266 passed + 1 skipped on Python 3.8; 0 failures, 0 errors).**
+- **Gate G-Drive Satisfied:** 0 runtime spend, 0 cloud VMs allocated, 100% offline mocked + immutable checkpoint revision history (`PublicationManifest` v2) + reproducible headless Chromium browser (`COLAB_REQUIRE_BROWSER_TESTS=1`) + two-OS-process concurrency verification. Live Drive validation pending user approval.
 
 
 ## Development sequence and parallelism

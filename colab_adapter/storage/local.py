@@ -113,13 +113,14 @@ class LocalArtifactStore:
         # Canonical revision artifact ID
         revision_artifact_id = format_revision_artifact_id(project_id, run_id, rel_path, src_sha256)
 
-        # Revision file destination
-        target_p = Path(target_filename)
-        rev_filename = f"{target_p.stem}.sha256_{src_sha256[:12]}{target_p.suffix}"
-        rev_dest_file = dest_dir / rev_filename
+        # Revision file destination inside content-addressed .revisions/<sha16>/ directory
+        # so Path(rev_dest_file).name remains target_filename while never overwriting prior revisions.
+        rev_dest_dir = dest_dir / ".revisions" / src_sha256[:16]
+        rev_dest_dir.mkdir(parents=True, exist_ok=True)
+        rev_dest_file = rev_dest_dir / target_filename
 
         # Write immutable revision file via atomic copy
-        tmp_rev = dest_dir / f"{target_filename}.rev.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        tmp_rev = rev_dest_dir / f"{target_filename}.rev.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
         shutil.copy2(src, tmp_rev)
         try:
             verify_sha = compute_file_sha256(tmp_rev)

@@ -907,7 +907,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
 
-            for root, _, files in os.walk(run_path):
+            for root, dirs, files in os.walk(run_path):
+                dirs[:] = [d for d in dirs if d not in (".revisions", ".upload_staging", ".staged_uploads")]
                 for fname in files:
                     if fname == "manifest.json" or fname.endswith(".tmp") or ".tmp." in fname:
                         continue

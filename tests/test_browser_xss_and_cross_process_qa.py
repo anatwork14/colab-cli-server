@@ -915,10 +915,16 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
           }}
 
           // Re-select target run to ensure inspector displays its artifacts
-          if (targetRow) {{
-            await targetRow.click();
-            await page.waitForTimeout(400);
+          const finalTargetRow = await page.$('tr[data-run-id="{self.run_adv_id}"]') || targetRow;
+          if (finalTargetRow) {{
+            await finalTargetRow.click();
           }}
+
+          // Wait for target run's artifact revisions to finish rendering
+          await page.waitForFunction(
+            () => (document.getElementById("artifacts-table")?.textContent || "").includes("aaaa"),
+            {{ timeout: 7000 }}
+          );
 
           // Switch tabs if present ([data-tab="artifacts"], [data-tab="drive"], [data-tab="logs"])
           for (const tabName of ["artifacts", "drive", "logs"]) {{
@@ -1447,9 +1453,11 @@ class TestCrossProcessDrivePublication(unittest.TestCase):
             journal_data = json.load(jf)
         self.assertIsInstance(journal_data, dict)
         transfer_key = f"google_drive-test_proj-test_run-{self.ckpt_path.name}"
-        self.assertIn(transfer_key, journal_data)
-        self.assertEqual(journal_data[transfer_key]["status"], TransferStatus.PUBLISHED.value)
-        self.assertEqual(journal_data[transfer_key]["remote_file_id"], res1["remote_file_id"])
+        matching_t_keys = [k for k in journal_data if k == transfer_key or k.startswith(transfer_key + "-")]
+        self.assertTrue(len(matching_t_keys) >= 1, f"{transfer_key} not found in {journal_data}")
+        t_rec = journal_data[matching_t_keys[0]]
+        self.assertEqual(t_rec["status"], TransferStatus.PUBLISHED.value)
+        self.assertEqual(t_rec["remote_file_id"], res1["remote_file_id"])
 
         # 5. Shared PublicationManifest (manifest.json) is valid JSON and records artifact without corruption
         manifest_path = self.workspace_dir / "projects" / "test_proj" / "runs" / "test_run" / "manifest.json"
@@ -1559,7 +1567,9 @@ class TestCrossProcessDrivePublication(unittest.TestCase):
         with open(self.journal_path, "r", encoding="utf-8") as jf:
             journal_after_abort = json.load(jf)
         t_key = f"google_drive-test_proj-test_run-{self.ckpt_path.name}"
-        self.assertEqual(journal_after_abort[t_key]["bytes_transferred"], 262144)
+        matching_abort_keys = [k for k in journal_after_abort if k == t_key or k.startswith(t_key + "-")]
+        self.assertTrue(len(matching_abort_keys) >= 1, f"{t_key} not found in {journal_after_abort}")
+        self.assertEqual(journal_after_abort[matching_abort_keys[0]]["bytes_transferred"], 262144)
 
         # 2. Process 2 starts, queries progress via HTTP 308, resumes from offset 262144, finishes publication
         p2 = subprocess.Popen(
@@ -1601,7 +1611,9 @@ class TestCrossProcessDrivePublication(unittest.TestCase):
         # Verify journal status transitioned to PUBLISHED
         with open(self.journal_path, "r", encoding="utf-8") as jf:
             journal_final = json.load(jf)
-        self.assertEqual(journal_final[t_key]["status"], TransferStatus.PUBLISHED.value)
+        matching_final_keys = [k for k in journal_final if k == t_key or k.startswith(t_key + "-")]
+        self.assertTrue(len(matching_final_keys) >= 1, f"{t_key} not found in {journal_final}")
+        self.assertEqual(journal_final[matching_final_keys[0]]["status"], TransferStatus.PUBLISHED.value)
 
     def test_two_os_processes_different_revisions_same_filename_preserved(self) -> None:
         """Process 1 and Process 2 publish different revisions of same filename; both succeed with distinct SHA256."""
