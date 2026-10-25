@@ -235,13 +235,16 @@ def build_exec_code(command_or_code: str, working_dir: Optional[str] = None, she
 
 def _attach_shell_exit(result: Dict[str, Any]) -> Dict[str, Any]:
     """Read the EXIT_CODE marker (last whole line). A missing marker is never a success."""
-    found = _EXIT_MARKER_RE.findall(result.get("output") or "")
+    lines = [ln for ln in (result.get("output") or "").splitlines() if ln.strip()]
+    last = _EXIT_MARKER_RE.findall(lines[-1].strip()) if lines else []
     result["shell"] = True
-    if not found:
+    if len(last) != 1 or lines[-1].strip() != f"{EXIT_CODE_MARKER} {last[0]}":
+        # Only a marker on the FINAL non-empty line counts; a marker printed earlier by the command
+        # itself (or left behind by truncated output) must never be read as the real exit status.
         result["exit_code"] = None
         result["success"] = False
         return result
-    code = int(found[-1])
+    code = int(last[0])
     result["exit_code"] = code
     result["success"] = bool(result.get("success")) and code == 0
     return result
@@ -742,6 +745,9 @@ class ProjectSessionManager:
         if listed:
             return _Verification(False, None, "session still listed by `colab sessions`", listed=True)
         after = self._assignments_now()
+        if baseline is not None and after is None:
+            # A baseline exists, so an unreadable post-stop usage count is UNVERIFIED, never silently weak.
+            return _Verification(False, None, "could not read `colab usage` after stop; baseline is known", listed=False)
         if baseline is None or after is None:
             return _Verification(True, "weak", "usage baseline unavailable; verified with sessions only", listed=False)
         if after <= baseline:
@@ -881,7 +887,12 @@ class ProjectSessionManager:
             all_managed = self.registry.get_all_managed()
             info = all_managed.get(session_id, {})
             session = ProjectSession.from_dict(info) if info else None
-            ok = self._stop_locked(session_id, session)
+            if info.get("state") == ProjectSessionState.TERMINATED.value:
+                # Already stopped and verified (for example by the lease guard): do not call `colab stop`
+                # again, which upstream would answer with a misleading "not found".
+                ok = True
+            else:
+                ok = self._stop_locked(session_id, session)
         if terminate_guard:
             self._terminate_guard(session_id)
         return ok

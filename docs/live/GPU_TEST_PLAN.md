@@ -115,7 +115,7 @@ Expected: exactly one new managed session whose `session_id` is `<SID>` and whos
 python3 -m colab_adapter.cli project status --session-id <SID> --json
 ```
 
-Expected: the guard is reported alive with a deadline about 900 s after the allocation and a positive remaining time. If the guard is not alive, run teardown immediately (a session without a live guard has no deadline enforcement).
+Expected: the guard is reported alive with a deadline about 900 s after the allocation and a positive remaining time. The record's `assignments_before` should be a number; if it is `null` the later stop verification is only `weak` (sessions listing only), which the report must say. A nonzero exit code (5) means attention is needed. After G3c, `usage` should show `Active assignments` equal to the G2 baseline **+ 1**. If the guard is not alive, run teardown immediately (a session without a live guard has no deadline enforcement).
 
 ### G4: sync and GPU probe
 
@@ -176,12 +176,21 @@ python3 -m colab_adapter.cli sessions
 python3 -m colab_adapter.cli usage
 ```
 
-- `status` records the remaining lease and the guard state for the report (at most 3 status calls in the whole plan).
+- `status` records the remaining lease and the guard state for the report. Status calls are read-only and cheap; use as many as needed (G3d, the lease check before G5, teardown, G7), but do not poll in a loop. `status` exits **5** when the record is NEEDS_RECONCILIATION/STOPPING or the guard is dead under an active lease: treat exit 5 as an alarm, not a formality.
 - `stop` targets only `<SID>` (and terminates that session's guard after a successful stop).
 - After `stop`, `usage` must show `Active assignments` equal to the G2 baseline (the server-side count and the strongest evidence), and `sessions` must not list `<SID>`. **Any `[?] <endpoint>` line in `sessions` (a runtime with no local name), or an assignment count above the baseline, is a possible orphan: stop, tell the owner immediately, and have them stop it in the Colab UI.** Upstream `colab stop` exits 0 even for a name it does not know, so a successful `stop` alone proves nothing.
 - After `stop`, `sessions` must not list `<SID>`. If it still does, retry `project stop --session-id <SID> --json` once and report the result; if it is still listed, tell the owner immediately so they can stop it from the Colab UI. Do not stop any other session.
-- If `up` failed in a way that may have left a runtime (timeout, nonzero exit after `new` started), `sessions` is the source of truth: report any unexpected session id to the owner; do not stop sessions this plan did not create.
+- After **any** failed or interrupted `up` (timeout, nonzero exit, Ctrl-C, guard could not start), do not trust `sessions` alone: `usage` showing `Active assignments` above the G2 baseline means a runtime exists. Stop and tell the owner at once so they stop it in the Colab UI, and do not stop sessions this plan did not create. A `[?] <endpoint>` line in `sessions` is the same alarm. A nonzero `colab new` exit does not prove that no runtime was assigned.
 - If the guard is not alive and the session cannot be stopped, the operator runs `python3 -m colab_adapter.cli project reconcile --json` (this auto-stops expired leases and `NEEDS_RECONCILIATION`/`STOPPING`/stale `PROVISIONING` records, managed ids only; read every `WARNING:` line) and then re-checks `sessions` and `usage`.
+
+### Stuck `NEEDS_RECONCILIATION` record (operator procedure)
+
+A record in `NEEDS_RECONCILIATION` still counts toward the global cap of one session, and there is no `resolve` command yet. It appears after a failed stop, a `not found` stop (upstream `colab stop` exits 0 for a name it does not know), a timed-out or interrupted `colab new`, or a guard that could not verify. Procedure:
+
+1. `project status --session-id <SID> --json` (exit 5; read `state`, `verification`, `guard_pid`, `orphan_possible`).
+2. `project reconcile --json` (stops expired or unhealthy *managed* sessions only; read its warnings).
+3. Compare `usage` `Active assignments` with the G2 baseline and look at the Colab web UI runtime list. If a runtime still exists, the owner stops it in the UI.
+4. If `usage` is back at the baseline, the runtime is gone but the record stays stuck (for example after a UI stop removed the local name, the guard keeps retrying `stop` forever), send SIGTERM to the `guard_pid` shown by `status`. Leave the record for an owner-approved registry cleanup. The cap stays blocked, which is acceptable here because the plan forbids a second `project up` anyway.
 
 ### G7 (optional, owner decides): guard drill
 
@@ -202,7 +211,7 @@ To verify the guard against real Colab instead of trusting the offline fake, the
 | 60 telemetry steps | G5 | 60 `metric` events, steps 1 to 60, finite loss |
 | Checkpoint written | G5 | `checkpoint_saved` event and `sha256=` in DONE_OK |
 | Checkpoint integrity | G6 | local digest == remote `sha256sum` == sidecar == DONE_OK value |
-| Clean teardown | Section 6 | `<SID>` absent from `sessions` after `stop` |
+| Clean teardown | Section 6 | `usage` `Active assignments` equals the G2 baseline after `stop`, `<SID>` absent from `sessions`, no `[?]` line |
 
 Any single failed check means the plan has not passed. Record the failure as a finding.
 
@@ -214,11 +223,11 @@ Abort the plan, run teardown (section 6), and stop further steps when any of the
 - `project up` fails after consuming the approval (do not request a second approval on your own; report to the owner).
 - G3d shows the lease guard is not alive.
 - `project up` is run again, or any step would allocate a second accelerator, or an approval is requested or used for a second allocation without a fresh owner instruction.
-- G4 exits 2 or the `GPU_PROBE_OK` marker is missing.
-- G5 exits with a non-zero code, or the `DONE_OK` marker is missing.
+- G4's `EXIT_CODE` is not 0 (2 means CUDA is missing), the `EXIT_CODE` line is missing, or the `GPU_PROBE_OK` marker is missing. (The adapter's own exit code is not the command's exit code.)
+- G5's `EXIT_CODE` is not 0, the `EXIT_CODE` line is missing, or the `DONE_OK` marker is missing.
 - The remaining lease from `status` is below 300 s before G5.
 - A command outside this plan is needed to proceed.
-- `usage` shows `Active assignments` above the G2 baseline at any check, or `sessions` shows a `[?]` line.
+- `usage` shows `Active assignments` above the G2 baseline **+ 1 while `<SID>` is alive** (the session itself accounts for exactly one), or above the G2 baseline **after** stop, or `sessions` shows a `[?]` line.
 - Any output shows a credential, token or account identifier. Stop and report it; do not paste it into the report.
 - `sessions` lists sessions that the plan did not create and the owner has not approved touching them.
 
