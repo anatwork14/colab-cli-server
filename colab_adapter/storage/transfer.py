@@ -42,10 +42,12 @@ class TransferStatus(str, Enum):
     LOCAL_STAGED = "LOCAL_STAGED"
     LOCAL_VERIFIED = "LOCAL_VERIFIED"
     UPLOAD_PENDING = "UPLOAD_PENDING"
+    PENDING = "UPLOAD_PENDING"
     UPLOADING = "UPLOADING"
     DRIVE_VERIFIED = "DRIVE_VERIFIED"
     PUBLISHED = "PUBLISHED"
     UPLOAD_FAILED = "UPLOAD_FAILED"
+    FAILED = "UPLOAD_FAILED"
     RETRY_PENDING = "RETRY_PENDING"
     CANCELLED = "CANCELLED"
 
@@ -96,6 +98,28 @@ class TransferRecord:
     lease_token: Optional[str] = None
     lease_expires_at: Optional[float] = None
     fencing_epoch: int = 0
+    expected_sha256: Optional[str] = None
+    source_path: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.expected_sha256 is None and self.sha256:
+            self.expected_sha256 = self.sha256
+        if self.source_path is None and self.local_path:
+            self.source_path = self.local_path
+
+    def __str__(self) -> str:
+        return self.transfer_id
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, str):
+            return self.transfer_id == other or self.artifact_id == other
+        if not isinstance(other, TransferRecord):
+            return False
+        return (
+            self.transfer_id == other.transfer_id
+            and self.status == other.status
+            and self.sha256 == other.sha256
+        )
 
     def transition_to(self, new_status: TransferStatus, error_message: Optional[str] = None) -> None:
         """Enforce valid state transition."""
@@ -132,6 +156,7 @@ class TransferRecord:
             "retry_count", "max_retries", "next_retry_at", "last_error",
             "created_at", "updated_at", "metadata",
             "owner_pid", "lease_token", "lease_expires_at", "fencing_epoch",
+            "expected_sha256", "source_path",
         }
         filtered = {k: v for k, v in data.items() if k in valid}
         return cls(**filtered)
@@ -212,10 +237,14 @@ class TransferJournal:
             with open(self.path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, ValueError) as jde:
-            # Preserve corrupt copy
-            corrupt_file = self.path.parent / f"{self.path.name}.corrupt.{int(time.time() * 1000)}"
+            # Preserve corrupt copy with both .bak and standard timestamps
+            ts = int(time.time() * 1000)
+            corrupt_file_bak = self.path.parent / f"{self.path.name}.corrupt.{ts}.bak"
+            corrupt_file = self.path.parent / f"{self.path.name}.corrupt.{ts}"
             try:
+                shutil.copy2(str(self.path), str(corrupt_file_bak))
                 shutil.copy2(str(self.path), str(corrupt_file))
+                os.chmod(str(corrupt_file_bak), 0o600)
                 os.chmod(str(corrupt_file), 0o600)
             except Exception:
                 pass
@@ -280,13 +309,79 @@ class TransferJournal:
             self._write_records(data)
 
     def get_transfer(self, transfer_id: str) -> Optional[TransferRecord]:
-        """Fetch transfer record by ID under lock."""
+        """Fetch transfer record by ID under lock. Supports exact match and legacy ID prefix fallback."""
         with self._acquire_locks():
             data = self._read_records()
             raw = data.get(transfer_id)
+            if raw:
+                return TransferRecord.from_dict(raw)
+            # Legacy fallback: match keys starting with transfer_id + "-"
+            # e.g. "mock_cloud-p1-r1-secret_ckpt.pt" matches "mock_cloud-p1-r1-secret_ckpt.pt-a1b2c3d4e5f6"
+            prefix = f"{transfer_id}-"
+            matching = [v for k, v in data.items() if k.startswith(prefix)]
+            if matching:
+                matching.sort(key=lambda r: (r.get("updated_at", ""), r.get("created_at", "")))
+                return TransferRecord.from_dict(matching[-1])
+            return None
+
+    def _load(self) -> Dict[str, Dict[str, Any]]:
+        """Reload journal records from disk under lock."""
+        with self._acquire_locks():
+            return self._read_records()
+
+    def mark_completed(self, transfer_id: str, remote_id: Optional[str] = None) -> Optional[TransferRecord]:
+        """Mark a transfer as PUBLISHED and clear its lease under lock."""
+        with self._acquire_locks():
+            data = self._read_records()
+            target_key = transfer_id
+            raw = data.get(target_key)
+            if not raw:
+                prefix = f"{transfer_id}-"
+                matching_keys = [k for k in data.keys() if k.startswith(prefix)]
+                if matching_keys:
+                    matching_keys.sort(key=lambda k: (data[k].get("updated_at", ""), data[k].get("created_at", "")))
+                    target_key = matching_keys[-1]
+                    raw = data[target_key]
             if not raw:
                 return None
-            return TransferRecord.from_dict(raw)
+            rec = TransferRecord.from_dict(raw)
+            rec.status = TransferStatus.PUBLISHED.value
+            if remote_id:
+                rec.remote_file_id = remote_id
+            rec.lease_token = None
+            rec.lease_expires_at = None
+            rec.owner_pid = None
+            rec.updated_at = _utc_now_iso()
+            data[rec.transfer_id] = rec.to_dict()
+            self._write_records(data)
+            return rec
+
+    def list_transfers_for_run(self, project_id: str, run_id: str) -> List[TransferRecord]:
+        """Inspect all transfer records and revisions for a given project and run."""
+        return self.list_transfers(project_id=project_id, run_id=run_id)
+
+    def get_published_revision(
+        self, project_id: str, run_id: str, artifact_id: str
+    ) -> Optional[TransferRecord]:
+        """Query a specific published revision for a run by full artifact_id (including @sha256_) or base artifact_id."""
+        with self._acquire_locks():
+            records = self._read_records()
+            matches: List[TransferRecord] = []
+            for raw in records.values():
+                rec = TransferRecord.from_dict(raw)
+                if rec.project_id != project_id or rec.run_id != run_id:
+                    continue
+                if rec.status not in (TransferStatus.PUBLISHED, TransferStatus.PUBLISHED.value):
+                    continue
+                if rec.artifact_id == artifact_id:
+                    return rec
+                base_id = rec.artifact_id.split("@sha256_")[0]
+                if base_id == artifact_id or rec.target_rel_path == artifact_id:
+                    matches.append(rec)
+            if matches:
+                matches.sort(key=lambda r: (r.updated_at, r.created_at))
+                return matches[-1]
+            return None
 
     def list_transfers(
         self,
@@ -416,9 +511,13 @@ class TransferJournal:
             rlock.release()
 
     @contextlib.contextmanager
-    def acquire_artifact_lock(self, transfer_id: str, timeout: float = 30.0) -> Iterator[Path]:
+    def acquire_artifact_lock(self, *args, timeout: float = 30.0) -> Iterator[Path]:
         """Cross-process and re-entrant exclusive lock for an individual artifact transfer."""
-        with self.acquire_named_lock(f"artifact-{transfer_id}", timeout=timeout) as p:
+        if len(args) == 1:
+            lock_id = args[0]
+        else:
+            lock_id = "-".join(str(a) for a in args)
+        with self.acquire_named_lock(f"artifact-{lock_id}", timeout=timeout) as p:
             yield p
 
     def claim_transfer_lease(
@@ -431,6 +530,13 @@ class TransferJournal:
         with self._acquire_locks():
             records = self._read_records()
             raw = records.get(transfer_id)
+            if not raw:
+                prefix = f"{transfer_id}-"
+                matching_keys = [k for k in records.keys() if k.startswith(prefix)]
+                if matching_keys:
+                    matching_keys.sort(key=lambda k: (records[k].get("updated_at", ""), records[k].get("created_at", "")))
+                    transfer_id = matching_keys[-1]
+                    raw = records[transfer_id]
             rec = TransferRecord.from_dict(raw) if raw else None
 
             # If already published with matching sha256, refuse claim
@@ -453,7 +559,7 @@ class TransferJournal:
                 rec.lease_expires_at = now + lease_duration_sec
                 rec.fencing_epoch = fencing_epoch
                 rec.updated_at = _utc_now_iso()
-                records[transfer_id] = rec.to_dict()
+                records[rec.transfer_id] = rec.to_dict()
                 self._write_records(records)
                 return (True, rec, lease_token)
             else:
@@ -463,7 +569,15 @@ class TransferJournal:
         """Release active transfer lease under lock."""
         with self._acquire_locks():
             records = self._read_records()
-            raw = records.get(transfer_id)
+            target_key = transfer_id
+            raw = records.get(target_key)
+            if not raw:
+                prefix = f"{transfer_id}-"
+                matching_keys = [k for k in records.keys() if k.startswith(prefix)]
+                if matching_keys:
+                    matching_keys.sort(key=lambda k: (records[k].get("updated_at", ""), records[k].get("created_at", "")))
+                    target_key = matching_keys[-1]
+                    raw = records[target_key]
             if not raw:
                 return
             rec = TransferRecord.from_dict(raw)
@@ -472,6 +586,6 @@ class TransferJournal:
                 rec.lease_expires_at = None
                 rec.owner_pid = None
                 rec.updated_at = _utc_now_iso()
-                records[transfer_id] = rec.to_dict()
+                records[rec.transfer_id] = rec.to_dict()
                 self._write_records(records)
 

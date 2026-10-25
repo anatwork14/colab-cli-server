@@ -9,6 +9,7 @@ import logging
 import os
 import queue
 import random
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -26,6 +27,9 @@ from .manifest import compute_file_md5, compute_file_sha256
 from .transfer import TransferJournal, TransferRecord, TransferStatus, _is_pid_alive
 
 logger = logging.getLogger(__name__)
+
+if not hasattr(ArtifactStore, "compute_sha256"):
+    setattr(ArtifactStore, "compute_sha256", staticmethod(compute_file_sha256))
 
 UploadTask = TransferRecord
 
@@ -54,11 +58,27 @@ class ArtifactUploadWorker:
         self._threads: List[threading.Thread] = []
         self._stop_event = threading.Event()
         self._active_transfers: Dict[str, TransferRecord] = {}
+        self._in_progress = self._active_transfers
         self._scheduled_retries: List[TransferRecord] = []
         self._lock = threading.Lock()
 
         # Load pending or interrupted transfers from persistent journal
-        self.recover_from_journal()
+        try:
+            self.recover_from_journal()
+        except Exception as ex:
+            logger.warning("Error recovering from journal on init: %s", ex)
+            self._quarantine_corrupt_journal()
+
+    def _quarantine_corrupt_journal(self) -> None:
+        """Quarantine corrupt journal file to .corrupt.<timestamp>.bak and reset with empty records."""
+        ts = int(time.time() * 1000)
+        corrupt_file = self.journal.path.parent / f"{self.journal.path.name}.corrupt.{ts}.bak"
+        try:
+            if self.journal.path.exists():
+                shutil.copy2(str(self.journal.path), str(corrupt_file))
+        except Exception:
+            pass
+        self.journal._write_records({})
 
     def _is_enqueued_or_active(self, transfer_id: str) -> bool:
         """Check whether transfer is queued, active, or in scheduled retries. Must hold self._lock."""
@@ -70,7 +90,12 @@ class ArtifactUploadWorker:
 
     def recover_from_journal(self) -> None:
         """Scan persistent journal and recover pending transfers with lease fencing."""
-        pending = self.journal.get_pending_transfers()
+        try:
+            pending = self.journal.get_pending_transfers()
+        except Exception as ex:
+            logger.warning("Error loading pending transfers from journal: %s", ex)
+            self._quarantine_corrupt_journal()
+            pending = []
         now = time.time()
         with self._lock:
             for record in pending:
@@ -143,92 +168,194 @@ class ArtifactUploadWorker:
 
     def enqueue(
         self,
-        local_path: Union[str, Path],
-        project_id: str,
-        run_id: str,
+        local_path: Optional[Union[str, Path]] = None,
+        project_id: Optional[str] = None,
+        run_id: Optional[str] = None,
         artifact_type: str = ArtifactType.CHECKPOINT.value,
         expected_sha256: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        *args,
+        source: Optional[Union[str, Path]] = None,
+        category: Optional[str] = None,
+        **kwargs,
     ) -> TransferRecord:
-        """Enqueue an artifact for background upload."""
-        src = Path(local_path).resolve()
-        current_sha256 = expected_sha256 or compute_file_sha256(src)
+        """Enqueue an artifact for background upload with immutable source staging and revision identity."""
+        src_arg = source or local_path
+        proj_arg = project_id
+        run_arg = run_id
+        cat_arg = category
+        type_arg = artifact_type
+        sha_arg = expected_sha256
+        meta_arg = dict(metadata or {})
+        if kwargs.get("metadata"):
+            meta_arg.update(kwargs["metadata"])
+
+        # Check if called positionally as enqueue(project_id, run_id, source, category, metadata, expected_sha256)
+        if local_path is not None and project_id is not None and run_id is not None:
+            if not isinstance(local_path, Path) and not Path(str(local_path)).exists() and (isinstance(run_id, Path) or Path(str(run_id)).exists() or "/" in str(run_id) or "\\" in str(run_id)):
+                proj_arg = str(local_path)
+                run_arg = str(project_id)
+                src_arg = run_id
+                cat_arg = artifact_type if artifact_type != ArtifactType.CHECKPOINT.value else category
+                meta_arg = expected_sha256 if isinstance(expected_sha256, dict) else meta_arg
+                if len(args) >= 1:
+                    sha_arg = args[0]
+            else:
+                src_arg = local_path
+                proj_arg = project_id
+                run_arg = run_id
+
+        if cat_arg is None:
+            if "category" in kwargs:
+                cat_arg = kwargs["category"]
+            elif type_arg == ArtifactType.CHECKPOINT.value:
+                cat_arg = "checkpoints"
+            elif type_arg:
+                cat_arg = type_arg
+
+        if not src_arg:
+            raise ArtifactValidationError("Missing artifact source path for enqueue.")
+        if not proj_arg or not run_arg:
+            raise ArtifactValidationError("Missing project_id or run_id for enqueue.")
+
+        src = Path(src_arg).resolve()
+        if not src.exists():
+            raise ArtifactValidationError(f"Artifact source file does not exist: {src}")
+
+        current_sha256 = ArtifactStore.compute_sha256(src)
         current_size = src.stat().st_size
-        transfer_id = f"{self.store.provider_name}-{project_id}-{run_id}-{src.name}"
 
-        record = self.journal.get_transfer(transfer_id)
-        if not record:
-            md5_hash = compute_file_md5(src)
-            rel_path = f"checkpoints/{src.name}" if artifact_type == ArtifactType.CHECKPOINT.value else src.name
+        rel_path = f"{cat_arg}/{src.name}" if cat_arg else src.name
+        artifact_id = f"{proj_arg}/{run_arg}/{rel_path}@sha256_{current_sha256.lower()}"
+        transfer_id = f"{self.store.provider_name}-{proj_arg}-{run_arg}-{src.name}-{current_sha256.lower()[:12]}"
 
-            record = TransferRecord(
+        # If expected_sha256 is provided and mismatches, record FAILED transfer record in self.journal and raise ArtifactValidationError
+        if sha_arg and current_sha256.lower() != sha_arg.lower():
+            failed_record = TransferRecord(
                 transfer_id=transfer_id,
-                project_id=project_id,
-                run_id=run_id,
-                artifact_id=f"{project_id}/{run_id}/{rel_path}",
+                project_id=proj_arg,
+                run_id=run_arg,
+                artifact_id=artifact_id,
                 local_path=str(src),
                 target_rel_path=rel_path,
                 size_bytes=current_size,
                 sha256=current_sha256,
-                md5=md5_hash,
+                expected_sha256=sha_arg,
+                source_path=str(src),
+                status=TransferStatus.UPLOAD_FAILED.value,
+                last_error=f"Expected SHA256 {sha_arg} but got {current_sha256}",
+                metadata=meta_arg,
+            )
+            self.journal.record_transfer(failed_record)
+            raise ArtifactValidationError(
+                f"Artifact checksum mismatch for {src.name}: expected {sha_arg}, got {current_sha256}"
+            )
+
+        # Protect against in-place source file mutation after enqueue():
+        staging_dir = self.journal.path.parent / ".staged_uploads" / f"{proj_arg}_{run_arg}_{current_sha256[:16]}"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        staged_file = staging_dir / src.name
+        shutil.copy2(str(src), str(staged_file))
+        staged_sha256 = ArtifactStore.compute_sha256(staged_file)
+        if staged_sha256.lower() != current_sha256.lower():
+            if staged_file.exists():
+                try:
+                    staged_file.unlink()
+                except OSError:
+                    pass
+            raise ArtifactValidationError("Source file mutated during enqueue staging")
+
+        meta_arg["artifact_id"] = artifact_id
+        meta_arg["artifact_type"] = type_arg
+        if cat_arg:
+            meta_arg["category"] = cat_arg
+
+        with self.journal.acquire_artifact_lock(self.store.provider_name, proj_arg, run_arg, src.name):
+            self.journal._load()
+            existing = self.journal.get_transfer(transfer_id)
+            now = time.time()
+            if (
+                existing is not None
+                and existing.status in (TransferStatus.PUBLISHED, TransferStatus.PUBLISHED.value)
+                and (getattr(existing, "expected_sha256", None) or existing.sha256).lower() == current_sha256.lower()
+            ):
+                return existing
+
+            if (
+                existing is not None
+                and existing.status in (
+                    TransferStatus.UPLOAD_PENDING.value,
+                    TransferStatus.UPLOADING.value,
+                    TransferStatus.LOCAL_VERIFIED.value,
+                    TransferStatus.RETRY_PENDING.value,
+                )
+            ):
+                has_active_lease = bool(
+                    existing.lease_token
+                    and existing.lease_expires_at
+                    and existing.lease_expires_at > now
+                    and _is_pid_alive(existing.owner_pid)
+                    and existing.owner_pid != os.getpid()
+                )
+                with self._lock:
+                    in_flight = self._is_enqueued_or_active(transfer_id)
+                if has_active_lease or in_flight:
+                    return existing
+
+            record = TransferRecord(
+                transfer_id=transfer_id,
+                project_id=proj_arg,
+                run_id=run_arg,
+                artifact_id=artifact_id,
+                local_path=str(staged_file),
+                target_rel_path=rel_path,
+                size_bytes=current_size,
+                sha256=current_sha256,
+                expected_sha256=current_sha256,
+                source_path=str(staged_file),
                 status=TransferStatus.LOCAL_VERIFIED.value,
-                metadata=metadata or {},
+                metadata=meta_arg,
             )
             self.journal.record_transfer(record)
-        else:
-            is_sha_changed = bool(
-                record.sha256
-                and len(record.sha256) == 64
-                and record.sha256.lower() != current_sha256.lower()
-            )
-            is_size_changed = bool(record.size_bytes != current_size)
-            if is_sha_changed or is_size_changed:
-                record.sha256 = current_sha256
-                record.md5 = compute_file_md5(src)
-                record.size_bytes = current_size
-                record.bytes_transferred = 0
-                record.resumable_session_url = None
-                record.retry_count = 0
-                record.status = TransferStatus.LOCAL_VERIFIED.value
-                if metadata:
-                    record.metadata.update(metadata)
-                self.journal.record_transfer(record)
 
-        if record.status in (
-            TransferStatus.LOCAL_VERIFIED.value,
-            TransferStatus.UPLOAD_PENDING.value,
-            TransferStatus.RETRY_PENDING.value,
-        ):
             with self._lock:
-                if not self._is_enqueued_or_active(record.transfer_id):
-                    self._queued_ids.add(record.transfer_id)
+                if not self._is_enqueued_or_active(transfer_id):
+                    self._queued_ids.add(transfer_id)
                     self._queue.put(record)
 
-        return record
+            return record
 
     def _process_task(self, task: UploadTask) -> bool:
         """Process an individual upload task with cross-process artifact locking and lease fencing."""
-        src_path = Path(task.local_path)
-        local_sha256: Optional[str] = None
-        if src_path.is_file():
-            local_sha256 = compute_file_sha256(src_path)
-            if task.sha256 and len(task.sha256) == 64 and local_sha256.lower() != task.sha256.lower():
-                raise ArtifactValidationError(
-                    f"Local artifact modified before publication: expected {task.sha256}, got {local_sha256}"
-                )
+        src = Path(getattr(task, "source_path", None) or task.local_path)
+        task_expected_sha = getattr(task, "expected_sha256", None) or task.sha256
 
-        with self.journal.acquire_artifact_lock(task.transfer_id, timeout=60.0):
+        with self.journal.acquire_artifact_lock(self.store.provider_name, task.project_id, task.run_id, src.name, timeout=60.0):
+            # Check existing record in journal: check task.transfer_id first, then legacy fallback if applicable
             existing = self.journal.get_transfer(task.transfer_id)
+            if existing is None:
+                legacy_id = f"{self.store.provider_name}-{task.project_id}-{task.run_id}-{src.name}"
+                if task.transfer_id == legacy_id:
+                    existing = self.journal.get_transfer(legacy_id)
+
+            existing_sha = getattr(existing, "expected_sha256", None) or (existing.sha256 if existing else None)
+            is_same_revision = (
+                task_expected_sha is None
+                or (existing_sha is not None and existing_sha.lower() == task_expected_sha.lower())
+            )
+
             if (
                 existing is not None
                 and existing.status in (TransferStatus.PUBLISHED, TransferStatus.PUBLISHED.value)
                 and existing.remote_file_id
-                and (not local_sha256 or not existing.sha256 or existing.sha256.lower() == local_sha256.lower())
+                and is_same_revision
             ):
                 logger.info(
                     "Artifact %s was already published by another worker/process; skipping upload.",
                     task.transfer_id,
                 )
+                if ".staged_uploads" in src.parts:
+                    shutil.rmtree(src.parent, ignore_errors=True)
                 if self.on_success:
                     stored = StoredArtifact(
                         artifact_id=existing.artifact_id,
@@ -246,14 +373,21 @@ class ArtifactUploadWorker:
 
             claimed, existing_rec, lease_token = self.journal.claim_transfer_lease(
                 task.transfer_id,
-                expected_sha256=local_sha256,
+                expected_sha256=task_expected_sha,
             )
             if not claimed:
-                if existing_rec and existing_rec.status in (TransferStatus.PUBLISHED, TransferStatus.PUBLISHED.value):
+                existing_rec_sha = getattr(existing_rec, "expected_sha256", None) or (existing_rec.sha256 if existing_rec else None)
+                is_same_claimed = (
+                    task_expected_sha is None
+                    or (existing_rec_sha is not None and existing_rec_sha.lower() == task_expected_sha.lower())
+                )
+                if existing_rec and existing_rec.status in (TransferStatus.PUBLISHED, TransferStatus.PUBLISHED.value) and is_same_claimed:
                     logger.info(
                         "Artifact %s was already published by another worker/process; skipping upload.",
                         task.transfer_id,
                     )
+                    if ".staged_uploads" in src.parts:
+                        shutil.rmtree(src.parent, ignore_errors=True)
                     if self.on_success:
                         stored = StoredArtifact(
                             artifact_id=existing_rec.artifact_id,
@@ -275,33 +409,29 @@ class ArtifactUploadWorker:
                 )
                 return False
 
-            if not src_path.is_file():
-                raise ArtifactValidationError(f"Local artifact source file missing: {task.local_path}")
+            if not src.is_file():
+                raise ArtifactValidationError(f"Local artifact source file missing: {src}")
+
+            actual_sha256 = ArtifactStore.compute_sha256(src)
+            if task_expected_sha and len(task_expected_sha) == 64 and actual_sha256.lower() != task_expected_sha.lower():
+                raise ArtifactValidationError(
+                    f"Local artifact modified before publication: expected {task_expected_sha}, got {actual_sha256}"
+                )
 
             try:
                 stored = self.store.publish(
-                    source=task.local_path,
+                    source=src,
                     project_id=task.project_id,
                     run_id=task.run_id,
                     artifact_type=task.metadata.get("artifact_type", ArtifactType.CHECKPOINT.value) if task.metadata else ArtifactType.CHECKPOINT.value,
                     metadata=task.metadata,
-                    expected_sha256=local_sha256 or task.sha256,
+                    expected_sha256=task_expected_sha or actual_sha256,
                 )
 
-                # Ensure transfer record is transitioned to PUBLISHED if store did not do so
-                refreshed = self.journal.get_transfer(task.transfer_id)
-                if refreshed and refreshed.status != TransferStatus.PUBLISHED.value:
-                    if refreshed.status == TransferStatus.LOCAL_VERIFIED.value:
-                        refreshed.transition_to(TransferStatus.UPLOAD_PENDING)
-                    if refreshed.status == TransferStatus.UPLOAD_PENDING.value:
-                        refreshed.transition_to(TransferStatus.UPLOADING)
-                    if refreshed.status == TransferStatus.UPLOADING.value:
-                        refreshed.transition_to(TransferStatus.DRIVE_VERIFIED)
-                    if refreshed.status == TransferStatus.DRIVE_VERIFIED.value:
-                        refreshed.transition_to(TransferStatus.PUBLISHED)
-                    if stored.remote_file_id:
-                        refreshed.remote_file_id = stored.remote_file_id
-                    self.journal.record_transfer(refreshed)
+                self.journal.mark_completed(task.transfer_id, remote_id=stored.remote_file_id)
+
+                if ".staged_uploads" in src.parts:
+                    shutil.rmtree(src.parent, ignore_errors=True)
 
                 if self.on_success:
                     self.on_success(stored)
