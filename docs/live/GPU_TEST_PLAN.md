@@ -2,7 +2,7 @@
 
 Status: **DRAFT, NOT APPROVED.** No Colab allocation may happen until the owner approves this plan in writing (see [Approval](#4-approval)). This document was prepared offline. Nothing in it has been executed against Colab.
 
-**What the 900 s lease is, and is not.** The lease is a *deadline the host tries to enforce*, not a billing cap and not a guarantee. `project up` starts a detached, session-scoped **lease guard** (`colab_adapter/lease_guard.py`) that, at the deadline, runs `colab --auth=oauth2 stop -s <SID>` for that one session and verifies with `colab sessions` that it is gone (bounded retries; then it flags `NEEDS_RECONCILIATION`). The guard does **not** survive a host reboot, `kill -9`, or loss of OAuth, its verification parses `sessions` output whose real format is **not yet verified against live Colab**, and the lease clock starts at `up` (it includes provisioning time). The operator must always check `sessions` and `usage` themselves after the test. The backstop for a dead guard is `project reconcile` (which auto-stops expired managed sessions) run by the operator.
+**What the 900 s lease is, and is not.** The lease is a *deadline the host tries to enforce*, not a billing cap and not a guarantee. `project up` starts a detached, session-scoped **lease guard** (`colab_adapter/lease_guard.py`) that, at the deadline, runs `colab --auth=oauth2 stop -s <SID>` for that one session and verifies it (`colab stop` exit 0 without a "not found" message, `colab sessions` no longer lists the id, and `colab usage` active assignments back at or below the pre-`new` baseline when one was recorded; otherwise `verification: weak`). Failed stops are retried until verified (no attempt cap); the first failure flags `NEEDS_RECONCILIATION`. An interrupted `project up` can leave an unnamed `[?] <endpoint>` VM that only `usage` and the Colab UI reveal, so do not Ctrl-C `up`. The guard does **not** survive a host reboot, `kill -9`, or loss of OAuth, its verification parses `sessions` output whose real format is **not yet verified against live Colab**, and the lease clock starts at `up` (it includes provisioning time). The operator must always check `sessions` and `usage` themselves after the test. The backstop for a dead guard is `project reconcile` (which auto-stops expired managed sessions) run by the operator.
 
 Project fixtures: `examples/live-smoke/` (manifest `colab-project.json`, `gpu_probe.py`, `train_tiny.py`, `workload_manifest.json`). Offline tests: `tests/test_live_gpu_fixtures.py`.
 
@@ -159,7 +159,7 @@ Procedure:
 4. Compare three values: the local digest, the remote `sha256sum` digest, and the digest in the `.sha256` sidecar. All three must be identical and equal the `sha256=` value printed by G5.
 5. Optional: load the file with `torch.load(..., map_location="cpu")` on a machine that has torch, and confirm the keys `model_state_dict`, `step` (60) and `seed` (1234). Skip this if torch is not installed locally.
 
-Assumption to verify at execution: `project exec` runs its argument through a shell, so `&&` and `base64` work. If it does not, stop and record the limitation; do not switch to another allocation.
+Assumption to verify at execution: `project exec` takes PYTHON code (kernel semantics), so a shell command must be passed with `--shell`, which prints an `EXIT_CODE <n>` marker that must be read. If the command does not return the marker, record the limitation; do not switch to another allocation.
 
 ## 6. Teardown (mandatory)
 
@@ -176,7 +176,7 @@ python3 -m colab_adapter.cli usage
 - `stop` targets only `<SID>` (and terminates that session's guard after a successful stop).
 - After `stop`, `sessions` must not list `<SID>`. If it still does, retry `project stop --session-id <SID> --json` once and report the result; if it is still listed, tell the owner immediately so they can stop it from the Colab UI. Do not stop any other session.
 - If `up` failed in a way that may have left a runtime (timeout, nonzero exit after `new` started), `sessions` is the source of truth: report any unexpected session id to the owner; do not stop sessions this plan did not create.
-- If the guard is not alive and the session cannot be stopped, the operator runs `python3 -m colab_adapter.cli project reconcile --json` (this auto-stops expired *managed* sessions only) and then re-checks `sessions`.
+- If the guard is not alive and the session cannot be stopped, the operator runs `python3 -m colab_adapter.cli project reconcile --json` (this auto-stops expired leases and `NEEDS_RECONCILIATION`/`STOPPING`/stale `PROVISIONING` records, managed ids only; read every `WARNING:` line) and then re-checks `sessions` and `usage`.
 
 ### G7 (optional, owner decides): guard drill
 
@@ -233,7 +233,7 @@ During this plan, do **not**:
 
 ## 11. Limitations
 
-- Nothing in this plan has been run against Colab. Provisioning time, lease behaviour during provisioning, exec output size, whether `project exec` runs through a shell, and the real `colab sessions`/`colab stop` output and exit codes are unverified.
+- Nothing in this plan has been run against Colab. Provisioning time, lease behaviour during provisioning, exec output size, the `--shell` EXIT_CODE marker on a real VM, and the real `colab sessions`/`colab stop`/`colab usage` output and exit codes are unverified (offline tests use a fake `colab` that mirrors the upstream source messages).
 - The lease guard is best effort: no billing cap; not robust to host reboot, `kill -9`, OAuth loss, or a changed `sessions` output format; its verification is only validated live if G7 is chosen. Operator checks of `sessions` and `usage` are mandatory regardless.
 - The approval gate is an interlock, not a security boundary against a process running as the same OS user.
 - CU cost is an account-wide delta, not per-job billing.

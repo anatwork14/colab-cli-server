@@ -3,7 +3,13 @@
 Part of Milestone M5 (Issue #9) in Colab Project Workspaces V2.
 Enforces strict state invariants, collision-resistant session IDs, lease limits,
 safe reuse, process locking, and non-interference with unmanaged user sessions.
+
+Verification model (see docs/SECURITY.md): a stop is only recorded as TERMINATED after `colab stop`
+exits 0 without a "not found" message AND `colab sessions` no longer lists the id AND, when a baseline
+was recorded before `colab new`, `colab usage` active assignments are back at or below that baseline.
+Without a baseline the record is marked verification=weak.
 """
+import contextlib
 import enum
 import json
 import os
@@ -16,9 +22,10 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
 
+from .capability import _strip_ansi
 from .errors import (
     AllocationError,
     CleanupError,
@@ -26,6 +33,7 @@ from .errors import (
     LeaseExpiredError,
     RemoteExecutionError,
     SessionNotFoundError,
+    TransportError,
     UnmanagedSessionError,
 )
 from .approval import (
@@ -37,6 +45,8 @@ from .approval import (
     v2_plan,
 )
 from .lease_guard import (
+    LOCK_WAIT_S,
+    _mark_needs_reconciliation,
     child_env,
     ensure_guard_dir,
     epoch_from_iso,
@@ -49,13 +59,36 @@ from .lease_guard import (
     validate_session_id,
 )
 from .project_manifest import ProjectSpec
-from .provider import ApprovalRequiredError, ColabProcessLock, ManagedSessionRegistry, is_process_running
+from .provider import (
+    ApprovalRequiredError,
+    ColabProcessLock,
+    ManagedSessionRegistry,
+    is_process_running,
+    parse_active_assignments,
+)
 from .transports.base import BaseTransport
 from .transports.official_cli import OfficialCliTransport
 
 LEASE_GUARD_CONFIRM_S = 5.0
 # Upstream `colab exec` should time out before our own subprocess budget does.
 EXEC_MIN_TIMEOUT_S = 1.0
+# Fail-closed path (guard could not start): how long to wait for a busy project lock before giving up.
+GUARD_STOP_LOCK_WAIT_S = LOCK_WAIT_S
+# A PROVISIONING record older than this is considered abandoned by reconcile.
+PROVISIONING_STALE_S = 300.0
+STOP_TIMEOUT_S = 60.0
+USAGE_TIMEOUT_S = 30.0
+SESSIONS_TIMEOUT_S = 60.0
+EXIT_CODE_MARKER = "EXIT_CODE"
+_EXIT_MARKER_RE = re.compile(r"^EXIT_CODE (-?[0-9]+)\s*$", re.MULTILINE)
+
+ORPHAN_WARNING = (
+    "NEEDS_RECONCILIATION: a stop failed or could not be verified, or colab new was interrupted. "
+    "An unnamed orphan VM may still exist: upstream `colab sessions` lists a server-side assignment that has "
+    "no local name only as '[?] <endpoint>'. Check active assignments with `colab --auth=<mode> usage` "
+    "(\"Active assignments: N\") and the Colab UI. The record keeps counting toward the global cap until "
+    "an operator resolves it; the adapter does not clear it automatically."
+)
 
 
 def _default_spawn(cmd: List[str], **kwargs: Any) -> subprocess.Popen:
@@ -122,8 +155,120 @@ VALID_TRANSITIONS: Dict[ProjectSessionState, Set[ProjectSessionState]] = {
 }
 
 
+class ManagerLockBusyError(RuntimeError):
+    """The project lock stayed busy for the whole bounded wait. Nothing was sent to the CLI."""
+
+
+NOT_FOUND_REASON = "stop reported session not found; runtime may be orphaned"
+
+
+class StopNotFoundError(CleanupError):
+    """`colab stop` exited 0 with a "not found" message, so the session was NOT stopped. `reason` is fixed text."""
+
+    def __init__(self, session_id: str):
+        super().__init__(f"Failed to stop session '{session_id}': {NOT_FOUND_REASON}")
+        self.reason = NOT_FOUND_REASON
+
+
+class StopUnverifiedError(CleanupError):
+    """`colab stop` exited 0 but the removal could not be verified.
+
+    `listed` is True when `colab sessions` still listed the id (a retry may stop it again) and False when
+    only the server-side assignment count was over its baseline (retry verification only; never re-stop).
+    """
+
+    def __init__(self, message: str, listed: bool):
+        super().__init__(message)
+        self.listed = listed
+
+
+@dataclass
+class _Verification:
+    ok: bool
+    level: Optional[str]
+    detail: str
+    listed: bool
+
+
+def _id_pattern(session_id: str) -> "re.Pattern":
+    return re.compile(r"(?<![A-Za-z0-9_\-])" + re.escape(session_id) + r"(?![A-Za-z0-9_\-])")
+
+
+def _validate_working_dir(working_dir: str) -> str:
+    """Working directories must be absolute remote POSIX paths with no control characters and no '..'."""
+    if not isinstance(working_dir, str) or not working_dir.startswith("/"):
+        raise TransportError("Invalid working directory: must be an absolute remote path.")
+    if any(ch in working_dir for ch in ("\n", "\r", "\x00")):
+        raise TransportError("Invalid working directory: control characters are not allowed.")
+    if ".." in PurePosixPath(working_dir).parts:
+        raise TransportError("Invalid working directory: '..' is not allowed.")
+    return working_dir
+
+
+def build_exec_code(command_or_code: str, working_dir: Optional[str] = None, shell: bool = False) -> str:
+    """Build the Python source sent to the remote kernel by `colab exec -f`.
+
+    Default (shell=False): the argument IS Python code. A working directory becomes an `os.chdir`
+    prologue. shell=True: the argument is a shell command run through `subprocess.run(shell=True)` on
+    the managed VM; its stdout, stderr and `EXIT_CODE <n>` are printed to kernel stdout, so the exit
+    code survives the upstream CLI (which does not propagate it). Both are built with repr(), so quotes,
+    newlines, `&&` and `$` are never interpolated raw.
+    """
+    if not isinstance(command_or_code, str):
+        raise TypeError("command must be a string")
+    wd = None if working_dir is None else _validate_working_dir(working_dir)
+    if shell:
+        return (
+            "import subprocess as _colab_sp\n"
+            f"_colab_r = _colab_sp.run({command_or_code!r}, shell=True, cwd={wd!r}, "
+            "stdout=_colab_sp.PIPE, stderr=_colab_sp.PIPE, universal_newlines=True)\n"
+            "print(_colab_r.stdout)\n"
+            "if _colab_r.stderr:\n"
+            "    print('[stderr]')\n"
+            "    print(_colab_r.stderr)\n"
+            f"print('{EXIT_CODE_MARKER}', _colab_r.returncode)\n"
+        )
+    if wd is not None:
+        return f"import os\nos.chdir({wd!r})\n" + command_or_code
+    return command_or_code
+
+
+def _attach_shell_exit(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Read the EXIT_CODE marker (last whole line). A missing marker is never a success."""
+    found = _EXIT_MARKER_RE.findall(result.get("output") or "")
+    result["shell"] = True
+    if not found:
+        result["exit_code"] = None
+        result["success"] = False
+        return result
+    code = int(found[-1])
+    result["exit_code"] = code
+    result["success"] = bool(result.get("success")) and code == 0
+    return result
+
+
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _is_stale_provisioning(info: Dict[str, Any], now_ts: float) -> bool:
+    try:
+        return now_ts - epoch_from_iso(str(info.get("updated_at"))) > PROVISIONING_STALE_S
+    except (TypeError, ValueError):
+        return True
+
+
+def _status_warnings(session: "ProjectSession", guard_alive: bool) -> Tuple[List[str], bool]:
+    warnings: List[str] = []
+    if session.state == ProjectSessionState.NEEDS_RECONCILIATION.value:
+        warnings.append(ORPHAN_WARNING)
+    if session.state == ProjectSessionState.STOPPING.value:
+        warnings.append("STOPPING: a previous stop did not finish. Run 'project reconcile' and check `colab usage`.")
+    if (session.state in (ProjectSessionState.READY.value, ProjectSessionState.RUNNING.value)
+            and session.is_lease_active() and not guard_alive):
+        warnings.append("lease guard is not running while the lease is active. Run 'project exec' or 'project up' "
+                        "to respawn it, and check `sessions` and `usage`.")
+    return warnings, bool(warnings)
 
 
 @dataclass
@@ -336,6 +481,8 @@ class ProjectSessionManager:
 
         After the session is READY (or reused), a detached lease guard is started. If the guard cannot
         be confirmed alive, the session is stopped again (fail closed) and AllocationError is raised.
+        Do not Ctrl-C `up`: an interrupt during `colab new` leaves a NEEDS_RECONCILIATION record that
+        still counts toward the cap (see ORPHAN_WARNING).
         """
         session = self._up_allocate(
             spec,
@@ -356,7 +503,8 @@ class ProjectSessionManager:
         """Allocation half of up(): reuse check, global cap, approval verify-and-consume, `colab new`.
 
         Order inside the ColabProcessLock critical section: reuse check, global cap, approval
-        verify-and-consume (single use, before any CLI call), registry PROVISIONING intent, `colab new`.
+        verify-and-consume (single use, before any CLI call), baseline usage read, registry PROVISIONING
+        intent, `colab new`.
         """
         if not (0 < float(lease_seconds) <= 86400.0):
             raise ValueError("lease_seconds must be > 0 and <= 86400.")
@@ -409,10 +557,11 @@ class ProjectSessionManager:
 
             # Register intent in registry BEFORE invoking CLI
             now_dt = datetime.now(timezone.utc)
-            now_iso = now_dt.isoformat()
             exp_iso = datetime.fromtimestamp(now_dt.timestamp() + lease_seconds, timezone.utc).isoformat()
 
             session.expires_at = exp_iso
+            # Baseline for server-side verification, read BEFORE `colab new`. None when `usage` is unavailable.
+            session.metadata["assignments_before"] = self._assignments_now()
             session.transition_to(ProjectSessionState.PROVISIONING)
 
             # Record in registry with full metadata
@@ -428,40 +577,29 @@ class ProjectSessionManager:
                 if res.returncode != 0:
                     err_msg = (res.stderr or res.stdout or "").strip()
                     session.transition_to(ProjectSessionState.FAILED, reason=f"Allocation CLI failed: {err_msg}")
-                    with self.registry._lock():
-                        data = self.registry._read_locked()
-                        if session_id in data:
-                            data[session_id] = session.to_dict()
-                            self.registry._atomic_write_locked(data)
+                    self._commit_session(session)
                     raise AllocationError(
                         f"Failed to allocate session '{session_id}' with accelerator '{gpu}': {err_msg}"
                     )
             except subprocess.TimeoutExpired as te:
-                session.transition_to(ProjectSessionState.NEEDS_RECONCILIATION, reason="Allocation CLI timed out")
-                with self.registry._lock():
-                    data = self.registry._read_locked()
-                    if session_id in data:
-                        data[session_id] = session.to_dict()
-                        self.registry._atomic_write_locked(data)
+                self._flag_orphan_risk(session, "Allocation CLI timed out; an unnamed orphan VM may exist")
                 raise AllocationError(f"Session allocation timed out after 180s for '{session_id}'") from te
+            except AllocationError:
+                raise
             except Exception as ex:
-                if not isinstance(ex, AllocationError):
-                    session.transition_to(ProjectSessionState.FAILED, reason=str(ex))
-                    with self.registry._lock():
-                        data = self.registry._read_locked()
-                        if session_id in data:
-                            data[session_id] = session.to_dict()
-                            self.registry._atomic_write_locked(data)
+                session.transition_to(ProjectSessionState.FAILED, reason=str(ex))
+                self._commit_session(session)
+                raise
+            except BaseException:
+                # KeyboardInterrupt / SystemExit during `colab new`: the VM may exist without a local name.
+                # The record stays NEEDS_RECONCILIATION (it keeps counting toward the cap); try a stop, re-raise.
+                self._flag_orphan_risk(session, "colab new interrupted; an unnamed orphan VM may exist")
+                self._best_effort_stop_locked(session)
                 raise
 
             # Transition to READY
             session.transition_to(ProjectSessionState.READY)
-            with self.registry._lock():
-                data = self.registry._read_locked()
-                if session_id in data:
-                    data[session_id] = session.to_dict()
-                    self.registry._atomic_write_locked(data)
-
+            self._commit_session(session)
             return session
 
     def attach(self, session_id: str) -> ProjectSession:
@@ -495,12 +633,19 @@ class ProjectSessionManager:
         env: Optional[Dict[str, str]] = None,
         timeout: float = 300.0,
         working_dir: Optional[str] = None,
+        shell: bool = False,
     ) -> Dict[str, Any]:
-        """Execute command in an attached session with state validation and lock safety.
+        """Run PYTHON code on a managed session's kernel (or, with shell=True, a shell command on its VM).
+
+        `colab exec` runs its input as kernel Python: the default argument is Python source, and
+        `working_dir` becomes an `os.chdir` prologue. With shell=True the command runs through the
+        shell on the managed VM only, and success requires an `EXIT_CODE 0` marker. The upstream exit
+        status is NOT the command's exit status. Kernel tracebacks are reported as failures.
 
         The lease guard is (re)started first, so remote work never runs without a deadline guard.
         The timeout is clamped to the remaining lease.
         """
+        code = build_exec_code(command_or_code, working_dir=working_dir, shell=shell)
         self.ensure_lease_guard(session_id)
         session = self.attach(session_id)
         remaining = session.time_remaining()
@@ -519,17 +664,14 @@ class ProjectSessionManager:
                 self.registry._atomic_write_locked(data)
 
         try:
-            # Prepend cd to working_dir if provided
-            cmd = command_or_code
-            if working_dir:
-                cmd = f"cd {working_dir} && {command_or_code}"
-
             result = self.transport.exec_code(
                 session_id=session_id,
-                code=cmd,
+                code=code,
                 env=env,
                 timeout=effective_timeout,
             )
+            if shell:
+                result = _attach_shell_exit(dict(result))
             session.transition_to(ProjectSessionState.READY)
             return result
         except BaseException as e:
@@ -563,51 +705,171 @@ class ProjectSessionManager:
             data[session.session_id] = new_record
             self.registry._atomic_write_locked(data)
 
-    def _stop_locked(self, session_id: str, session: Optional[ProjectSession] = None) -> bool:
-        """Internal worker to stop a session when self.lock is already held."""
-        if session:
-            try:
-                session.transition_to(ProjectSessionState.STOPPING)
-                with self.registry._lock():
-                    data = self.registry._read_locked()
-                    if session_id in data:
-                        data[session_id] = session.to_dict()
-                        self.registry._atomic_write_locked(data)
-            except InvalidStateTransitionError:
-                pass
+    # ----- upstream CLI helpers (every call goes through self._run_cmd so tests can inject them) -----
 
-        cmd = [self.colab_binary, f"--auth={self.auth_mode}", "stop", "-s", session_id]
-        res = self._run_cmd(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60.0)
-        if res.returncode == 0:
-            if session:
-                session.transition_to(ProjectSessionState.TERMINATED)
-                with self.registry._lock():
-                    data = self.registry._read_locked()
-                    if session_id in data:
-                        data[session_id] = session.to_dict()
-                        self.registry._atomic_write_locked(data)
-            else:
-                self.registry.update_state(session_id, ProjectSessionState.TERMINATED.value)
+    def _cli(self, args: List[str], timeout: float) -> subprocess.CompletedProcess:
+        return self._run_cmd(
+            [self.colab_binary, f"--auth={self.auth_mode}", *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout,
+        )
+
+    def _sessions_listed(self, session_id: str) -> Optional[bool]:
+        """True/False from `colab sessions`, or None when the check itself failed."""
+        try:
+            res = self._cli(["sessions"], SESSIONS_TIMEOUT_S)
+            out = _strip_ansi(res.stdout or "")
+            if res.returncode != 0:
+                combined = (out + "\n" + _strip_ansi(res.stderr or "")).lower()
+                return False if "no active sessions" in combined else None
+            return _id_pattern(session_id).search(out) is not None
+        except Exception:  # noqa: BLE001 - unknown means not verified
+            return None
+
+    def _assignments_now(self) -> Optional[int]:
+        """Active assignments from `colab usage`, or None when unavailable (never guessed as 0)."""
+        try:
+            res = self._cli(["usage"], USAGE_TIMEOUT_S)
+            if res.returncode != 0:
+                return None
+            return parse_active_assignments(_strip_ansi(res.stdout or ""))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _verify_gone(self, session_id: str, baseline: Optional[int]) -> _Verification:
+        listed = self._sessions_listed(session_id)
+        if listed is None:
+            return _Verification(False, None, "could not read `colab sessions`", listed=True)
+        if listed:
+            return _Verification(False, None, "session still listed by `colab sessions`", listed=True)
+        after = self._assignments_now()
+        if baseline is None or after is None:
+            return _Verification(True, "weak", "usage baseline unavailable; verified with sessions only", listed=False)
+        if after <= baseline:
+            return _Verification(True, "strong", f"active assignments {after} <= baseline {baseline}", listed=False)
+        return _Verification(False, None, f"active assignments {after} > baseline {baseline}", listed=False)
+
+    # ----- registry writes that never flip a newer TERMINATED back -----
+
+    def _commit_session(self, session: ProjectSession) -> bool:
+        """Write the in-memory session, re-reading the registry under its lock.
+
+        Refuses when the registry already says TERMINATED and this copy does not. Guard-written
+        `guard_*` metadata in the registry is kept.
+        """
+        with self.registry._lock():
+            data = self.registry._read_locked()
+            current = data.get(session.session_id)
+            if current is None:
+                return False
+            if (current.get("state") == ProjectSessionState.TERMINATED.value
+                    and session.state != ProjectSessionState.TERMINATED.value):
+                return False
+            new_record = session.to_dict()
+            merged = dict(new_record.get("metadata") or {})
+            for key, value in (current.get("metadata") or {}).items():
+                if key.startswith("guard_"):
+                    merged[key] = value
+            new_record["metadata"] = merged
+            data[session.session_id] = new_record
+            self.registry._atomic_write_locked(data)
             return True
-        else:
+
+    @staticmethod
+    def _set_state(session: ProjectSession, target: ProjectSessionState, reason: Optional[str]) -> None:
+        try:
+            session.transition_to(target, reason=reason)
+        except InvalidStateTransitionError:
+            # Recovery writes may need a state the normal table does not allow from here; record it explicitly.
+            session.state = target.value
+            session.updated_at = _iso_now()
+            if reason:
+                session.metadata["last_transition_reason"] = reason
+
+    def _flag_orphan_risk(self, session: ProjectSession, reason: str) -> None:
+        self._set_state(session, ProjectSessionState.NEEDS_RECONCILIATION, reason)
+        session.metadata["orphan_possible"] = True
+        self._commit_session(session)
+
+    def _best_effort_stop_locked(self, session: ProjectSession) -> None:
+        """Cleanup after an interrupt: must not mask the original exception."""
+        try:
+            self._stop_locked(session.session_id, session)
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _stop_locked(self, session_id: str, session: Optional[ProjectSession] = None) -> bool:
+        """Stop a managed session and verify it. The caller must hold self.lock.
+
+        Returns True only when the stop is verified. Raises CleanupError (stop failed, or `colab stop`
+        reported "not found") or StopUnverifiedError (exit 0 but not verified). Both leave the record in
+        NEEDS_RECONCILIATION, never TERMINATED.
+        """
+        if session is None:
+            session = ProjectSession.from_dict(self.registry.get_all_managed()[session_id])
+        baseline = session.metadata.get("assignments_before")
+        try:
+            session.transition_to(ProjectSessionState.STOPPING)
+        except InvalidStateTransitionError:
+            pass
+        self._commit_session(session)
+
+        res = self._cli(["stop", "-s", session_id], STOP_TIMEOUT_S)
+        if res.returncode != 0:
             err_msg = (res.stderr or res.stdout or "").strip()
-            if session:
-                session.transition_to(ProjectSessionState.NEEDS_RECONCILIATION, reason=f"Stop failed: {err_msg}")
-                with self.registry._lock():
-                    data = self.registry._read_locked()
-                    if session_id in data:
-                        data[session_id] = session.to_dict()
-                        self.registry._atomic_write_locked(data)
-            else:
-                self.registry.update_state(session_id, ProjectSessionState.NEEDS_RECONCILIATION.value)
+            self._set_state(session, ProjectSessionState.NEEDS_RECONCILIATION, f"Stop failed: {err_msg}")
+            self._commit_session(session)
             raise CleanupError(f"Failed to stop session '{session_id}': {err_msg}")
 
-    def stop(self, session_id: str, *, terminate_guard: bool = True) -> bool:
+        # Upstream `colab stop` exits 0 and prints "[colab] Session '<name>' not found." for an unknown name.
+        output = _strip_ansi(res.stdout or "") + "\n" + _strip_ansi(res.stderr or "")
+        if "not found" in output.lower():
+            self._set_state(session, ProjectSessionState.NEEDS_RECONCILIATION, NOT_FOUND_REASON)
+            self._commit_session(session)
+            raise StopNotFoundError(session_id)
+
+        verdict = self._verify_gone(session_id, baseline)
+        if verdict.ok:
+            session.metadata["verification"] = verdict.level
+            session.metadata["verification_detail"] = verdict.detail
+            session.metadata.pop("stop_unverified", None)
+            self._set_state(session, ProjectSessionState.TERMINATED, "stopped and verified")
+            self._commit_session(session)
+            return True
+        reason = f"stop returned 0 but removal is not verified: {verdict.detail}"
+        # "listed": sessions still lists the id, so a retry may stop again. "usage": only the assignment count
+        # is over its baseline, so retries must verify and never re-stop (the stop already succeeded).
+        session.metadata["stop_unverified"] = "listed" if verdict.listed else "usage"
+        self._set_state(session, ProjectSessionState.NEEDS_RECONCILIATION, reason)
+        self._commit_session(session)
+        raise StopUnverifiedError(
+            f"Stop for '{session_id}' returned success but could not be verified: {verdict.detail}",
+            listed=verdict.listed,
+        )
+
+    @contextlib.contextmanager
+    def _project_lock(self, timeout: Optional[float]) -> Iterator[None]:
+        """timeout None: fail immediately when busy (existing behaviour). A number: wait up to that long."""
+        if timeout is None:
+            with self.lock:
+                yield
+            return
+        deadline = time.monotonic() + float(timeout)
+        while not self.lock.acquire(blocking=False):
+            if time.monotonic() >= deadline:
+                raise ManagerLockBusyError(f"project lock stayed busy for {float(timeout):g}s")
+            time.sleep(0.2)
+        try:
+            yield
+        finally:
+            self.lock.release()
+
+    def stop(self, session_id: str, *, terminate_guard: bool = True,
+             lock_timeout: Optional[float] = None) -> bool:
         """Safely terminate a managed session. Refuses unmanaged sessions.
 
-        After a successful stop the session's lease guard is terminated (SIGTERM, verified by
-        cmdline). A failed stop leaves the guard running as the deadline backstop.
-        The guard itself passes terminate_guard=False.
+        Returns True only when the stop is verified (see _stop_locked). After a verified stop the session's
+        lease guard is terminated (SIGTERM, verified by cmdline). A failed stop leaves the guard running as
+        the deadline backstop. The guard itself passes terminate_guard=False and a lock_timeout.
         """
         if not self.registry.is_managed(session_id):
             raise UnmanagedSessionError(
@@ -615,7 +877,7 @@ class ProjectSessionManager:
                 details={"session_id": session_id},
             )
 
-        with self.lock:
+        with self._project_lock(lock_timeout):
             all_managed = self.registry.get_all_managed()
             info = all_managed.get(session_id, {})
             session = ProjectSession.from_dict(info) if info else None
@@ -623,6 +885,28 @@ class ProjectSessionManager:
         if terminate_guard:
             self._terminate_guard(session_id)
         return ok
+
+    def verify_stopped(self, session_id: str, lock_timeout: Optional[float] = None) -> bool:
+        """Verification-only retry for a stop that exited 0 but failed the usage baseline check.
+
+        Never issues `colab stop`. Marks the record TERMINATED only when verification now passes.
+        """
+        with self._project_lock(lock_timeout):
+            info = self.registry.get_all_managed().get(session_id)
+            if not info:
+                return True
+            session = ProjectSession.from_dict(info)
+            if session.state == ProjectSessionState.TERMINATED.value:
+                return True
+            verdict = self._verify_gone(session_id, session.metadata.get("assignments_before"))
+            if not verdict.ok:
+                return False
+            session.metadata["verification"] = verdict.level
+            session.metadata["verification_detail"] = verdict.detail
+            session.metadata.pop("stop_unverified", None)
+            self._set_state(session, ProjectSessionState.TERMINATED, "verified after an earlier stop")
+            self._commit_session(session)
+            return True
 
     # ----- host-side lease guard -------------------------------------------------------------
 
@@ -728,19 +1012,39 @@ class ProjectSessionManager:
             return {"guard_pid": new_pid, "guard_alive": True, "respawned": True}
 
     def _guard_or_fail_closed(self, session: ProjectSession) -> None:
-        """Used by up(): if the guard cannot be started, stop the session and raise AllocationError."""
+        """Used by up(): if the guard cannot be confirmed, flag and stop the session, then raise.
+
+        The record is flagged NEEDS_RECONCILIATION before the stop is attempted, so an interrupt or a busy
+        lock can never leave it READY without a guard. An interrupt is re-raised after the best-effort stop.
+        """
+        sid = session.session_id
         try:
-            self.ensure_lease_guard(session.session_id)
-        except Exception as exc:
-            try:
-                self.stop(session.session_id, terminate_guard=False)
-                outcome = "stopped"
-            except Exception:
-                outcome = "stop failed; session flagged NEEDS_RECONCILIATION by the stop path"
+            self.ensure_lease_guard(sid)
+        except BaseException as exc:
+            _mark_needs_reconciliation(self.registry, sid,
+                                       f"lease guard not confirmed ({type(exc).__name__}); stop pending")
+            outcome = self._best_effort_stop(sid, lock_wait_s=GUARD_STOP_LOCK_WAIT_S)
+            if not isinstance(exc, Exception):
+                raise
             raise AllocationError(
-                f"Lease guard could not be started for '{session.session_id}' ({type(exc).__name__}); "
-                f"the session was {outcome}. The approval stays consumed."
+                f"Lease guard could not be started for '{sid}' ({type(exc).__name__}); {outcome}. "
+                "The approval stays consumed."
             ) from exc
+
+    def _best_effort_stop(self, session_id: str, lock_wait_s: float) -> str:
+        """Try one verified stop and describe the result accurately for the operator."""
+        try:
+            self.stop(session_id, terminate_guard=False, lock_timeout=lock_wait_s)
+            return "the session was stopped and verified"
+        except ManagerLockBusyError:
+            return (f"the project lock was busy for {lock_wait_s:g}s, so no stop was issued; "
+                    "session flagged NEEDS_RECONCILIATION")
+        except StopUnverifiedError:
+            return "the stop returned success but could not be verified; session flagged NEEDS_RECONCILIATION"
+        except Exception as exc:  # noqa: BLE001 - _stop_locked has already flagged the record
+            return f"the stop failed ({type(exc).__name__}); session flagged NEEDS_RECONCILIATION"
+        except BaseException:  # noqa: BLE001 - e.g. a second Ctrl-C; the original interrupt is re-raised
+            return "the stop was interrupted; session flagged NEEDS_RECONCILIATION"
 
     def close_session(self, session_id: str) -> bool:
         """Safely close, stop and tear down a managed project session (alias for stop)."""
@@ -756,6 +1060,10 @@ class ProjectSessionManager:
             }
         info = self.registry.get_all_managed().get(session_id, {})
         session = ProjectSession.from_dict(info)
+        guard_pid = self._guard_pid_of(session_id)
+        guard_alive = guard_process_matches(guard_pid, session_id)
+        warnings, needs_attention = _status_warnings(session, guard_alive)
+        metadata = info.get("metadata") or {}
         return {
             "session_id": session.session_id,
             "project_id": session.project_id,
@@ -768,40 +1076,87 @@ class ProjectSessionManager:
             "lease_active": session.is_lease_active(),
             "remote_root": session.remote_root,
             "managed": True,
-            "guard_pid": self._guard_pid_of(session_id),
-            "guard_alive": guard_process_matches(self._guard_pid_of(session_id), session_id),
-            "guard_deadline": (info.get("metadata") or {}).get("guard_deadline"),
-            "guard_outcome": (info.get("metadata") or {}).get("guard_outcome"),
+            "guard_pid": guard_pid,
+            "guard_alive": guard_alive,
+            "guard_deadline": metadata.get("guard_deadline"),
+            "guard_outcome": metadata.get("guard_outcome"),
             "seconds_remaining": round(session.time_remaining(), 1),
+            "assignments_before": metadata.get("assignments_before"),
+            "verification": metadata.get("verification"),
+            "orphan_possible": bool(metadata.get("orphan_possible")),
+            "warnings": warnings,
+            "needs_attention": needs_attention,
         }
 
     def reconcile_leases(self, auto_stop: bool = True) -> Dict[str, Any]:
-        """Audit all managed sessions, detect expired leases, and optionally auto-stop them."""
-        stopped = []
-        failed = []
-        active = []
+        """Audit managed sessions and, unless auto_stop is False, stop the ones that need it.
+
+        Managed ids only. Categories:
+        - READY/RUNNING/ACTIVE with an expired lease: stopped (verified) when auto_stop.
+        - NEEDS_RECONCILIATION and STOPPING: a stop is attempted when auto_stop.
+        - PROVISIONING older than PROVISIONING_STALE_S: a stop is attempted when auto_stop.
+        - Healthy READY/RUNNING with an active lease, and fresh PROVISIONING: reported as active.
+        Results: stopped (verified now), failed (attempt raised), active, needs_attention (unresolved or
+        skipped; includes every NEEDS_RECONCILIATION record), warnings (orphan caveat when any exists).
+        """
+        stopped: List[str] = []
+        failed: List[Dict[str, str]] = []
+        active: List[str] = []
+        needs_attention: List[Dict[str, str]] = []
+        now_ts = time.time()
 
         with self.lock:
             all_managed = self.registry.get_all_managed()
             for session_id, info in all_managed.items():
                 state = info.get("state")
+                session = ProjectSession.from_dict(info)
                 if state in (ProjectSessionState.READY.value, ProjectSessionState.RUNNING.value, "ACTIVE"):
-                    session = ProjectSession.from_dict(info)
-                    if not session.is_lease_active():
-                        if auto_stop:
-                            try:
-                                self._stop_locked(session_id, session)
-                                self._terminate_guard(session_id)
-                                stopped.append(session_id)
-                            except Exception as e:
-                                failed.append({"session_id": session_id, "error": str(e)})
-                        else:
-                            active.append(session_id)
-                    else:
+                    if session.is_lease_active():
                         active.append(session_id)
+                        continue
+                    category = "lease expired"
+                elif state in (ProjectSessionState.NEEDS_RECONCILIATION.value, ProjectSessionState.STOPPING.value):
+                    category = f"state {state}"
+                elif state == ProjectSessionState.PROVISIONING.value:
+                    if not _is_stale_provisioning(info, now_ts):
+                        active.append(session_id)
+                        continue
+                    category = f"PROVISIONING older than {PROVISIONING_STALE_S:g}s"
+                else:
+                    continue  # PLANNED, AWAITING_APPROVAL, FAILED, TERMINATED: nothing live to reconcile
 
+                if not auto_stop:
+                    needs_attention.append({
+                        "session_id": session_id, "state": state,
+                        "reason": f"{category}; not stopped (--no-auto-stop)",
+                    })
+                    continue
+                try:
+                    self._stop_locked(session_id, session)
+                    self._terminate_guard(session_id)
+                    stopped.append(session_id)
+                except Exception as e:  # noqa: BLE001 - reported per session
+                    failed.append({"session_id": session_id, "state": state, "error": str(e)})
+                    needs_attention.append({
+                        "session_id": session_id, "state": state,
+                        "reason": f"{category}; stop not verified: {e}",
+                    })
+
+            current = self.registry.get_all_managed()
+            unresolved = [sid for sid, rec in current.items()
+                          if rec.get("state") == ProjectSessionState.NEEDS_RECONCILIATION.value]
+
+        warnings: List[str] = []
+        if unresolved:
+            warnings.append(f"{ORPHAN_WARNING} Records: {', '.join(sorted(unresolved))}.")
+            for sid in unresolved:
+                if not any(item["session_id"] == sid for item in needs_attention):
+                    needs_attention.append({"session_id": sid, "state": "NEEDS_RECONCILIATION",
+                                            "reason": "unresolved; see warnings"})
         return {
             "stopped": stopped,
             "failed": failed,
             "active": active,
+            "needs_attention": needs_attention,
+            "warnings": warnings,
         }

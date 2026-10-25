@@ -148,10 +148,25 @@ def build_parser() -> argparse.ArgumentParser:
     sync_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
 
     # project exec
-    exec_p = proj_subs.add_parser("exec", help="Execute command or script in remote project session.")
-    exec_p.add_argument("exec_cmd", help="Command or code to execute remotely.")
+    exec_p = proj_subs.add_parser(
+        "exec",
+        help="Run PYTHON code on the remote kernel (or, with --shell, a shell command on the managed VM).",
+    )
+    exec_p.add_argument(
+        "exec_cmd",
+        help="PYTHON code run by the remote kernel (`colab exec` semantics). With --shell: a shell command "
+             "run on the managed VM only.",
+    )
     exec_p.add_argument("--session-id", required=True, help="Target session ID.")
-    exec_p.add_argument("--working-dir", default=None, help="Remote working directory.")
+    exec_p.add_argument(
+        "--working-dir", default=None,
+        help="Absolute remote directory. Python mode: an os.chdir prologue. Shell mode: the command's cwd.",
+    )
+    exec_p.add_argument(
+        "--shell", action="store_true",
+        help="Run exec_cmd as a shell command on the managed VM. Prints stdout, stderr and an 'EXIT_CODE <n>' "
+             "marker; the upstream exec exit status is not the command's exit status.",
+    )
     exec_p.add_argument(
         "--timeout", type=float, default=600.0,
         help="Execution budget in seconds (default 600). Passed to 'colab exec --timeout' (minus a margin) "
@@ -329,11 +344,15 @@ def handle_project_command(args: argparse.Namespace) -> int:
                 command_or_code=args.exec_cmd,
                 timeout=args.timeout,
                 working_dir=args.working_dir,
+                shell=bool(getattr(args, "shell", False)),
             )
             if is_json:
                 print(json.dumps(res, indent=2))
             else:
                 print(res.get("output", ""))
+                if res.get("shell"):
+                    code = res.get("exit_code")
+                    print(f"[adapter] command exit code: {code if code is not None else 'UNKNOWN (EXIT_CODE marker missing)'}")
             return 0 if res.get("success", False) else 1
 
         elif action == "status":
@@ -347,14 +366,18 @@ def handle_project_command(args: argparse.Namespace) -> int:
                 print(f"GPU:     {stat.get('accelerator')}")
                 print(f"Lease:   {stat.get('time_remaining_seconds', 0):.0f}s remaining (active: {stat.get('lease_active')})")
                 print(f"Guard:   {'alive' if stat.get('guard_alive') else 'dead'} (pid: {stat.get('guard_pid')}, deadline: {stat.get('guard_deadline')}, outcome: {stat.get('guard_outcome')})")
-            return 0
+                print(f"Verify:  baseline={stat.get('assignments_before')} verification={stat.get('verification')}")
+                for warning in stat.get("warnings", []):
+                    print(f"WARNING: {warning}")
+            # Exit 5: needs attention (NEEDS_RECONCILIATION, STOPPING, or a dead guard under an active lease).
+            return 5 if stat.get("needs_attention") else 0
 
         elif action == "stop":
             ok = mgr.stop(args.session_id)
             if is_json:
                 print(json.dumps({"session_id": args.session_id, "stopped": ok}, indent=2))
             else:
-                print(f"Session '{args.session_id}' stopped successfully.")
+                print(f"Session '{args.session_id}' stopped and verified.")
             return 0
 
         elif action == "reconcile":
@@ -363,7 +386,11 @@ def handle_project_command(args: argparse.Namespace) -> int:
             if is_json:
                 print(json.dumps(rep, indent=2))
             else:
-                print(f"Reconcile complete: stopped {len(rep['stopped'])}, failed {len(rep['failed'])}, active {len(rep['active'])}.")
+                print(f"Reconcile complete: stopped {len(rep['stopped'])}, failed {len(rep['failed'])}, active {len(rep['active'])}, needs attention {len(rep['needs_attention'])}.")
+                for item in rep["needs_attention"]:
+                    print(f"  needs attention: {item['session_id']} ({item['state']}): {item['reason']}")
+                for warning in rep["warnings"]:
+                    print(f"WARNING: {warning}")
             return 0
 
     except ApprovalRequiredError as e:

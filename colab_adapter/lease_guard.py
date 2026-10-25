@@ -1,15 +1,18 @@
 """Host-side lease deadline guard for ONE managed Colab session (internal).
 
 What it is: a best-effort, session-scoped deadline enforcer. A detached process sleeps until the
-session's lease deadline, then calls `colab stop -s <id>` for that id only, verifies the id is gone
-from `colab sessions`, and retries with bounded backoff.
+session's lease deadline, then stops exactly that session through the project stop path, which
+verifies the removal (`colab sessions` plus, when a baseline was recorded before `colab new`,
+`colab usage` active assignments). Failures are retried with capped backoff, indefinitely by default.
 
 What it is NOT: a billing cap, a hard guarantee, or a substitute for `project status`, `sessions`
 and `usage` checks by the operator. It does not survive a host reboot, `kill -9` of the guard, or
-loss of OAuth. `project reconcile` (auto-stop by default) is the backstop for dead guards.
+loss of OAuth. `project reconcile` (auto-stop by default) is the backstop for dead guards and for
+records left in NEEDS_RECONCILIATION, STOPPING or stale PROVISIONING.
 
 Invariants: the guard only ever acts on its own session id, never loops over sessions, never stops
-unmanaged sessions, and never writes tokens or raw CLI output to its log.
+unmanaged sessions, never writes tokens or raw CLI output to its log, and never flips a TERMINATED
+record back to NEEDS_RECONCILIATION.
 """
 from __future__ import annotations
 
@@ -25,16 +28,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional
 
-from .capability import _strip_ansi
-from .provider import ManagedSessionRegistry, is_process_running
+from .provider import ColabProcessLock, ManagedSessionRegistry, is_process_running
 
 GUARD_DIR_NAME = "lease_guards"
 GUARD_SESSION_ID_RE = re.compile(r"colab-v2-[A-Za-z0-9_\-]{1,40}")
 TERMINAL_STATES = frozenset({"TERMINATED", "FAILED"})
-DEFAULT_MAX_STOP_ATTEMPTS = 5
+# Upper bound on the time the guard waits for the project lock per stop attempt. A busy lock is retried
+# and is never counted as a failed stop attempt.
+LOCK_WAIT_S = 30.0
 STOP_BACKOFF_BASE_S = 1.0
 STOP_BACKOFF_CAP_S = 30.0
-SESSIONS_TIMEOUT_S = 60.0
 GUARD_MARKER = "lease-guard"
 
 OUTCOME_STOPPED_VERIFIED = "STOPPED_VERIFIED"
@@ -155,12 +158,14 @@ def _read_record(registry: ManagedSessionRegistry, session_id: str) -> Optional[
     return registry.get_all_managed().get(session_id)
 
 
-def _update_record(registry: ManagedSessionRegistry, session_id: str, mutate: Callable[[dict], None]) -> bool:
+def _update_record(registry: ManagedSessionRegistry, session_id: str, mutate: Callable[[dict], object]) -> bool:
+    """Read-modify-write one record under the registry lock. A mutate that returns False skips the write."""
     with registry._lock():
         data = registry._read_locked()
         if session_id not in data:
             return False
-        mutate(data[session_id])
+        if mutate(data[session_id]) is False:
+            return False
         registry._atomic_write_locked(data)
         return True
 
@@ -173,35 +178,20 @@ def merge_guard_metadata(registry: ManagedSessionRegistry, session_id: str, upda
 
 
 def _mark_needs_reconciliation(registry: ManagedSessionRegistry, session_id: str, reason: str) -> None:
-    """Flag the session for operator/reconcile attention. Guard-only write; bypasses transition rules."""
+    """Flag the session for operator/reconcile attention. Re-reads under the registry lock.
 
-    def mutate(rec: dict) -> None:
+    Never flips a TERMINATED or FAILED record back: a newer terminal state always wins.
+    """
+
+    def mutate(rec: dict) -> Optional[bool]:
+        if rec.get("state") in TERMINAL_STATES:
+            return False
         rec["state"] = "NEEDS_RECONCILIATION"
         rec["updated_at"] = iso_now()
         rec.setdefault("metadata", {})["last_transition_reason"] = reason
+        return None
 
     _update_record(registry, session_id, mutate)
-
-
-def session_still_listed(colab_binary: str, auth_mode: str, session_id: str,
-                         timeout: float = SESSIONS_TIMEOUT_S) -> bool:
-    """Run `colab --auth=<mode> sessions` and report whether session_id is still listed.
-
-    Raises on an unexpected failure. Output is never logged.
-    """
-    res = subprocess.run(
-        [colab_binary, f"--auth={auth_mode}", "sessions"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, timeout=timeout,
-    )
-    out = _strip_ansi(res.stdout or "")
-    if res.returncode != 0:
-        combined = (out + "\n" + _strip_ansi(res.stderr or "")).lower()
-        if "no active sessions" in combined:
-            return False
-        raise RuntimeError(f"sessions exited with code {res.returncode}")
-    pattern = re.compile(r"(?<![A-Za-z0-9_\-])" + re.escape(session_id) + r"(?![A-Za-z0-9_\-])")
-    return bool(pattern.search(out))
 
 
 class _GuardLog:
@@ -238,16 +228,23 @@ def run_guard(
     auth_mode: str,
     deadline_ts: float,
     poll_interval: float = 2.0,
-    max_stop_attempts: int = DEFAULT_MAX_STOP_ATTEMPTS,
+    max_stop_attempts: Optional[int] = None,
     backoff: Optional[Callable[[int], float]] = None,
+    lock: Optional[ColabProcessLock] = None,
+    lock_wait_s: float = LOCK_WAIT_S,
 ) -> int:
     """Wait for the lease deadline, then stop exactly this session and verify its removal.
 
     Returns 0 when the session ended (stopped and verified, or ended by someone else before the
-    deadline), 1 when stop could not be verified after max_stop_attempts (record flagged
-    NEEDS_RECONCILIATION).
+    deadline), 1 when the guard gave up (only possible when max_stop_attempts is set; production
+    passes None, so the guard retries until verified, the record is terminal, or SIGTERM arrives).
     """
-    from .project_sessions import ProjectSessionManager  # local import: project_sessions imports this module
+    from .project_sessions import (
+        ManagerLockBusyError,
+        ProjectSessionManager,
+        StopNotFoundError,
+        StopUnverifiedError,
+    )
 
     validate_session_id(session_id)
     registry_path = Path(registry_path)
@@ -277,7 +274,8 @@ def run_guard(
             "guard_outcome": None,
         })
         log.write(f"guard started for {session_id}")
-        manager = ProjectSessionManager(registry=registry, colab_binary=colab_binary, auth_mode=auth_mode)
+        manager = ProjectSessionManager(registry=registry, lock=lock, colab_binary=colab_binary,
+                                        auth_mode=auth_mode)
 
         # Phase 1: wait for the deadline; exit silently if the session ends first.
         while True:
@@ -293,39 +291,63 @@ def run_guard(
                 break
             _sleep_interruptible(min(poll_interval, remaining), state)
 
-        # Phase 2: deadline reached. Bounded stop attempts with verification.
+        # Phase 2: deadline reached. Retry until verified (unbounded unless max_stop_attempts is set).
         reason = "deadline reached"
-        for attempt in range(max_stop_attempts):
+        failures = 0
+        # True after a stop that exited 0 while `colab sessions` no longer listed the id but the usage
+        # baseline check failed. Re-stopping would only report "not found", so only verification is retried.
+        # The flag is persisted by the stop path, so a guard started later behaves the same way.
+        start_rec = _read_record(registry, session_id) or {}
+        verify_only = (start_rec.get("metadata") or {}).get("stop_unverified") == "usage"
+        while True:
             if state.requested:
                 log.write("SIGTERM received at deadline; exiting without stopping")
                 return finish(OUTCOME_SIGNALLED, 0)
             rec = _read_record(registry, session_id)
-            if rec is None or rec.get("state") in TERMINAL_STATES:
+            if rec is None or rec.get("state") == "TERMINATED":
                 log.write("session ended before guard stop; nothing to do")
                 return finish(OUTCOME_ENDED_EXTERNALLY, 0)
-            attempt_no = attempt + 1
+            if max_stop_attempts is not None and failures >= max_stop_attempts:
+                break
+            attempt_no = failures + 1
             try:
-                manager.stop(session_id, terminate_guard=False)
-            except Exception as exc:  # noqa: BLE001 - classify and retry
-                reason = f"stop attempt {attempt_no} failed: {type(exc).__name__}"
-            else:
-                try:
-                    listed = session_still_listed(colab_binary, auth_mode, session_id)
-                except Exception as exc:  # noqa: BLE001
-                    listed = None
-                    reason = f"verification attempt {attempt_no} failed: {type(exc).__name__}"
-                else:
-                    if not listed:
-                        log.write(f"stop attempt {attempt_no} verified: session no longer listed")
+                if rec.get("state") == "FAILED" and manager.verify_stopped(session_id, lock_timeout=lock_wait_s):
+                    log.write("record is FAILED and verified gone; nothing to do")
+                    return finish(OUTCOME_ENDED_EXTERNALLY, 0)
+                if verify_only:
+                    if manager.verify_stopped(session_id, lock_timeout=lock_wait_s):
+                        log.write(f"verification attempt {attempt_no} passed after an unverified stop")
                         return finish(OUTCOME_STOPPED_VERIFIED, 0)
-                    reason = f"session still listed after stop attempt {attempt_no}"
-                _mark_needs_reconciliation(registry, session_id, reason)
+                    failure = f"verification attempt {attempt_no} still failing after an unverified stop"
+                else:
+                    manager.stop(session_id, terminate_guard=False, lock_timeout=lock_wait_s)
+                    log.write(f"stop attempt {attempt_no} verified")
+                    return finish(OUTCOME_STOPPED_VERIFIED, 0)
+            except ManagerLockBusyError:
+                # Waiting on a busy project lock is not a failed attempt.
+                log.write("project lock busy; waiting (not counted as a failed attempt)")
+                continue
+            except StopUnverifiedError as exc:
+                verify_only = not exc.listed
+                failure = f"stop attempt {attempt_no} returned success but was not verified: {exc}"
+            except Exception as exc:  # noqa: BLE001 - classify and retry
+                if verify_only:
+                    failure = f"verification attempt {attempt_no} failed: {type(exc).__name__}"
+                elif isinstance(exc, StopNotFoundError):
+                    # Fixed, secret-free text owned by the adapter; keeps the orphan reason on the record.
+                    failure = f"stop attempt {attempt_no} failed: {exc.reason}"
+                else:
+                    failure = f"stop attempt {attempt_no} failed: {type(exc).__name__}"
+            failures += 1
+            reason = failure
+            _mark_needs_reconciliation(registry, session_id, reason)
             log.write(reason)
-            if attempt_no < max_stop_attempts:
-                _sleep_interruptible(backoff_fn(attempt), state)
+            if max_stop_attempts is not None and failures >= max_stop_attempts:
+                break
+            _sleep_interruptible(backoff_fn(failures - 1), state)
 
-        _mark_needs_reconciliation(registry, session_id, f"guard gave up after {max_stop_attempts} attempts: {reason}")
-        log.write(f"giving up after {max_stop_attempts} stop attempts; flagged NEEDS_RECONCILIATION")
+        _mark_needs_reconciliation(registry, session_id, f"guard gave up after {failures} attempts: {reason}")
+        log.write(f"giving up after {failures} stop attempts (bounded by max_stop_attempts); flagged NEEDS_RECONCILIATION")
         return finish(OUTCOME_NEEDS_RECONCILIATION, 1)
     except Exception as exc:  # noqa: BLE001 - never leak messages that may contain secrets
         try:

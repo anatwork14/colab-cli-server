@@ -180,13 +180,17 @@ class TestProjectSessions(unittest.TestCase):
         )
 
         s1 = manager.up(self.spec, lease_seconds=3600.0, approval_id=grant_v2(manager, self.spec, 3600.0))
-        self.assertEqual(mock_run.call_count, 1)
+        # up() reads the usage baseline before `colab new`; exactly one allocation must be dispatched.
+        allocations = [c.args[0] for c in mock_run.call_args_list if "new" in c.args[0]]
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(mock_run.call_count, 2)  # one baseline `usage` read, then `new`
 
         # Second call to up with reuse_active=True (default)
         s2 = manager.up(self.spec, lease_seconds=3600.0, reuse_active=True)
         self.assertEqual(s1.session_id, s2.session_id)
-        # Verify no second CLI allocation was made
-        self.assertEqual(mock_run.call_count, 1)
+        # Verify no second CLI allocation was made (the call count is unchanged by the reuse)
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(len([c for c in mock_run.call_args_list if "new" in c.args[0]]), 1)
 
     def test_q08_attach_refuses_unmanaged_session(self):
         """Q08: Refuses to attach to unmanaged or unknown sessions."""
@@ -307,13 +311,11 @@ class TestProjectSessions(unittest.TestCase):
 
         ok = manager.stop(session_id)
         self.assertTrue(ok)
-        mock_run.assert_called_once_with(
-            ["colab", "--auth=oauth2", "stop", "-s", session_id],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=60.0,
-        )
+        # The stop is followed by read-only verification (`sessions`, `usage`); no other command may run.
+        self.assertEqual(mock_run.call_args_list[0].args[0], ["colab", "--auth=oauth2", "stop", "-s", session_id])
+        self.assertEqual(mock_run.call_args_list[0].kwargs,
+                         {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True, "timeout": 60.0})
+        self.assertTrue(all(c.args[0][2] in ("sessions", "usage") for c in mock_run.call_args_list[1:]))
         self.assertEqual(self.registry.get_all_managed()[session_id]["state"], ProjectSessionState.TERMINATED.value)
 
     def test_reconcile_leases_auto_stops_expired_sessions(self):
@@ -368,7 +370,9 @@ class TestProjectSessions(unittest.TestCase):
         report = manager.reconcile_leases(auto_stop=True)
         self.assertEqual(report["stopped"], [expired_id])
         self.assertEqual(report["active"], [active_id])
-        self.assertEqual(stopped_calls, [["colab", "--auth=oauth2", "stop", "-s", expired_id]])
+        stop_only = [c for c in stopped_calls if "stop" in c]
+        self.assertEqual(stop_only, [["colab", "--auth=oauth2", "stop", "-s", expired_id]])
+        self.assertTrue(all(c[2] in ("sessions", "usage") for c in stopped_calls if "stop" not in c))
 
         # Expired is now terminated, active remains ready
         self.assertEqual(self.registry.get_all_managed()[expired_id]["state"], ProjectSessionState.TERMINATED.value)

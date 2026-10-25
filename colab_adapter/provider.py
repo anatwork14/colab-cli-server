@@ -404,6 +404,18 @@ class ManagedSessionRegistry:
             return self._read_locked()
 
 
+_ACTIVE_ASSIGNMENTS_RE = re.compile(r"active\s+assignments\s*[:=]?\s*([0-9]+)", re.IGNORECASE)
+
+
+def parse_active_assignments(output: str) -> Optional[int]:
+    """Active assignment count from `colab usage` output ("Active assignments: N"), or None if absent.
+
+    Unlike the monitor's lenient parser, a missing line is None (unknown), never 0.
+    """
+    match = _ACTIVE_ASSIGNMENTS_RE.search(output or "")
+    return int(match.group(1)) if match else None
+
+
 def parse_session_lines(output: str) -> List[Dict[str, str]]:
     """Parse structured session information from colab CLI output.
 

@@ -12,12 +12,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+from colab_adapter.approval import GlobalCapExceededError
 from colab_adapter.errors import AllocationError, LeaseExpiredError, UnmanagedSessionError
 from colab_adapter.lease_guard import (
     pid_argv,
@@ -35,39 +37,7 @@ from tests.approval_helpers import fake_guard_spawner, grant_v2
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-FAKE_COLAB_SOURCE = '''#!{python}
-import json
-import os
-import sys
-
-state_dir = os.environ["FAKE_COLAB_DIR"]
-calls_file = os.environ["FAKE_COLAB_CALLS"]
-args = sys.argv[1:]
-with open(calls_file, "a", encoding="utf-8") as fh:
-    fh.write(json.dumps(args) + "\\n")
-alive_dir = os.path.join(state_dir, "alive")
-os.makedirs(alive_dir, exist_ok=True)
-rest = [a for a in args if not a.startswith("--auth=")]
-command = rest[0] if rest else ""
-if command == "sessions":
-    ids = sorted(os.listdir(alive_dir))
-    if not ids:
-        print("No active sessions found.")
-    for sid in ids:
-        print(sid + "  T4  READY")
-    sys.exit(0)
-if command == "stop":
-    sid = rest[rest.index("-s") + 1]
-    if os.environ.get("FAKE_COLAB_STOP_FAIL"):
-        print("stop failed for " + sid + " token ya29.FAKETOKEN0123456789abcdefXYZ", file=sys.stderr)
-        sys.exit(1)
-    if not os.environ.get("FAKE_COLAB_STOP_LIE"):
-        path = os.path.join(alive_dir, sid)
-        if os.path.exists(path):
-            os.remove(path)
-    sys.exit(0)
-sys.exit(0)
-'''
+from tests.colab_fakes import FAKE_COLAB_SOURCE  # shared fake `colab` (upstream-shaped output)
 
 
 def _iso(offset_s):
@@ -245,13 +215,14 @@ class TestRealProcessGuard(GuardFixture):
         while time.time() < deadline and not self.stop_calls(target):
             time.sleep(0.2)
         self.assertEqual(self.stop_calls(target), [["--auth=oauth2", "stop", "-s", target]])
-        self.assertEqual(self.record(target)["state"], "TERMINATED")
-        # The orphaned guard exits after the stop; it must not be left running.
+        # The stop is followed by read-only verification (sessions, usage); wait for the guard to finish
+        # before reading the final state.
         for _ in range(100):
             if pid_argv(guard_pid) is None:
                 break
             time.sleep(0.1)
         self.assertIsNone(pid_argv(guard_pid), "orphaned guard must exit after the stop")
+        self.assertEqual(self.record(target)["state"], "TERMINATED")
 
     def test_sigterm_exits_cleanly_without_stopping_session(self):
         """(k) SIGTERM to the guard exits it without stopping the session."""
@@ -522,6 +493,290 @@ class TestAuthModeAndExecTimeout(GuardFixture):
         with self.assertRaises(LeaseExpiredError):
             mgr.exec(sid, "print(1)", timeout=600.0)
         transport.exec_code.assert_not_called()
+
+
+class TestGuardRetriesAndLockWait(GuardFixture):
+    """F2/F4: the guard never gives up on its own and waits for a busy project lock."""
+
+    def guard(self, session_id, **kwargs):
+        kwargs.setdefault("poll_interval", 0.05)
+        kwargs.setdefault("backoff", lambda attempt: 0.01)
+        return run_guard(
+            session_id=session_id,
+            registry_path=self.registry_path,
+            colab_binary=str(self.fake_colab),
+            auth_mode="oauth2",
+            deadline_ts=time.time(),
+            **kwargs,
+        )
+
+    def test_unbounded_guard_retries_beyond_five_attempts_until_verified(self):
+        target = "colab-v2-guard-retry01"
+        self.put_session(make_session(target, expires_in=600))
+        self.mark_alive(target)
+        (self.state_dir / "stop_fail_remaining").write_text("7", encoding="utf-8")
+        code = self.guard(target)  # default: no attempt cap
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.stop_calls(target)), 8, "7 failures then one verified success")
+        self.assertFalse(self.is_alive(target))
+        self.assertEqual(self.record(target)["state"], "TERMINATED")
+        self.assertEqual(self.guard_metadata(target)["guard_outcome"], OUTCOME_STOPPED_VERIFIED)
+        log_text = (self.registry_path.parent / "lease_guards" / f"{target}.log").read_text(encoding="utf-8")
+        self.assertIn("stop attempt 1 failed", log_text)
+        self.assertIn("stop attempt 7 failed", log_text)
+        self.assertNotIn("ya29.", log_text)
+
+    def test_first_failure_flags_needs_reconciliation_while_guard_keeps_going(self):
+        target = "colab-v2-guard-flag01"
+        self.put_session(make_session(target, expires_in=600))
+        self.mark_alive(target)
+        (self.state_dir / "stop_fail_remaining").write_text("1", encoding="utf-8")
+        seen_after_mark = []
+        from colab_adapter import lease_guard as lg
+        real_mark = lg._mark_needs_reconciliation
+
+        def spy(registry, sid, reason):
+            real_mark(registry, sid, reason)
+            seen_after_mark.append(self.record(sid)["state"])
+
+        with mock.patch.object(lg, "_mark_needs_reconciliation", side_effect=spy):
+            self.assertEqual(self.guard(target), 0)
+        self.assertEqual(seen_after_mark[:1], ["NEEDS_RECONCILIATION"])
+        self.assertEqual(self.record(target)["state"], "TERMINATED")
+
+    def test_guard_waits_for_busy_project_lock_then_stops(self):
+        """A busy lock is not a failed attempt: with a one-attempt cap the stop still succeeds once freed."""
+        target = "colab-v2-guard-lock01"
+        self.put_session(make_session(target, expires_in=600))
+        self.mark_alive(target)
+        self.assertTrue(self.lock.acquire(blocking=False))
+        timer = threading.Timer(1.0, self.lock.release)
+        timer.start()
+        self.addCleanup(timer.join)
+        code = self.guard(target, max_stop_attempts=1, lock=self.lock, lock_wait_s=0.2)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.stop_calls(target)), 1)
+        self.assertFalse(self.is_alive(target))
+        self.assertEqual(self.record(target)["state"], "TERMINATED")
+
+    def test_stop_not_found_is_needs_reconciliation_not_terminated(self):
+        target = "colab-v2-guard-nf0001"
+        self.put_session(make_session(target, expires_in=600))  # no VM with this name exists
+        code = self.guard(target, max_stop_attempts=2)
+        self.assertEqual(code, 1)
+        record = self.record(target)
+        self.assertEqual(record["state"], "NEEDS_RECONCILIATION")
+        self.assertIn("stop reported session not found; runtime may be orphaned",
+                      record["metadata"].get("last_transition_reason", ""))
+
+
+class TestServerSideVerification(GuardFixture):
+    """F3b: verification uses `usage` active assignments against the baseline recorded before `new`."""
+
+    def guard(self, session_id, **kwargs):
+        kwargs.setdefault("poll_interval", 0.05)
+        kwargs.setdefault("backoff", lambda attempt: 0.01)
+        return run_guard(
+            session_id=session_id,
+            registry_path=self.registry_path,
+            colab_binary=str(self.fake_colab),
+            auth_mode="oauth2",
+            deadline_ts=time.time(),
+            **kwargs,
+        )
+
+    def set_baseline(self, session_id, before):
+        self.put_session(make_session(session_id, expires_in=600))
+        meta = {} if before is None else {"assignments_before": before}
+        with self.registry._lock():
+            data = self.registry._read_locked()
+            data[session_id]["metadata"] = meta
+            self.registry._atomic_write_locked(data)
+
+    def test_stop_verified_strong_when_assignments_back_to_baseline(self):
+        target = "colab-v2-verify-ok01"
+        self.set_baseline(target, 0)
+        self.mark_alive(target)
+        self.assertTrue(self.manager().stop(target, terminate_guard=False))
+        self.assertEqual(self.record(target)["state"], "TERMINATED")
+        self.assertEqual(self.record(target)["metadata"]["verification"], "strong")
+        self.assertTrue(any("usage" in c for c in self.calls()))
+
+    def test_extra_assignment_after_stop_is_not_verified_and_is_not_restopped(self):
+        target = "colab-v2-verify-extra"
+        other = "colab-v2-verify-other"
+        self.set_baseline(target, 0)
+        self.mark_alive(target)
+        self.mark_alive(other)  # another live assignment: usage shows 1 > baseline 0
+        from colab_adapter.project_sessions import StopUnverifiedError
+        with self.assertRaises(StopUnverifiedError) as ctx:
+            self.manager().stop(target, terminate_guard=False)
+        self.assertIn("active assignments 1 > baseline 0", str(ctx.exception))
+        self.assertEqual(self.record(target)["state"], "NEEDS_RECONCILIATION")
+        code = self.guard(target, max_stop_attempts=3)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.stop_calls(target)), 1, "verification-only retries; no repeated stop")
+        self.assertEqual(self.record(target)["state"], "NEEDS_RECONCILIATION")
+
+    def test_weak_verification_when_baseline_unknown(self):
+        target = "colab-v2-verify-weak"
+        self.set_baseline(target, None)
+        self.mark_alive(target)
+        self.assertTrue(self.manager().stop(target, terminate_guard=False))
+        self.assertEqual(self.record(target)["state"], "TERMINATED")
+        self.assertEqual(self.record(target)["metadata"]["verification"], "weak")
+
+    def test_listed_after_stop_is_never_verified(self):
+        target = "colab-v2-verify-lst1"
+        self.set_baseline(target, 0)
+        self.mark_alive(target)
+        with mock.patch.dict(os.environ, {"FAKE_COLAB_STOP_LIE": "1"}):
+            with self.assertRaises(Exception):
+                self.manager().stop(target, terminate_guard=False)
+        self.assertEqual(self.record(target)["state"], "NEEDS_RECONCILIATION")
+
+
+class TestUpBranchHoles(GuardFixture):
+    """F3c/F4: interrupts and busy locks in up() never free the cap or leave a stuck record."""
+
+    def make_spec(self):
+        project_root = self.tmp / "project"
+        project_root.mkdir(exist_ok=True)
+        (project_root / "train.py").write_text("print('train')\n", encoding="utf-8")
+        return ProjectSpec(name="holes", root=project_root, entrypoint="train.py",
+                           gpu="T4", timeout_seconds=600.0)
+
+    def scripted_run(self, new_behaviour):
+        self.cli_cmds = []
+        usage_out = "Current balance: 5.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0"
+
+        def run(cmd, **kwargs):
+            self.cli_cmds.append(list(cmd))
+            if "usage" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, usage_out, "")
+            if "new" in cmd:
+                return new_behaviour(cmd)
+            if "stop" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "[colab] Session 'x' not found.", "")
+            return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+        return run
+
+    def test_up_records_assignments_before_colab_new(self):
+        spec = self.make_spec()
+        run = self.scripted_run(lambda cmd: subprocess.CompletedProcess(cmd, 0, "[colab] Session READY.", ""))
+        mgr = ProjectSessionManager(registry=self.registry, lock=self.lock, run_cmd_fn=run,
+                                    spawn_fn=fake_guard_spawner(self), auth_mode="oauth2")
+        approval_id = grant_v2(mgr, spec, 900.0)
+        session = mgr.up(spec, lease_seconds=900.0, approval_id=approval_id)
+        self.assertEqual(self.record(session.session_id)["metadata"]["assignments_before"], 0)
+        usage_idx = next(i for i, c in enumerate(self.cli_cmds) if "usage" in c)
+        new_idx = next(i for i, c in enumerate(self.cli_cmds) if "new" in c)
+        self.assertLess(usage_idx, new_idx, "baseline is read before colab new")
+
+    def test_keyboard_interrupt_during_new_keeps_record_and_cap(self):
+        spec = self.make_spec()
+
+        def interrupted(cmd):
+            raise KeyboardInterrupt()
+
+        run = self.scripted_run(interrupted)
+        mgr = ProjectSessionManager(registry=self.registry, lock=self.lock, run_cmd_fn=run,
+                                    spawn_fn=fake_guard_spawner(self), auth_mode="oauth2")
+        approval_id = grant_v2(mgr, spec, 900.0)
+        with self.assertRaises(KeyboardInterrupt):
+            mgr.up(spec, lease_seconds=900.0, approval_id=approval_id)
+        sids = list(self.registry.get_all_managed())
+        self.assertEqual(len(sids), 1)
+        sid = sids[0]
+        self.assertEqual(self.record(sid)["state"], "NEEDS_RECONCILIATION")
+        self.assertIn(sid, self.registry.get_active_managed(), "an interrupted allocation keeps the cap")
+        self.assertTrue(any("stop" in c for c in self.cli_cmds), "best-effort stop is attempted")
+        second = grant_v2(mgr, spec, 900.0)
+        with self.assertRaises(GlobalCapExceededError):
+            mgr.up(spec, lease_seconds=900.0, approval_id=second)
+
+    def test_new_timeout_keeps_record_needs_reconciliation_and_flags_orphan_risk(self):
+        spec = self.make_spec()
+
+        def timed_out(cmd):
+            raise subprocess.TimeoutExpired(cmd, 180)
+
+        run = self.scripted_run(timed_out)
+        mgr = ProjectSessionManager(registry=self.registry, lock=self.lock, run_cmd_fn=run,
+                                    spawn_fn=fake_guard_spawner(self), auth_mode="oauth2")
+        approval_id = grant_v2(mgr, spec, 900.0)
+        with self.assertRaises(AllocationError):
+            mgr.up(spec, lease_seconds=900.0, approval_id=approval_id)
+        sid = next(iter(self.registry.get_all_managed()))
+        self.assertEqual(self.record(sid)["state"], "NEEDS_RECONCILIATION")
+        self.assertTrue(self.record(sid)["metadata"]["orphan_possible"])
+        self.assertIn(sid, self.registry.get_active_managed())
+        self.assertFalse(any("stop" in c for c in self.cli_cmds), "timeout path leaves the stop to reconcile")
+
+    def test_fail_closed_with_busy_lock_flags_needs_reconciliation_with_accurate_message(self):
+        spec = self.make_spec()
+        run = self.scripted_run(lambda cmd: subprocess.CompletedProcess(cmd, 0, "[colab] Session READY.", ""))
+
+        def spawn_while_lock_is_held(cmd, **kwargs):
+            # Another holder owns the project lock when the guard fails to start.
+            self.assertTrue(self.lock.acquire(blocking=False))
+            self.addCleanup(self.lock.release)
+            raise OSError("spawn refused")
+
+        mgr = ProjectSessionManager(registry=self.registry, lock=self.lock, run_cmd_fn=run,
+                                    spawn_fn=spawn_while_lock_is_held, auth_mode="oauth2")
+        approval_id = grant_v2(mgr, spec, 900.0)
+        with mock.patch("colab_adapter.project_sessions.GUARD_STOP_LOCK_WAIT_S", 0.3):
+            with self.assertRaises(AllocationError) as ctx:
+                mgr.up(spec, lease_seconds=900.0, approval_id=approval_id)
+        sid = next(iter(self.registry.get_all_managed()))
+        self.assertEqual(self.record(sid)["state"], "NEEDS_RECONCILIATION")
+        message = str(ctx.exception)
+        self.assertIn("NEEDS_RECONCILIATION", message)
+        self.assertIn("lock was busy", message)
+        self.assertNotIn("stopped and verified", message)
+        self.assertEqual([c for c in self.cli_cmds if "stop" in c], [], "busy lock: no stop was issued")
+
+
+class TestStatusExitCodes(GuardFixture):
+    def run_cli(self, argv):
+        import contextlib
+        import io
+        from colab_adapter.cli import main
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main(argv)
+        return code, out.getvalue()
+
+    def put_default(self, session):
+        reg = ManagedSessionRegistry(Path(self.home) / ".colab_experiments" / "managed_sessions.json")
+        with reg._lock():
+            data = reg._read_locked()
+            data[session.session_id] = session.to_dict()
+            reg._atomic_write_locked(data)
+
+    def test_status_exits_5_and_warns_for_needs_reconciliation(self):
+        sid = "colab-v2-status-nr01"
+        self.put_default(make_session(sid, expires_in=600, state="NEEDS_RECONCILIATION"))
+        code, out = self.run_cli(["project", "status", "--session-id", sid])
+        self.assertEqual(code, 5)
+        self.assertIn("WARNING", out)
+        self.assertIn("[?]", out)
+
+    def test_status_exits_5_when_guard_is_dead_while_lease_is_active(self):
+        sid = "colab-v2-status-gd001"
+        self.put_default(make_session(sid, expires_in=600, state="READY"))
+        code, out = self.run_cli(["project", "status", "--session-id", sid])
+        self.assertEqual(code, 5)
+        self.assertIn("guard", out.lower())
+
+    def test_status_exits_0_for_terminated(self):
+        sid = "colab-v2-status-ok001"
+        self.put_default(make_session(sid, expires_in=600, state="TERMINATED"))
+        code, _ = self.run_cli(["project", "status", "--session-id", sid])
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":

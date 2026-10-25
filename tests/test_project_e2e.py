@@ -165,14 +165,16 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         # Provision first session
         s1 = mgr.up(spec, lease_seconds=1800.0, approval_id=grant_v2(mgr, spec, 1800.0))
         self.assertEqual(s1.state, ProjectSessionState.READY.value)
-        self.assertEqual(len(executed_cmds), 1)
-        self.assertEqual(executed_cmds[0][:4], ["colab", "--auth=oauth2", "new", "-s"])
+        # up() also reads the usage baseline before `new`; only allocation commands are counted here.
+        allocations = [c for c in executed_cmds if "new" in c]
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(allocations[0][:4], ["colab", "--auth=oauth2", "new", "-s"])
 
         # Second call reuses existing active session
         s2 = mgr.up(spec, reuse_active=True)
         self.assertEqual(s1.session_id, s2.session_id)
         # Invariant: No second allocation CLI call made
-        self.assertEqual(len(executed_cmds), 1)
+        self.assertEqual(len([c for c in executed_cmds if "new" in c]), 1)
 
     def test_scenario_d_incremental_workspace_sync_engine(self):
         """Scenario D: Full cycle of initial sync, 0-file unchanged sync (Q04), and 1-file sync (Q05)."""
@@ -310,13 +312,9 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         # 2. Managed session stops cleanly
         ok = mgr.stop(managed_id)
         self.assertTrue(ok)
-        mock_run.assert_called_once_with(
-            ["colab", "--auth=oauth2", "stop", "-s", managed_id],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=60.0,
-        )
+        # The stop is followed by read-only verification (`sessions`, `usage`); no other command may run.
+        self.assertEqual(mock_run.call_args_list[0].args[0], ["colab", "--auth=oauth2", "stop", "-s", managed_id])
+        self.assertTrue(all(c.args[0][2] in ("sessions", "usage") for c in mock_run.call_args_list[1:]))
         self.assertEqual(self.registry.get_all_managed()[managed_id]["state"], ProjectSessionState.TERMINATED.value)
 
     def test_full_13_stage_research_lifecycle(self):
@@ -436,8 +434,9 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         session = session_mgr.up(spec, lease_seconds=1800.0, approval_id=approval_id)
         self.assertEqual(session.state, ProjectSessionState.READY.value)
         self.assertEqual(session.accelerator, "T4")
-        self.assertEqual(len(executed_cmds), 1)
-        self.assertEqual(executed_cmds[0][:4], ["colab", "--auth=oauth2", "new", "-s"])
+        allocations = [c for c in executed_cmds if "new" in c]  # baseline `usage` read is not an allocation
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(allocations[0][:4], ["colab", "--auth=oauth2", "new", "-s"])
 
         # =====================================================================
         # Stage 4: Colab session creation

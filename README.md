@@ -100,7 +100,7 @@ colab --auth=oauth2 download -s example-training \
 colab --auth=oauth2 stop -s example-training
 ```
 
-The commands above are a **manual workflow**, not an exception-safe wrapper. If any command fails, inspect `colab sessions` and explicitly stop the session. Prefer `colab run` for standalone scripts because it automatically attempts cleanup. **Important:** in the current upstream implementation, `colab exec` can print a Python traceback without necessarily returning a nonzero shell exit status. Verify remote completion and artifact correctness; do not infer success solely from `exec`'s exit code.
+The commands above are a **manual workflow**, not an exception-safe wrapper. If any command fails, inspect `colab sessions` and explicitly stop the session. Prefer `colab run` for standalone scripts because it automatically attempts cleanup. **Important:** in the current upstream implementation, `colab exec` can print a Python traceback without necessarily returning a nonzero shell exit status. The adapter's `project exec` reports kernel tracebacks as failures, but it still does not prove the job's outputs are correct: verify remote completion and artifact correctness, and do not infer success solely from `exec`'s exit code.
 
 ## Agent-assisted setup
 
@@ -117,7 +117,15 @@ Start here:
 **What the approval fingerprint covers.** The workspace part of the fingerprint hashes every regular file under the project root except `artifacts_local_dir` (default `./artifacts`), the `.colab_experiments` state directory, `*.log` files, `__pycache__`, `*.pyc` and `.git`. Changing any covered file (for example a source file) requires a new approval. Pulling artifacts or writing logs does not, so an existing session can still be reused. `project plan` output is unchanged.
 
 **Global cap and `--no-reuse`.** One managed session is allowed at a time. `project up --no-reuse` while any managed session is live always fails the cap (exit 4) and leaves the approval unconsumed: stop or reconcile the live session first. `colab_server.py run` follows the same cap: it registers a managed record before `colab run`, and the record stops counting toward the cap once the run finishes.
-**Host-side lease guard (best effort; not a billing cap).** `project up` starts a detached `project lease-guard` process for that one session (and restarts it if it died, on `project exec` or `project sync`). At the lease deadline the guard calls `colab --auth=<mode> stop -s <that id>` only, then checks `colab sessions` to confirm the id is gone. Failed stops or failed checks are retried with exponential backoff capped at 30 s, up to 5 attempts; after that the record is flagged `NEEDS_RECONCILIATION` and the guard exits nonzero. The guard never touches other sessions. It does **not** survive a host reboot, a `kill -9` of the guard, or loss of OAuth, and it is not a guarantee: the lease clock starts at `up`, so provisioning time counts against it. After every test, check `project status` (guard alive or dead, seconds remaining), `sessions` and `usage` yourself. `project reconcile` (auto-stop is on by default; `--no-auto-stop` only audits) is the backstop for a dead guard. `project exec` takes `--timeout` (default 600 s), which is passed to `colab exec --timeout` minus a 15 s margin and clamped to the remaining lease.
+**Host-side lease guard (best effort; not a billing cap).** `project up` starts a detached `project lease-guard` process for that one session (and restarts it if it died, on `project exec` or `project sync`). At the lease deadline the guard calls `colab --auth=<mode> stop -s <that id>` only, then verifies the removal. Failed stops are retried with exponential backoff capped at 30 s and the guard does **not** give up on its own: the first failure flags the record `NEEDS_RECONCILIATION`, and retries continue until the stop is verified, the record becomes terminal, or the guard receives SIGTERM. A busy project lock is waited for and is not counted as a failed attempt. The guard never touches other sessions.
+
+Verification of a stop, in order: `colab stop` must exit 0 without a "not found" message (upstream exits 0 and prints `[colab] Session '<id>' not found.` for an unknown name, so that case is recorded as `NEEDS_RECONCILIATION`, never `TERMINATED`); `colab sessions` must no longer list the id; and, when `up` recorded an `assignments_before` baseline from `colab usage` before `colab new`, the `Active assignments` count from `colab usage` must be back at or below that baseline. Without a baseline the record says `verification: weak` (sessions check only). A stop that exited 0 but failed the usage check is never re-issued; only verification is retried.
+
+The guard does **not** survive a host reboot, a `kill -9` of the guard, or loss of OAuth, and it is not a guarantee: the lease clock starts at `up`, so provisioning time counts against it. After every test, check `project status` (exit code 5 means needs attention: `NEEDS_RECONCILIATION`, `STOPPING`, or a dead guard under an active lease), `sessions` and `usage` yourself. `project reconcile` (auto-stop is on by default; `--no-auto-stop` only audits) is the backstop: it handles expired leases, `NEEDS_RECONCILIATION`, `STOPPING` and `PROVISIONING` records older than 300 s, managed ids only, and prints a warning whenever a `NEEDS_RECONCILIATION` record exists.
+
+**Do not Ctrl-C `project up`.** If `colab new` is interrupted (timeout, Ctrl-C) it may already have assigned a VM before the adapter recorded its local name. The record is kept as `NEEDS_RECONCILIATION` and still counts toward the cap. Upstream `colab sessions` shows such an unnamed VM only as a line starting `[?] <endpoint>`. Check `colab --auth=<mode> usage` (`Active assignments: N`) and the Colab UI, and do not assume the adapter has cleaned it up. The adapter does not clear `NEEDS_RECONCILIATION` automatically.
+
+**`project exec` takes Python.** The argument is PYTHON code run by the remote kernel, because `colab exec -f` runs its file as kernel Python. `--working-dir` becomes an `os.chdir` prologue (absolute remote path, no `..`, no control characters). `--shell` runs the argument as a shell command on the managed VM only, with `cwd` set from `--working-dir`, and prints stdout, stderr and an `EXIT_CODE <n>` marker. The upstream exit status of `colab exec` is not the command's exit status, so success requires the marker to be present and equal to 0; a missing marker is reported as failure. Kernel tracebacks are reported as failure even though upstream exits 0. `project exec --timeout` (default 600 s) is passed to `colab exec --timeout` minus a 15 s margin and clamped to the remaining lease.
 
 ## Documentation
 
@@ -187,10 +195,13 @@ python3 -m colab_adapter.cli project up --manifest ./my-project/colab-project.js
 # Incrementally sync workspace source tree to the remote session
 python3 -m colab_adapter.cli project sync --manifest ./my-project/colab-project.json --session-id <session-id> --json
 
-# Execute project entrypoint with optional runtime arguments
-python3 -m colab_adapter.cli project exec "python3 train.py --epochs 10 --batch-size 32" --session-id <session-id> --json
+# Run PYTHON code on the remote kernel (project exec takes Python, not a shell command)
+python3 -m colab_adapter.cli project exec "import runpy; runpy.run_path('train.py', run_name='__main__')" --working-dir /content/colab-workspaces/my-project --session-id <session-id> --json
 
-# Inspect remote project session status and lease TTL
+# Run a shell command on the managed VM (exit code is read from the EXIT_CODE marker)
+python3 -m colab_adapter.cli project exec --shell "python3 train.py --epochs 10 --batch-size 32" --working-dir /content/colab-workspaces/my-project --session-id <session-id> --json
+
+# Inspect remote project session status and lease TTL (exit code 5 = needs attention)
 python3 -m colab_adapter.cli project status --session-id <session-id> --json
 
 # Safely terminate project session
@@ -278,7 +289,7 @@ python3 -m colab_adapter.cli project up --manifest ./research-project/colab-proj
 12. **Remote Training Execution**:
     Execute the remote training entrypoint with live streaming output:
     ```bash
-    python3 -m colab_adapter.cli project exec "python3 train.py --epochs 10 --batch-size 32" --session-id <session-id> --json
+    python3 -m colab_adapter.cli project exec --shell "python3 train.py --epochs 10 --batch-size 32" --working-dir /content/colab-workspaces/my-project --session-id <session-id> --json
     ```
 13. **Incremental Code Synchronization (Hot Updates)**:
     Modify local code and re-synchronize; only modified files transfer:
@@ -311,7 +322,7 @@ python3 -m colab_adapter.cli project up --manifest ./research-project/colab-proj
     python3 -m colab_adapter.cli project stop --session-id <session-id> --json
     ```
 20. **Lease Reconciliation & Rollback / Troubleshooting**:
-    Reconcile expired sessions and release orphan compute:
+    Reconcile expired sessions, `NEEDS_RECONCILIATION`/`STOPPING` records and stale `PROVISIONING` records (managed ids only). Read every `WARNING:` line: a `NEEDS_RECONCILIATION` record may hide an unnamed orphan VM that only `colab usage` (active assignments) and the Colab UI can confirm:
     ```bash
     python3 -m colab_adapter.cli project reconcile --json
     ```
