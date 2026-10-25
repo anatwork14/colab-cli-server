@@ -43,6 +43,7 @@ from colab_adapter.storage import (
     compute_file_md5,
     compute_file_sha256,
 )
+from colab_adapter.storage.drive_metadata import canonical_successor_id, path_digest
 
 
 class MockDriveHttpClient:
@@ -1746,14 +1747,32 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
 
         # Revision C is latest
         self.assertEqual(mf_c["appProperties"].get("is_latest"), "true")
+        self.assertEqual(mf_c["appProperties"].get("schema"), "2")
+        self.assertEqual(mf_c["appProperties"].get("sha256"), art_c.sha256)
+        self.assertEqual(mf_c["appProperties"].get("path_sha256"), path_digest(project_id, run_id, "checkpoints/model.pt"))
         self.assertNotIn("superseded_by", mf_c["appProperties"])
+        self.assertNotIn("next_sha256", mf_c["appProperties"])
+        self.assertNotIn("logical_path", mf_c["appProperties"])
+        self.assertNotIn("revision_id", mf_c["appProperties"])
+        self.assertNotIn("project_id", mf_c["appProperties"])
+        self.assertNotIn("run_id", mf_c["appProperties"])
 
-        # Revisions A and B have is_latest == "false" and correct superseded_by
+        # Revisions A and B have is_latest == "false" and correct next_sha256
         self.assertEqual(mf_a["appProperties"].get("is_latest"), "false")
-        self.assertEqual(mf_a["appProperties"].get("superseded_by"), art_b.artifact_id)
+        self.assertEqual(mf_a["appProperties"].get("next_sha256"), art_b.sha256)
+        self.assertEqual(canonical_successor_id(project_id, run_id, "checkpoints/model.pt", mf_a["appProperties"]["next_sha256"]), art_b.artifact_id)
+        self.assertNotIn("superseded_by", mf_a["appProperties"])
+        self.assertEqual(mf_a["appProperties"].get("schema"), "2")
+        self.assertEqual(mf_a["appProperties"].get("sha256"), art_a.sha256)
+        self.assertNotIn("logical_path", mf_a["appProperties"])
 
         self.assertEqual(mf_b["appProperties"].get("is_latest"), "false")
-        self.assertEqual(mf_b["appProperties"].get("superseded_by"), art_c.artifact_id)
+        self.assertEqual(mf_b["appProperties"].get("next_sha256"), art_c.sha256)
+        self.assertEqual(canonical_successor_id(project_id, run_id, "checkpoints/model.pt", mf_b["appProperties"]["next_sha256"]), art_c.artifact_id)
+        self.assertNotIn("superseded_by", mf_b["appProperties"])
+        self.assertEqual(mf_b["appProperties"].get("schema"), "2")
+        self.assertEqual(mf_b["appProperties"].get("sha256"), art_b.sha256)
+        self.assertNotIn("logical_path", mf_b["appProperties"])
 
         # Verify ONLY revision C has is_latest == "true" among all model.pt files in the target folder
         target_folder_id = self.store.resolve_target_folder_id(project_id, run_id, "checkpoints")

@@ -30,7 +30,7 @@ import hashlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Protocol, Tuple, Union
 
 try:
     import fcntl
@@ -52,6 +52,22 @@ from ..errors import (
 from .base import ArtifactStore, ArtifactType, StoredArtifact, _utc_now_iso
 from .manifest import PublicationManifest, compute_file_md5, compute_file_sha256
 from .transfer import TransferJournal, TransferRecord, TransferStatus
+from .drive_metadata import (
+    DRIVE_PROPERTY_MAX_BYTES,
+    DRIVE_MAX_APP_PROPERTIES,
+    SCHEMA_VERSION,
+    STATE_HISTORICAL,
+    STATE_LATEST,
+    STATE_PENDING,
+    build_revision_properties,
+    canonical_successor_id,
+    is_sha256_hex,
+    path_digest,
+    props_match_path,
+    revision_state,
+    successor_sha256,
+    validate_drive_properties,
+)
 
 ArtifactTransferError = DriveTransferError
 
@@ -807,6 +823,8 @@ class GoogleDriveArtifactStore:
         app_properties: Optional[Dict[str, str]] = None,
     ) -> str:
         """Initiate resumable upload session and return the upload URL."""
+        if app_properties:
+            validate_drive_properties(app_properties)
         token = self._ensure_token()
         init_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,md5Checksum,appProperties"
         metadata: Dict[str, Any] = {
@@ -982,14 +1000,13 @@ class GoogleDriveArtifactStore:
 
         if app_properties is None and transfer_record and transfer_record.sha256:
             target_rel = transfer_record.target_rel_path or filename or ""
-            app_properties = {
-                "sha256": transfer_record.sha256.lower(),
-                "logical_path": target_rel,
-                "revision_id": f"sha256_{transfer_record.sha256.lower()}",
-                "project_id": transfer_record.project_id or "",
-                "run_id": transfer_record.run_id or "",
-                "is_latest": "false",
-            }
+            app_properties = build_revision_properties(
+                sha256=transfer_record.sha256,
+                project_id=transfer_record.project_id or "",
+                run_id=transfer_record.run_id or "",
+                logical_path=target_rel,
+                is_latest=False,
+            )
 
         new_session_url = self._initiate_resumable_upload(
             filename, target_folder_id, total_size, app_properties=app_properties
@@ -1023,14 +1040,13 @@ class GoogleDriveArtifactStore:
 
         if app_properties is None and transfer_record and transfer_record.sha256:
             target_rel = transfer_record.target_rel_path or filename or ""
-            app_properties = {
-                "sha256": transfer_record.sha256.lower(),
-                "logical_path": target_rel,
-                "revision_id": f"sha256_{transfer_record.sha256.lower()}",
-                "project_id": transfer_record.project_id or "",
-                "run_id": transfer_record.run_id or "",
-                "is_latest": "false",
-            }
+            app_properties = build_revision_properties(
+                sha256=transfer_record.sha256,
+                project_id=transfer_record.project_id or "",
+                run_id=transfer_record.run_id or "",
+                logical_path=target_rel,
+                is_latest=False,
+            )
 
         # Check if identical file already exists in target folder (idempotency)
         existing = self._find_file_in_folder(
@@ -1353,11 +1369,19 @@ class GoogleDriveArtifactStore:
                     pass
 
     def _patch_remote_file_app_properties(
-        self, remote_id: str, app_properties: Dict[str, str]
+        self, remote_id: str, app_properties: Mapping[str, Optional[str]]
     ) -> Dict[str, Any]:
         """Send a retryable PATCH request to update file appProperties on Google Drive."""
+        if not isinstance(app_properties, (dict, Mapping)):
+            raise DriveTransferError("Drive custom properties must be provided as a mapping")
+        for k in app_properties.keys():
+            if not isinstance(k, str) or not k:
+                raise DriveTransferError("Drive custom property key must not be empty and must be a string")
+        non_none_props = {k: v for k, v in app_properties.items() if v is not None}
+        validate_drive_properties(non_none_props)
+
         url = f"https://www.googleapis.com/drive/v3/files/{remote_id}?fields=id,name,appProperties"
-        payload = json.dumps({"appProperties": app_properties}).encode("utf-8")
+        payload = json.dumps({"appProperties": dict(app_properties)}).encode("utf-8")
         status, headers, body = self._request_with_retry(
             "PATCH",
             url,
@@ -1393,10 +1417,16 @@ class GoogleDriveArtifactStore:
 
         res_props = res.get("appProperties") or {}
         for k, v in app_properties.items():
-            if res_props.get(k) != v:
-                raise DriveTransferError(
-                    f"PATCH verification failed for '{remote_id}': property '{k}' expected '{v}', got '{res_props.get(k)}'."
-                )
+            if v is None:
+                if k in res_props:
+                    raise DriveTransferError(
+                        f"PATCH verification failed for '{remote_id}': property '{k}' expected to be deleted, but still present in response."
+                    )
+            else:
+                if res_props.get(k) != v:
+                    raise DriveTransferError(
+                        f"PATCH verification failed for '{remote_id}': property '{k}' expected '{v}', got '{res_props.get(k)}'."
+                    )
 
         return res
 
@@ -1415,8 +1445,12 @@ class GoogleDriveArtifactStore:
 
         Called only after new_remote_id has been uploaded and content-verified.
         Demotes all previous revisions in target_folder_id to is_latest='false'
-        and sets superseded_by, then promotes new_remote_id to is_latest='true'.
+        and sets next_sha256 to new_sha256 (preserving existing next_sha256 if
+        already set). Then promotes new_remote_id to is_latest='true'.
+        Removes any legacy custom properties present remotely on demoted/promoted files.
         """
+        legacy_keys = ("logical_path", "revision_id", "project_id", "run_id", "superseded_by")
+
         # Step A: List all existing remote files in target_folder_id with name = filename
         files = self._list_files_in_folder(filename, target_folder_id)
 
@@ -1426,22 +1460,120 @@ class GoogleDriveArtifactStore:
             if not f_id or f_id == new_remote_id:
                 continue
             old_props = dict(f.get("appProperties") or {})
-            if old_props.get("is_latest") == "true":
-                updated_old_props = {**old_props, "is_latest": "false"}
-                if not old_props.get("superseded_by"):
-                    updated_old_props["superseded_by"] = artifact_id
-                self._patch_remote_file_app_properties(f_id, updated_old_props)
 
-        # Step C: Promote new_remote_id to is_latest="true"
-        promoted_props = {
-            "sha256": new_sha256.lower(),
-            "logical_path": logical_path,
-            "revision_id": f"sha256_{new_sha256.lower()}",
-            "project_id": project_id,
-            "run_id": run_id,
-            "is_latest": "true",
-        }
+            # ONLY consider files whose props_match_path(...) is not False (never demote other logical paths)
+            if props_match_path(old_props, project_id, run_id, logical_path) is False:
+                continue
+
+            # For each other file with revision_state == latest
+            if revision_state(old_props) == STATE_LATEST:
+                old_sha = old_props.get("sha256")
+                if not old_sha and old_props.get("revision_id"):
+                    m = re.search(r"sha256_([0-9a-fA-F]{64})", old_props["revision_id"])
+                    if m:
+                        old_sha = m.group(1).lower()
+
+                if not old_sha:
+                    raise DriveTransferError(
+                        f"Remote file '{f_id}' marked latest lacks sha256 property; cannot demote."
+                    )
+
+                # Preserve existing next_sha256 if already set; do not overwrite
+                existing_next = old_props.get("next_sha256") or successor_sha256(old_props)
+                nxt_sha = existing_next if (existing_next and is_sha256_hex(existing_next)) else new_sha256
+
+                demoted_props: Dict[str, Optional[str]] = dict(
+                    build_revision_properties(
+                        sha256=old_sha,
+                        project_id=project_id,
+                        run_id=run_id,
+                        logical_path=logical_path,
+                        is_latest=False,
+                        next_sha256=nxt_sha,
+                    )
+                )
+
+                # Drop legacy long keys by sending value None ONLY if present remotely
+                for k in legacy_keys:
+                    if k in old_props:
+                        demoted_props[k] = None
+
+                self._patch_remote_file_app_properties(f_id, demoted_props)
+
+        # Step C: Promote new_remote_id via build_revision_properties(new_sha, ..., True)
+        new_remote_file = next((f for f in files if f.get("id") == new_remote_id), None)
+        new_existing_props = dict(new_remote_file.get("appProperties") or {}) if new_remote_file else {}
+        if new_remote_file is None:
+            try:
+                _, new_existing_props = self._remote_revision_state(new_remote_id)
+            except Exception:
+                new_existing_props = {}
+
+        promoted_props: Dict[str, Optional[str]] = dict(
+            build_revision_properties(
+                sha256=new_sha256,
+                project_id=project_id,
+                run_id=run_id,
+                logical_path=logical_path,
+                is_latest=True,
+            )
+        )
+
+        # Drop legacy long keys by sending value None ONLY if present remotely
+        for k in legacy_keys:
+            if k in new_existing_props:
+                promoted_props[k] = None
+
         self._patch_remote_file_app_properties(new_remote_id, promoted_props)
+
+    def _remote_revision_state(self, remote_id: str) -> Tuple[str, Dict[str, str]]:
+        """Fetch remote file appProperties and classify revision state.
+
+        Returns (revision_state(props), props).
+        """
+        url = f"https://www.googleapis.com/drive/v3/files/{remote_id}?fields=id,name,appProperties"
+        try:
+            status, _, body = self._request_with_retry("GET", url)
+        except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+            raise
+        except Exception as e:
+            raise DriveTransferError(
+                f"Failed to fetch remote revision state for '{remote_id}': {_sanitize_drive_error(str(e), url)}"
+            ) from e
+
+        if status == 401:
+            raise DriveAuthenticationError(
+                f"Drive authentication rejected (401) fetching revision state for '{remote_id}': {_sanitize_drive_error(body, url)}"
+            )
+        if status == 403:
+            body_text = body.decode("utf-8", errors="replace")
+            sanitized = _sanitize_drive_error(body, url)
+            if "quotaExceeded" in body_text or "storageQuotaExceeded" in body_text:
+                raise DriveQuotaExceededError(f"Drive storage quota exceeded (403): {sanitized}")
+            raise DriveAuthenticationError(f"Drive access forbidden (403): {sanitized}")
+        if status == 404:
+            raise ArtifactNotFoundError(
+                f"Remote file '{remote_id}' not found on Google Drive (HTTP 404): {_sanitize_drive_error(body, url)}"
+            )
+        if status != 200:
+            raise DriveTransferError(
+                f"Failed to fetch remote revision state for '{remote_id}' (HTTP {status}): {_sanitize_drive_error(body, url)}"
+            )
+
+        try:
+            res = json.loads(body.decode("utf-8"))
+        except Exception as e:
+            raise DriveTransferError(
+                f"Invalid JSON response fetching revision state for '{remote_id}': {_sanitize_drive_error(str(e), url)}"
+            ) from e
+
+        if not isinstance(res, dict):
+            raise DriveTransferError(
+                f"Invalid response fetching revision state for '{remote_id}': expected JSON object, got {type(res).__name__}"
+            )
+
+        props = dict(res.get("appProperties") or {})
+        return revision_state(props), props
 
     def _save_manifest_with_backup(self, manifest: PublicationManifest, local_manifest_path: Path) -> None:
         """Atomically persist manifest and sync 0600 backup."""
@@ -2009,14 +2141,13 @@ class GoogleDriveArtifactStore:
                     record.transition_to(TransferStatus.UPLOADING)
                     self.journal.record_transfer(record)
 
-                drive_app_props = {
-                    "sha256": local_sha256.lower(),
-                    "logical_path": rel_path,
-                    "revision_id": f"sha256_{local_sha256.lower()}",
-                    "project_id": project_id,
-                    "run_id": run_id,
-                    "is_latest": "false",
-                }
+                drive_app_props = build_revision_properties(
+                    sha256=local_sha256,
+                    project_id=project_id,
+                    run_id=run_id,
+                    logical_path=rel_path,
+                    is_latest=False,
+                )
                 drive_file_meta = self.upload_file_resumable(
                     staged_src, target_folder_id, record, app_properties=drive_app_props
                 )
@@ -2445,6 +2576,9 @@ class GoogleDriveArtifactStore:
                     c_fid = cand.get("id")
                     if not c_fid:
                         continue
+                    c_props = cand.get("appProperties") or {}
+                    if props_match_path(c_props, proj_id, r_id, rel_p) is False:
+                        continue
                     c_size = int(cand["size"]) if cand.get("size") is not None else None
                     c_md5 = cand.get("md5Checksum")
                     cand_meta = StoredArtifact(
@@ -2526,23 +2660,17 @@ class GoogleDriveArtifactStore:
 
                 latest_candidates = [
                     f for f in files
-                    if (f.get("appProperties") or {}).get("is_latest") == "true"
-                    and (f.get("appProperties") or {}).get("sha256")
+                    if props_match_path(f.get("appProperties"), proj_id, r_id, rel_p) is not False
+                    and (f.get("appProperties") or {}).get("is_latest") == "true"
                 ]
-                if len(latest_candidates) == 1:
-                    chosen = latest_candidates[0]
+                valid_latest_candidates = [
+                    f for f in latest_candidates
+                    if is_sha256_hex((f.get("appProperties") or {}).get("sha256"))
+                ]
+                if len(latest_candidates) == 1 and len(valid_latest_candidates) == 1:
+                    chosen = valid_latest_candidates[0]
                     app_props = chosen.get("appProperties") or {}
                     chosen_sha = app_props["sha256"].strip().lower()
-
-                    cand_logical = app_props.get("logical_path")
-                    if cand_logical and cand_logical != rel_p and Path(cand_logical).name != fname:
-                        raise DriveIntegrityError(
-                            f"Remote file logical_path '{cand_logical}' does not match expected '{rel_p}'."
-                        )
-                    if len(chosen_sha) != 64 or not all(c in "0123456789abcdef" for c in chosen_sha):
-                        raise DriveIntegrityError(
-                            f"Invalid SHA256 '{chosen_sha}' in remote file appProperties for '{artifact_id}'."
-                        )
 
                     meta = StoredArtifact(
                         artifact_id=f"{base_art_id}@sha256_{chosen_sha}",
@@ -2557,9 +2685,19 @@ class GoogleDriveArtifactStore:
                         verified_at=_utc_now_iso(),
                     )
                     target_sha = chosen_sha
+                elif len(latest_candidates) == 1 and len(valid_latest_candidates) == 0:
+                    chosen = latest_candidates[0]
+                    chosen_sha = (chosen.get("appProperties") or {}).get("sha256")
+                    raise DriveIntegrityError(
+                        f"Ambiguous unversioned Drive recovery: latest remote file '{chosen.get('id')}' lacks valid 64-hex sha256 ({chosen_sha!r}) for '{artifact_id}' and local manifest is missing."
+                    )
                 elif len(latest_candidates) == 0:
-                    if len(files) == 1 and allow_unverified_recovery:
-                        chosen = files[0]
+                    matching_files = [
+                        f for f in files
+                        if props_match_path(f.get("appProperties"), proj_id, r_id, rel_p) is not False
+                    ]
+                    if len(matching_files) == 1 and allow_unverified_recovery:
+                        chosen = matching_files[0]
                         if not chosen.get("md5Checksum") or chosen.get("size") is None:
                             raise DriveIntegrityError(
                                 "Unverified Drive recovery refused: remote file lacks md5Checksum or size."
@@ -2625,11 +2763,19 @@ class GoogleDriveArtifactStore:
                     return False
                 if req_sha is not None:
                     for f in files:
-                        c_sha = (f.get("appProperties") or {}).get("sha256", "").strip().lower()
+                        f_props = f.get("appProperties") or {}
+                        if props_match_path(f_props, proj_id, r_id, rel_p) is False:
+                            continue
+                        c_sha = f_props.get("sha256", "").strip().lower()
                         if c_sha and c_sha.startswith(req_sha):
                             return True
                     return False
-                return True
+                for f in files:
+                    f_props = f.get("appProperties") or {}
+                    if props_match_path(f_props, proj_id, r_id, rel_p) is False:
+                        continue
+                    return True
+                return False
             except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
                 raise
             except Exception:
