@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from colab_adapter.errors import (
+    ArtifactNotFoundError,
     ArtifactValidationError,
     DriveAuthenticationError,
     DriveIntegrityError,
@@ -42,6 +43,7 @@ from colab_adapter.storage import (
     compute_file_md5,
     compute_file_sha256,
 )
+from colab_adapter.storage.drive_metadata import canonical_successor_id, path_digest
 
 
 class MockDriveHttpClient:
@@ -60,13 +62,33 @@ class MockDriveHttpClient:
         self.resumed_called = False
         self.upload_sessions_initiated = 0
 
+        # Pagination and listing error simulation controls
+        self.list_page_size_override: Optional[int] = None
+        self.inject_looping_page_token: bool = False
+        self.inject_malformed_page_token: Any = None
+        self.fail_list_files_status: Optional[int] = None
+        self.fail_list_files_body: Optional[bytes] = None
+        self.fail_list_files_exception: Optional[Exception] = None
+        self.fail_list_files_at_page: Optional[int] = None
+        self.list_files_page_count: int = 0
+        self.fail_folder_lookup_status: Optional[int] = None
+        self.fail_folder_lookup_body: Optional[bytes] = None
+        self.fail_folder_lookup_exception: Optional[Exception] = None
+
         # Session tracking buffers and committed files
         self.session_buffers: Dict[str, bytearray] = {}
         self.session_to_file_id: Dict[str, str] = {}
         self.session_to_filename: Dict[str, str] = {}
         self.session_to_parent: Dict[str, Optional[str]] = {}
+        self.session_to_app_props: Dict[str, Dict[str, str]] = {}
         self.committed_files: Dict[str, bytes] = {}
         self.mock_files: List[Dict[str, Any]] = []
+        self.fail_download_network_error = False
+        self.corrupt_download_bytes: Optional[bytes] = None
+        self.truncate_download_bytes_to: Optional[int] = None
+        self.fail_next_n_patches: int = 0
+        self.patch_status_code: int = 503
+        self.abort_before_promote_patch: bool = False
 
     def _get_session_buffer(self, url: str) -> Optional[bytearray]:
         if url in self.session_buffers:
@@ -92,11 +114,17 @@ class MockDriveHttpClient:
         chunk_size: int = 64 * 1024,
         timeout: float = 60.0,
     ) -> Tuple[int, Dict[str, str], int]:
+        if self.fail_download_network_error:
+            raise ConnectionResetError("Simulated network interruption during stream_download")
         status, resp_headers, body = self.request("GET", url, headers=headers, timeout=timeout)
         if status == 200:
             dest = Path(dest_path)
             dest.parent.mkdir(parents=True, exist_ok=True)
             body_bytes = body if isinstance(body, (bytes, bytearray)) else (body.encode("utf-8") if isinstance(body, str) else b"")
+            if self.truncate_download_bytes_to is not None:
+                body_bytes = body_bytes[:self.truncate_download_bytes_to]
+            if self.corrupt_download_bytes is not None:
+                body_bytes = self.corrupt_download_bytes
             dest.write_bytes(body_bytes)
             return status, resp_headers, len(body_bytes)
         return status, resp_headers, 0
@@ -144,6 +172,13 @@ class MockDriveHttpClient:
         if "drive/v3/files?q=" in url and method == "GET":
             q_unquoted = urllib.parse.unquote(url)
             if "mimeType = 'application/vnd.google-apps.folder'" in q_unquoted:
+                if self.fail_folder_lookup_exception is not None:
+                    raise self.fail_folder_lookup_exception
+                if self.fail_folder_lookup_status is not None:
+                    return self.fail_folder_lookup_status, {}, self.fail_folder_lookup_body or b'{"error": "Folder lookup failed"}'
+                if self.fail_folder_lookup_body is not None:
+                    return 200, {}, self.fail_folder_lookup_body
+
                 matched_folders = []
                 for f in self.mock_files:
                     if f.get("mimeType") == "application/vnd.google-apps.folder":
@@ -153,6 +188,48 @@ class MockDriveHttpClient:
                             if (f_parent is None and "'root' in parents" in q_unquoted) or (f_parent and f"'{f_parent}' in parents" in q_unquoted):
                                 matched_folders.append({"id": f["id"], "name": f_name})
                 return 200, {}, json.dumps({"files": matched_folders}).encode("utf-8")
+
+            # Non-folder files query: parse pagination params
+            parsed = urllib.parse.urlparse(url)
+            qs = urllib.parse.parse_qs(parsed.query)
+            parsed_page_size = qs.get("pageSize", [None])[0]
+            parsed_page_token = qs.get("pageToken", [None])[0]
+
+            effective_page_size = self.list_page_size_override or (int(parsed_page_size) if parsed_page_size else None)
+
+            current_page = 1
+            offset = 0
+            if parsed_page_token:
+                m_page = re.match(r"page-(\d+)-offset-(\d+)", parsed_page_token)
+                if m_page:
+                    current_page = int(m_page.group(1))
+                    offset = int(m_page.group(2))
+                elif parsed_page_token.startswith("offset-"):
+                    offset = int(parsed_page_token.split("-")[1])
+                    current_page = (offset // (effective_page_size or 100)) + 1
+                else:
+                    self.list_files_page_count += 1
+                    current_page = self.list_files_page_count
+                    if effective_page_size:
+                        offset = (current_page - 1) * effective_page_size
+            else:
+                self.list_files_page_count = 1
+                current_page = 1
+                offset = 0
+
+            # Check simulated failure for file listing
+            if self.fail_list_files_exception is not None:
+                if self.fail_list_files_at_page is None or current_page == self.fail_list_files_at_page:
+                    raise self.fail_list_files_exception
+
+            if self.fail_list_files_status is not None:
+                if self.fail_list_files_at_page is None or current_page == self.fail_list_files_at_page:
+                    body = self.fail_list_files_body if self.fail_list_files_body is not None else b'{"error": "Simulated listing failure"}'
+                    return self.fail_list_files_status, {}, body
+
+            if self.fail_list_files_body is not None:
+                if self.fail_list_files_at_page is None or current_page == self.fail_list_files_at_page:
+                    return 200, {}, self.fail_list_files_body
 
             matched = []
             for f in self.mock_files:
@@ -174,7 +251,27 @@ class MockDriveHttpClient:
                             "name": f_name,
                             "size": sz_val,
                             "md5Checksum": md5_val,
+                            "appProperties": f.get("appProperties", {}),
+                            "description": f.get("description", ""),
+                            "createdTime": f.get("createdTime", "2026-01-01T00:00:00Z"),
                         })
+
+            if effective_page_size is not None and effective_page_size > 0:
+                page_items = matched[offset : offset + effective_page_size]
+                has_more = (offset + effective_page_size) < len(matched)
+                resp_dict: Dict[str, Any] = {"files": page_items}
+
+                if self.inject_malformed_page_token is not None:
+                    resp_dict["nextPageToken"] = self.inject_malformed_page_token
+                elif self.inject_looping_page_token:
+                    resp_dict["nextPageToken"] = "looping-page-token"
+                elif has_more:
+                    next_page_num = current_page + 1
+                    next_offset = offset + effective_page_size
+                    resp_dict["nextPageToken"] = f"page-{next_page_num}-offset-{next_offset}"
+
+                return 200, {}, json.dumps(resp_dict).encode("utf-8")
+
             return 200, {}, json.dumps({"files": matched}).encode("utf-8")
 
         if "drive/v3/files" in url and method == "POST" and "uploadType=resumable" not in url:
@@ -209,18 +306,22 @@ class MockDriveHttpClient:
 
             f_name = "uploaded_file"
             f_parent = None
+            f_app_props = {}
             if data:
                 try:
                     meta = json.loads(data.decode("utf-8"))
                     f_name = meta.get("name", f_name)
                     f_parents = meta.get("parents", [])
                     f_parent = f_parents[0] if f_parents else None
+                    f_app_props = meta.get("appProperties", {})
                 except Exception:
                     pass
             self.session_to_filename[session_url] = f_name
             self.session_to_filename[session_id] = f_name
             self.session_to_parent[session_url] = f_parent
             self.session_to_parent[session_id] = f_parent
+            self.session_to_app_props[session_url] = f_app_props
+            self.session_to_app_props[session_id] = f_app_props
             return 200, {"location": session_url}, b""
 
         # 4. Uploading chunk or querying status
@@ -279,18 +380,21 @@ class MockDriveHttpClient:
                 md5_hex = hashlib.md5(committed).hexdigest()
                 fname = self.session_to_filename.get(url, "uploaded_file")
                 fparent = self.session_to_parent.get(url, None)
+                fapp_props = dict(self.session_to_app_props.get(url, {}))
                 self.mock_files.append({
                     "id": file_id,
                     "name": fname,
                     "parent": fparent,
                     "size": total_size,
                     "md5Checksum": md5_hex,
+                    "appProperties": fapp_props,
                 })
                 resp = {
                     "id": file_id,
                     "name": fname,
                     "size": str(total_size),
                     "md5Checksum": md5_hex,
+                    "appProperties": fapp_props,
                 }
                 return 200, {"content-type": "application/json"}, json.dumps(resp).encode("utf-8")
             else:
@@ -299,15 +403,23 @@ class MockDriveHttpClient:
 
         # 5. Media download
         if "alt=media" in url and method == "GET":
+            if self.fail_download_network_error:
+                raise ConnectionResetError("Simulated network interruption during media download")
             m_fid = re.search(r"drive/v3/files/([^/?]+)", url)
             fid = m_fid.group(1) if m_fid else None
+            data_bytes = b"VERIFIED_DOWNLOADED_CONTENT_MOCK"
             if fid and fid in self.committed_files:
-                return 200, {}, self.committed_files[fid]
-            if fid:
+                data_bytes = self.committed_files[fid]
+            elif fid:
                 for mf in self.mock_files:
                     if mf.get("id") == fid and "content" in mf:
-                        return 200, {}, mf["content"]
-            return 200, {}, b"VERIFIED_DOWNLOADED_CONTENT_MOCK"
+                        data_bytes = mf["content"]
+                        break
+            if self.truncate_download_bytes_to is not None:
+                data_bytes = data_bytes[:self.truncate_download_bytes_to]
+            if self.corrupt_download_bytes is not None:
+                data_bytes = self.corrupt_download_bytes
+            return 200, {}, data_bytes
 
         # 6. File metadata query (GET /drive/v3/files/{file_id})
         if re.search(r"drive/v3/files/[^/?]+", url) and method == "GET" and "?q=" not in url:
@@ -328,22 +440,81 @@ class MockDriveHttpClient:
                             "name": mf.get("name", "uploaded_file"),
                             "size": sz,
                             "md5Checksum": md5,
+                            "appProperties": mf.get("appProperties", {}),
+                            "description": mf.get("description", ""),
+                            "createdTime": mf.get("createdTime", "2026-01-01T00:00:00Z"),
                         }
                         return 200, {"content-type": "application/json"}, json.dumps(resp).encode("utf-8")
                 if fid in self.committed_files:
                     c_data = self.committed_files[fid]
                     fname = "uploaded_file"
+                    fprops = {}
                     for mf in self.mock_files:
                         if mf.get("id") == fid:
                             fname = mf.get("name", fname)
+                            fprops = mf.get("appProperties", {})
                             break
                     resp = {
                         "id": fid,
                         "name": fname,
                         "size": str(len(c_data)),
                         "md5Checksum": hashlib.md5(c_data).hexdigest(),
+                        "appProperties": fprops,
                     }
                     return 200, {"content-type": "application/json"}, json.dumps(resp).encode("utf-8")
+
+        # 7. File patch (PATCH /drive/v3/files/{file_id})
+        if re.search(r"drive/v3/files/[^/?]+", url) and method == "PATCH":
+            m_fid = re.search(r"drive/v3/files/([^/?]+)", url)
+            if not m_fid:
+                return 404, {}, b'{"error": "Not Found"}'
+            fid = m_fid.group(1)
+
+            if self.fail_next_n_patches > 0:
+                self.fail_next_n_patches -= 1
+                return self.patch_status_code, {}, b'{"error": {"message": "Simulated PATCH failure"}}'
+
+            patch_data = json.loads(data.decode("utf-8")) if data else {}
+            new_app_props = patch_data.get("appProperties")
+
+            if self.abort_before_promote_patch and new_app_props and new_app_props.get("is_latest") == "true":
+                raise ConnectionResetError("Simulated crash before promotion PATCH")
+
+            found_file = None
+            for mf in self.mock_files:
+                if mf.get("id") == fid:
+                    found_file = mf
+                    break
+
+            if found_file is None:
+                return 404, {}, b'{"error": "Not Found"}'
+
+            if "appProperties" not in found_file or not isinstance(found_file["appProperties"], dict):
+                found_file["appProperties"] = {}
+
+            if new_app_props and isinstance(new_app_props, dict):
+                for k, v in new_app_props.items():
+                    if v is None:
+                        found_file["appProperties"].pop(k, None)
+                    else:
+                        found_file["appProperties"][k] = v
+
+            c_data = found_file.get("content")
+            if c_data is not None:
+                sz = str(len(c_data))
+                md5 = hashlib.md5(c_data).hexdigest()
+            else:
+                sz = str(found_file.get("size", 0))
+                md5 = found_file.get("md5Checksum", "")
+
+            resp = {
+                "id": fid,
+                "name": found_file.get("name", "uploaded_file"),
+                "size": sz,
+                "md5Checksum": md5,
+                "appProperties": dict(found_file["appProperties"]),
+            }
+            return 200, {"content-type": "application/json"}, json.dumps(resp).encode("utf-8")
 
         return 404, {}, b'{"error": "Not Found"}'
 
@@ -630,6 +801,8 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
         def missing_md5_success_request(method, url, headers=None, data=None, timeout=30.0):
             status, resp_headers, body = original_request(method, url, headers=headers, data=data, timeout=timeout)
             if "session_id=upload-session" in url and status == 200:
+                if self.mock_client.mock_files:
+                    self.mock_client.mock_files[-1]["id"] = "file-no-md5"
                 resp = {"id": "file-no-md5", "name": "uploaded_file", "size": str(len(payload_data))}
                 return 200, resp_headers, json.dumps(resp).encode("utf-8")
             if "drive/v3/files/file-no-md5" in url and method == "GET" and "alt=media" not in url:
@@ -1115,13 +1288,14 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
         file_path = Path(self.test_dir) / "mutate_during_stage.pt"
         file_path.write_bytes(b"DATA_BEFORE_MUTATION")
 
-        original_copy2 = shutil.copy2
+        original_stage = self.store._stage_file
 
-        def mutating_copy2(src, dst, *args, **kwargs):
-            original_copy2(src, dst, *args, **kwargs)
-            Path(dst).write_bytes(b"MUTATED_DURING_STAGING")
+        def mutating_stage(src, tmp_staging):
+            original_stage(src, tmp_staging)
+            tmp_staging.write_bytes(b"MUTATED_DURING_STAGING")
+            return len(b"MUTATED_DURING_STAGING"), hashlib.sha256(b"MUTATED_DURING_STAGING").hexdigest()
 
-        shutil.copy2 = mutating_copy2
+        self.store._stage_file = mutating_stage
         try:
             with self.assertRaises(ArtifactTransferError) as ctx:
                 self.store.publish(
@@ -1131,7 +1305,998 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
                 )
             self.assertIn("Source file mutated during staging", str(ctx.exception))
         finally:
-            shutil.copy2 = original_copy2
+            self.store._stage_file = original_stage
+
+
+    def test_01_manifest_missing_exact_revision_found_among_multiple_files(self):
+        """1. Manifest missing, exact revision @sha256_<FULL_HASH> exists among multiple model.pt files on Drive."""
+        project_id = "proj_m1"
+        run_id = "run_m1"
+        file_path = Path(self.test_dir) / "model.pt"
+
+        # Publish rev 1
+        data_1 = b"MODEL_WEIGHTS_EPOCH_1_REV1"
+        file_path.write_bytes(data_1)
+        sha_1 = compute_file_sha256(file_path)
+        art_1 = self.store.publish(
+            source=file_path,
+            project_id=project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+
+        # Publish rev 2
+        data_2 = b"MODEL_WEIGHTS_EPOCH_2_REV2_LARGER"
+        file_path.write_bytes(data_2)
+        sha_2 = compute_file_sha256(file_path)
+        art_2 = self.store.publish(
+            source=file_path,
+            project_id=project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+
+        # Destroy local manifest, backup, cache, and journal
+        manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+        bak_path = manifest_path.with_suffix(".json.bak")
+        if manifest_path.exists():
+            manifest_path.unlink()
+        if bak_path.exists():
+            bak_path.unlink()
+        self.store._manifest_cache.clear()
+        self.store.journal._write_records({})
+
+        # Retrieve exact rev 1 by @sha256_<FULL_HASH>
+        dest_1 = Path(self.test_dir) / "retrieved_m1_rev1.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt@sha256_{sha_1}", dest_1)
+        self.assertEqual(dest_1.read_bytes(), data_1)
+        self.assertEqual(compute_file_sha256(dest_1), sha_1)
+
+        # Retrieve exact rev 2 by @sha256_<FULL_HASH>
+        dest_2 = Path(self.test_dir) / "retrieved_m1_rev2.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt@sha256_{sha_2}", dest_2)
+        self.assertEqual(dest_2.read_bytes(), data_2)
+        self.assertEqual(compute_file_sha256(dest_2), sha_2)
+
+    def test_02_manifest_missing_same_name_same_size_different_hashes(self):
+        """2. Manifest missing, two model.pt files have the same name and size but different hashes."""
+        project_id = "proj_m2"
+        run_id = "run_m2"
+        folder_id = self.store.resolve_target_folder_id(project_id, run_id, "checkpoints")
+
+        data_a = b"AAAA_16_BYTES_!!"
+        data_b = b"BBBB_16_BYTES_??"
+        self.assertEqual(len(data_a), len(data_b))
+        sha_a = hashlib.sha256(data_a).hexdigest()
+        sha_b = hashlib.sha256(data_b).hexdigest()
+
+        # Seed mock Drive folder directly with two same-name, same-size files
+        self.mock_client.mock_files.append({
+            "id": "file-rev-a",
+            "name": "model.pt",
+            "parent": folder_id,
+            "size": len(data_a),
+            "md5Checksum": hashlib.md5(data_a).hexdigest(),
+            "appProperties": {
+                "sha256": sha_a,
+                "logical_path": "checkpoints/model.pt",
+                "revision_id": f"sha256_{sha_a}",
+            },
+            "content": data_a,
+        })
+        self.mock_client.mock_files.append({
+            "id": "file-rev-b",
+            "name": "model.pt",
+            "parent": folder_id,
+            "size": len(data_b),
+            "md5Checksum": hashlib.md5(data_b).hexdigest(),
+            "appProperties": {
+                "sha256": sha_b,
+                "logical_path": "checkpoints/model.pt",
+                "revision_id": f"sha256_{sha_b}",
+            },
+            "content": data_b,
+        })
+        self.mock_client.committed_files["file-rev-a"] = data_a
+        self.mock_client.committed_files["file-rev-b"] = data_b
+
+        # Clear local state
+        self.store._manifest_cache.clear()
+        self.store.journal._write_records({})
+
+        # Exact request for rev A selects A
+        dest_a = Path(self.test_dir) / "retrieved_m2_a.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt@sha256_{sha_a}", dest_a)
+        self.assertEqual(dest_a.read_bytes(), data_a)
+
+        # Exact request for rev B selects B
+        dest_b = Path(self.test_dir) / "retrieved_m2_b.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt@sha256_{sha_b}", dest_b)
+        self.assertEqual(dest_b.read_bytes(), data_b)
+
+        # Nonexistent hash fails closed
+        dest_bad = Path(self.test_dir) / "retrieved_m2_bad.pt"
+        with self.assertRaises(DriveIntegrityError):
+            self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt@sha256_{'0' * 64}", dest_bad)
+        self.assertFalse(dest_bad.exists())
+
+    def test_03_manifest_missing_unversioned_multiple_files_fails_closed(self):
+        """3. Manifest missing, unversioned lookup when two revisions exist on Drive fails closed with DriveIntegrityError."""
+        project_id = "proj_m3"
+        run_id = "run_m3"
+        folder_id = self.store.resolve_target_folder_id(project_id, run_id, "checkpoints")
+
+        data_1 = b"UNVERSIONED_CANDIDATE_1"
+        data_2 = b"UNVERSIONED_CANDIDATE_2"
+        sha_1 = hashlib.sha256(data_1).hexdigest()
+        sha_2 = hashlib.sha256(data_2).hexdigest()
+
+        # Seed two files with NO is_latest=="true" marker
+        self.mock_client.mock_files.append({
+            "id": "file-unv-1",
+            "name": "model.pt",
+            "parent": folder_id,
+            "size": len(data_1),
+            "md5Checksum": hashlib.md5(data_1).hexdigest(),
+            "appProperties": {"sha256": sha_1, "logical_path": "checkpoints/model.pt"},
+            "content": data_1,
+        })
+        self.mock_client.mock_files.append({
+            "id": "file-unv-2",
+            "name": "model.pt",
+            "parent": folder_id,
+            "size": len(data_2),
+            "md5Checksum": hashlib.md5(data_2).hexdigest(),
+            "appProperties": {"sha256": sha_2, "logical_path": "checkpoints/model.pt"},
+            "content": data_2,
+        })
+
+        self.store._manifest_cache.clear()
+        self.store.journal._write_records({})
+
+        dest = Path(self.test_dir) / "retrieved_m3.pt"
+        with self.assertRaises(DriveIntegrityError) as ctx:
+            self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest)
+        self.assertIn("Ambiguous unversioned Drive recovery", str(ctx.exception))
+        self.assertFalse(dest.exists())
+
+    def test_04_corrupted_manifest_recovered_from_backup(self):
+        """4. Corrupted manifest.json with valid manifest.json.bak automatically recovers manifest."""
+        project_id = "proj_m4"
+        run_id = "run_m4"
+        file_path = Path(self.test_dir) / "model.pt"
+
+        # Publish v1 then v2
+        file_path.write_bytes(b"MODEL_V1")
+        self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        file_path.write_bytes(b"MODEL_V2_LATEST_BYTES")
+        art_2 = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+        bak_path = manifest_path.with_suffix(".json.bak")
+        self.assertTrue(manifest_path.exists())
+        self.assertTrue(bak_path.exists())
+
+        # Check backup file permissions are 0600
+        mode = stat.S_IMODE(bak_path.stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
+        # Corrupt primary manifest
+        manifest_path.write_text("{CORRUPTED_JSON_NOT_VALID_SYNTAX...")
+
+        # Clear in-memory manifest cache
+        self.store._manifest_cache.clear()
+
+        dest = Path(self.test_dir) / "recovered_from_bak.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest)
+        self.assertEqual(dest.read_bytes(), b"MODEL_V2_LATEST_BYTES")
+
+        # Primary manifest must be automatically restored and valid JSON
+        self.assertTrue(manifest_path.exists())
+        loaded = PublicationManifest.load(manifest_path)
+        self.assertIsNotNone(loaded.get_artifact(art_2.artifact_id))
+
+    def test_05_wrong_remote_file_content_raises_integrity_error_and_cleans_tmp(self):
+        """5. Wrong remote file returned by Drive mock raises DriveIntegrityError and cleans up temp file."""
+        project_id = "proj_m5"
+        run_id = "run_m5"
+        file_path = Path(self.test_dir) / "model.pt"
+        file_path.write_bytes(b"CORRECT_AUTHENTIC_BYTES")
+        art = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Tamper committed remote file bytes
+        self.mock_client.committed_files[art.remote_file_id] = b"WRONG_TAMPERED_BYTES_FROM_DRIVE"
+
+        dest = Path(self.test_dir) / "dest_m5.pt"
+        with self.assertRaises(DriveIntegrityError):
+            self.store.retrieve(art.artifact_id, dest)
+
+        self.assertFalse(dest.exists())
+        # Verify no .tmp leftover files in destination directory
+        tmp_files = list(dest.parent.glob("*.tmp*"))
+        self.assertEqual(len(tmp_files), 0, f"Leftover temp files found: {tmp_files}")
+
+    def test_06_corrupted_bytes_from_drive_raises_integrity_error(self):
+        """6. Correct remote ID in manifest, but Drive returns corrupted bytes -> raises DriveIntegrityError."""
+        project_id = "proj_m6"
+        run_id = "run_m6"
+        file_path = Path(self.test_dir) / "model.pt"
+        file_path.write_bytes(b"GOOD_BYTES_REV6")
+        art = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        self.mock_client.corrupt_download_bytes = b"CORRUPTED_BYTE_STREAM_PAYLOAD"
+
+        dest = Path(self.test_dir) / "dest_m6.pt"
+        with self.assertRaises(DriveIntegrityError):
+            self.store.retrieve(art.artifact_id, dest)
+
+        self.assertFalse(dest.exists())
+
+    def test_07_omitted_md5_verified_via_full_sha256(self):
+        """7. Remote metadata omits md5Checksum -> verified via full SHA256 content readback."""
+        project_id = "proj_m7"
+        run_id = "run_m7"
+        file_path = Path(self.test_dir) / "model.pt"
+        data = b"PAYLOAD_WITHOUT_REMOTE_MD5"
+        file_path.write_bytes(data)
+        art = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Clear MD5 in manifest
+        manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+        manifest = PublicationManifest.load(manifest_path)
+        for k in manifest.artifacts:
+            manifest.artifacts[k]["md5"] = None
+        manifest.save(manifest_path)
+        self.store._manifest_cache.clear()
+
+        # Clear MD5 in mock Drive file
+        for mf in self.mock_client.mock_files:
+            if mf.get("id") == art.remote_file_id:
+                mf["md5Checksum"] = ""
+
+        dest = Path(self.test_dir) / "dest_m7.pt"
+        self.store.retrieve(art.artifact_id, dest)
+        self.assertEqual(dest.read_bytes(), data)
+        self.assertEqual(compute_file_sha256(dest), art.sha256)
+
+    def test_08_truncated_download_raises_integrity_error(self):
+        """8. Drive returns incomplete content (truncated byte stream) -> raises DriveIntegrityError."""
+        project_id = "proj_m8"
+        run_id = "run_m8"
+        file_path = Path(self.test_dir) / "model.pt"
+        file_path.write_bytes(b"LONG_PAYLOAD_DATA_BYTES_TO_BE_TRUNCATED" * 10)
+        art = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        self.mock_client.truncate_download_bytes_to = 25  # smaller than size_bytes
+
+        dest = Path(self.test_dir) / "dest_m8.pt"
+        with self.assertRaises(DriveIntegrityError):
+            self.store.retrieve(art.artifact_id, dest)
+
+        self.assertFalse(dest.exists())
+
+    def test_09_network_interruption_during_retrieval_raises_transfer_error(self):
+        """9. Network interruption during retrieval -> raises DriveTransferError, cleans up .tmp file."""
+        project_id = "proj_m9"
+        run_id = "run_m9"
+        file_path = Path(self.test_dir) / "model.pt"
+        file_path.write_bytes(b"DATA_BEFORE_NETWORK_CUT")
+        art = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        self.mock_client.fail_download_network_error = True
+
+        dest = Path(self.test_dir) / "dest_m9.pt"
+        with self.assertRaises(DriveTransferError):
+            self.store.retrieve(art.artifact_id, dest)
+
+        self.assertFalse(dest.exists())
+        tmp_files = list(dest.parent.glob("*.tmp*"))
+        self.assertEqual(len(tmp_files), 0, f"Leftover temp files: {tmp_files}")
+
+    def test_10_historical_revision_a_retrieval_after_revision_b_published(self):
+        """10. Historical revision A retrieval after revision B is published -> returns exact revision A bytes."""
+        project_id = "proj_m10"
+        run_id = "run_m10"
+        file_path = Path(self.test_dir) / "checkpoint.pt"
+
+        data_a = b"HISTORICAL_REVISION_A_DATA"
+        file_path.write_bytes(data_a)
+        art_a = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        data_b = b"LATEST_REVISION_B_NEW_DATA_LONGER"
+        file_path.write_bytes(data_b)
+        art_b = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Retrieve Rev A by explicit ID
+        dest_a = Path(self.test_dir) / "dest_m10_a.pt"
+        self.store.retrieve(art_a.artifact_id, dest_a)
+        self.assertEqual(dest_a.read_bytes(), data_a)
+
+        # Retrieve Rev B by explicit ID
+        dest_b = Path(self.test_dir) / "dest_m10_b.pt"
+        self.store.retrieve(art_b.artifact_id, dest_b)
+        self.assertEqual(dest_b.read_bytes(), data_b)
+
+        # Retrieve unversioned returns Rev B
+        dest_latest = Path(self.test_dir) / "dest_m10_latest.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/checkpoint.pt", dest_latest)
+        self.assertEqual(dest_latest.read_bytes(), data_b)
+
+    def test_11_recovery_after_process_restart(self):
+        """11. Recovery after simulated Ubuntu process restart (fresh store instance on disk directory)."""
+        project_id = "proj_m11"
+        run_id = "run_m11"
+        file_path = Path(self.test_dir) / "model.pt"
+        data = b"PROCESS_RESTART_PERSISTENCE_TEST"
+        file_path.write_bytes(data)
+        art = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Fresh instance
+        fresh_store = GoogleDriveArtifactStore(
+            credentials=self.creds,
+            credentials_file=self.credentials_file,
+            local_staging_dir=self.staging_dir,
+            http_client=self.mock_client,
+            chunk_size=1024 * 1024,
+            initial_backoff_sec=0.01,
+        )
+
+        dest = Path(self.test_dir) / "dest_m11.pt"
+        fresh_store.retrieve(art.artifact_id, dest)
+        self.assertEqual(dest.read_bytes(), data)
+
+        dest_unv = Path(self.test_dir) / "dest_m11_unv.pt"
+        fresh_store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_unv)
+        self.assertEqual(dest_unv.read_bytes(), data)
+
+    def test_12_retrieval_failure_preserves_previously_verified_dest_file(self):
+        """12. Retrieval failure preserves previously verified local destination file intact."""
+        project_id = "proj_m12"
+        run_id = "run_m12"
+        file_path = Path(self.test_dir) / "model.pt"
+        file_path.write_bytes(b"PUBLISHED_DATA")
+        art = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Pre-seed destination with good verified data
+        dest = Path(self.test_dir) / "dest_m12_existing.pt"
+        original_good_data = b"PREVIOUS_VERIFIED_GOOD_DATA_DO_NOT_CORRUPT"
+        dest.write_bytes(original_good_data)
+
+        # Make download fail due to corrupted bytes
+        self.mock_client.corrupt_download_bytes = b"CORRUPTED_DOWNLOAD_ATTEMPT"
+
+        with self.assertRaises(DriveIntegrityError):
+            self.store.retrieve(art.artifact_id, dest)
+
+        # Ensure destination content was preserved completely untouched
+        self.assertEqual(dest.read_bytes(), original_good_data)
+
+    def test_13_private_staging_permissions_and_symlink_rejection(self):
+        """13. Private staging permissions under os.umask(0): .upload_staging is 0700, files 0600, symlinks rejected."""
+        old_umask = os.umask(0)
+        try:
+            project_id = "proj_m13"
+            run_id = "run_m13"
+            file_path = Path(self.test_dir) / "open_perms_model.pt"
+            file_path.write_bytes(b"WEIGHTS_WITH_0777_PERMS")
+            os.chmod(file_path, 0o777)
+
+            art = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+            # Check .upload_staging mode is strictly 0700
+            staging_dir = self.staging_dir / ".upload_staging"
+            self.assertTrue(staging_dir.exists())
+            st_dir_mode = stat.S_IMODE(staging_dir.stat().st_mode)
+            self.assertEqual(st_dir_mode, 0o700, f"Expected 0700 for staging_dir, got {oct(st_dir_mode)}")
+
+            # Check backup manifest mode is 0600
+            bak_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json.bak"
+            self.assertTrue(bak_path.exists())
+            bak_mode = stat.S_IMODE(bak_path.stat().st_mode)
+            self.assertEqual(bak_mode, 0o600, f"Expected 0600 for backup manifest, got {oct(bak_mode)}")
+
+            # Symlink source rejection
+            symlink_src = Path(self.test_dir) / "symlink_source.pt"
+            symlink_src.symlink_to(file_path)
+            with self.assertRaises(ArtifactValidationError):
+                self.store.publish(symlink_src, project_id, run_id)
+
+            # Fake .upload_staging outside trusted root is rejected by _is_trusted_staged_file
+            fake_dir = Path(self.test_dir) / "fake" / ".upload_staging"
+            fake_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fake_file = fake_dir / "fake.pt"
+            fake_file.write_bytes(b"FAKE_STAGED")
+            self.assertFalse(self.store._is_trusted_staged_file(fake_file))
+        finally:
+            os.umask(old_umask)
+
+    def test_14_remote_latest_revision_coordination_on_success(self):
+        """14. Remote latest revision coordination demotes earlier revisions and promotes latest."""
+        project_id = "proj_m14"
+        run_id = "run_m14"
+        file_path = Path(self.test_dir) / "model.pt"
+
+        # Publish revision A
+        data_a = b"REVISION_A_WEIGHTS_111"
+        file_path.write_bytes(data_a)
+        art_a = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Publish revision B
+        data_b = b"REVISION_B_WEIGHTS_222_LONGER"
+        file_path.write_bytes(data_b)
+        art_b = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Publish revision C
+        data_c = b"REVISION_C_WEIGHTS_333_LATEST"
+        file_path.write_bytes(data_c)
+        art_c = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        self.assertNotEqual(art_a.remote_file_id, art_b.remote_file_id)
+        self.assertNotEqual(art_b.remote_file_id, art_c.remote_file_id)
+
+        # Inspect mock_client.mock_files
+        mf_map = {f["id"]: f for f in self.mock_client.mock_files if f.get("id")}
+        self.assertIn(art_a.remote_file_id, mf_map)
+        self.assertIn(art_b.remote_file_id, mf_map)
+        self.assertIn(art_c.remote_file_id, mf_map)
+
+        mf_a = mf_map[art_a.remote_file_id]
+        mf_b = mf_map[art_b.remote_file_id]
+        mf_c = mf_map[art_c.remote_file_id]
+
+        # Revision C is latest
+        self.assertEqual(mf_c["appProperties"].get("is_latest"), "true")
+        self.assertEqual(mf_c["appProperties"].get("schema"), "2")
+        self.assertEqual(mf_c["appProperties"].get("sha256"), art_c.sha256)
+        self.assertEqual(mf_c["appProperties"].get("path_sha256"), path_digest(project_id, run_id, "checkpoints/model.pt"))
+        self.assertNotIn("superseded_by", mf_c["appProperties"])
+        self.assertNotIn("next_sha256", mf_c["appProperties"])
+        self.assertNotIn("logical_path", mf_c["appProperties"])
+        self.assertNotIn("revision_id", mf_c["appProperties"])
+        self.assertNotIn("project_id", mf_c["appProperties"])
+        self.assertNotIn("run_id", mf_c["appProperties"])
+
+        # Revisions A and B have is_latest == "false" and correct next_sha256
+        self.assertEqual(mf_a["appProperties"].get("is_latest"), "false")
+        self.assertEqual(mf_a["appProperties"].get("next_sha256"), art_b.sha256)
+        self.assertEqual(canonical_successor_id(project_id, run_id, "checkpoints/model.pt", mf_a["appProperties"]["next_sha256"]), art_b.artifact_id)
+        self.assertNotIn("superseded_by", mf_a["appProperties"])
+        self.assertEqual(mf_a["appProperties"].get("schema"), "2")
+        self.assertEqual(mf_a["appProperties"].get("sha256"), art_a.sha256)
+        self.assertNotIn("logical_path", mf_a["appProperties"])
+
+        self.assertEqual(mf_b["appProperties"].get("is_latest"), "false")
+        self.assertEqual(mf_b["appProperties"].get("next_sha256"), art_c.sha256)
+        self.assertEqual(canonical_successor_id(project_id, run_id, "checkpoints/model.pt", mf_b["appProperties"]["next_sha256"]), art_c.artifact_id)
+        self.assertNotIn("superseded_by", mf_b["appProperties"])
+        self.assertEqual(mf_b["appProperties"].get("schema"), "2")
+        self.assertEqual(mf_b["appProperties"].get("sha256"), art_b.sha256)
+        self.assertNotIn("logical_path", mf_b["appProperties"])
+
+        # Verify ONLY revision C has is_latest == "true" among all model.pt files in the target folder
+        target_folder_id = self.store.resolve_target_folder_id(project_id, run_id, "checkpoints")
+        model_files = [
+            f for f in self.mock_client.mock_files
+            if f.get("name") == "model.pt" and f.get("parent") == target_folder_id
+        ]
+        latest_files = [f for f in model_files if f.get("appProperties", {}).get("is_latest") == "true"]
+        self.assertEqual(len(latest_files), 1)
+        self.assertEqual(latest_files[0]["id"], art_c.remote_file_id)
+
+    def test_15_unversioned_latest_recovery_from_remote_after_manifest_and_journal_loss(self):
+        """15. Remote unversioned latest recovery succeeds when local manifest and journal are completely lost."""
+        project_id = "proj_m15"
+        run_id = "run_m15"
+        file_path = Path(self.test_dir) / "model.pt"
+
+        data_a = b"REV_A_DATA_FOR_LOSS_TEST"
+        file_path.write_bytes(data_a)
+        art_a = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        data_b = b"REV_B_DATA_FOR_LOSS_TEST"
+        file_path.write_bytes(data_b)
+        art_b = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        data_c = b"REV_C_DATA_FOR_LOSS_TEST_FINAL"
+        file_path.write_bytes(data_c)
+        art_c = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Delete local manifest.json, manifest.json.bak, and journal
+        manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+        bak_path = manifest_path.with_suffix(".json.bak")
+        manifest_path.unlink(missing_ok=True)
+        bak_path.unlink(missing_ok=True)
+
+        if self.store.journal.path.exists():
+            self.store.journal.path.unlink()
+        self.store.journal.path.with_suffix(".json.bak").unlink(missing_ok=True)
+
+        fresh_store = GoogleDriveArtifactStore(
+            credentials=self.creds,
+            credentials_file=self.credentials_file,
+            local_staging_dir=self.staging_dir,
+            http_client=self.mock_client,
+            chunk_size=1024 * 1024,
+            initial_backoff_sec=0.01,
+        )
+
+        # Unversioned retrieval returns exact bytes of C
+        dest_unv = Path(self.test_dir) / "recovered_unv_c.pt"
+        fresh_store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_unv)
+        self.assertEqual(dest_unv.read_bytes(), data_c)
+
+        # Historical retrieval by @sha256_<digest> returns each exact historical revision
+        dest_a = Path(self.test_dir) / "recovered_hist_a.pt"
+        fresh_store.retrieve(art_a.artifact_id, dest_a)
+        self.assertEqual(dest_a.read_bytes(), data_a)
+
+        dest_b = Path(self.test_dir) / "recovered_hist_b.pt"
+        fresh_store.retrieve(art_b.artifact_id, dest_b)
+        self.assertEqual(dest_b.read_bytes(), data_b)
+
+        dest_c = Path(self.test_dir) / "recovered_hist_c.pt"
+        fresh_store.retrieve(art_c.artifact_id, dest_c)
+        self.assertEqual(dest_c.read_bytes(), data_c)
+
+    def test_16_transient_patch_failure_retries_and_succeeds(self):
+        """16. Transient HTTP 503 on PATCH during revision coordination retries and succeeds."""
+        project_id = "proj_m16"
+        run_id = "run_m16"
+        file_path = Path(self.test_dir) / "model.pt"
+        data = b"TRANSIENT_PATCH_DATA_RETRY"
+        file_path.write_bytes(data)
+
+        # Simulate 1 transient PATCH failure
+        self.mock_client.fail_next_n_patches = 1
+        stored = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        self.assertEqual(self.mock_client.fail_next_n_patches, 0)
+        self.assertIsNotNone(stored.remote_file_id)
+
+        mf = next(f for f in self.mock_client.mock_files if f.get("id") == stored.remote_file_id)
+        self.assertEqual(mf["appProperties"].get("is_latest"), "true")
+
+        dest = Path(self.test_dir) / "dest_m16.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest)
+        self.assertEqual(dest.read_bytes(), data)
+
+    def test_17_crash_before_promote_patch_fails_closed_and_recovers_on_retry(self):
+        """17. Crash before promotion PATCH marks file is_latest=false, unversioned retrieve fails closed, and retry reconciles."""
+        project_id = "proj_m17"
+        run_id = "run_m17"
+        file_path = Path(self.test_dir) / "model.pt"
+
+        # Publish revision A successfully
+        data_a = b"DATA_REVISION_A_INITIAL"
+        file_path.write_bytes(data_a)
+        art_a = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Attempt to publish revision B, but crash before promotion PATCH
+        data_b = b"DATA_REVISION_B_INTERRUPTED_BEFORE_PROMOTE"
+        file_path.write_bytes(data_b)
+        self.mock_client.abort_before_promote_patch = True
+
+        with self.assertRaises(Exception):
+            self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Check remote files before retry:
+        # Revision B was uploaded but never promoted -> is_latest == "false"
+        target_folder_id = self.store.resolve_target_folder_id(project_id, run_id, "checkpoints")
+        model_files = [
+            f for f in self.mock_client.mock_files
+            if f.get("name") == "model.pt" and f.get("parent") == target_folder_id
+        ]
+        self.assertEqual(len(model_files), 2)
+        mf_b = next(f for f in model_files if f.get("id") != art_a.remote_file_id)
+        self.assertEqual(mf_b["appProperties"].get("is_latest"), "false")
+
+        # When 0 remote files have is_latest == "true" (A was demoted, B never promoted):
+        # Unversioned retrieve without local manifest or journal must raise DriveIntegrityError
+        manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+        manifest_path.unlink(missing_ok=True)
+        manifest_path.with_suffix(".json.bak").unlink(missing_ok=True)
+        self.store._manifest_cache.clear()
+        if self.store.journal.path.exists():
+            self.store.journal.path.unlink()
+        self.store.journal.path.with_suffix(".json.bak").unlink(missing_ok=True)
+
+        dest_fail_0 = Path(self.test_dir) / "dest_fail_0.pt"
+        with self.assertRaises(DriveIntegrityError) as ctx_0:
+            self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_fail_0)
+        self.assertIn("Ambiguous unversioned Drive recovery", str(ctx_0.exception))
+        self.assertFalse(dest_fail_0.exists())
+
+        # When 2 remote files have is_latest == "true":
+        # Unversioned retrieve must also fail closed with DriveIntegrityError
+        mf_a = next(f for f in model_files if f.get("id") == art_a.remote_file_id)
+        mf_a["appProperties"]["is_latest"] = "true"
+        mf_b["appProperties"]["is_latest"] = "true"
+
+        dest_fail_2 = Path(self.test_dir) / "dest_fail_2.pt"
+        with self.assertRaises(DriveIntegrityError) as ctx_2:
+            self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_fail_2)
+        self.assertIn("Ambiguous unversioned Drive recovery", str(ctx_2.exception))
+        self.assertFalse(dest_fail_2.exists())
+
+        # Reset abort_before_promote_patch and retry publishing revision B
+        self.mock_client.abort_before_promote_patch = False
+        art_b = self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Remote properties are now reconciled: only B is latest
+        self.assertEqual(mf_b["appProperties"].get("is_latest"), "true")
+        self.assertEqual(mf_a["appProperties"].get("is_latest"), "false")
+
+        # Unversioned retrieve now succeeds and recovers revision B
+        dest_success = Path(self.test_dir) / "dest_recovered_b.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_success)
+        self.assertEqual(dest_success.read_bytes(), data_b)
+
+    # =========================================================================
+    # Section 6.4: Full Bounded Pagination Tests (F3)
+    # =========================================================================
+
+    def test_6_4_1_single_page_with_no_next_page_token(self):
+        """6.4.1. Single page listing with no nextPageToken returns all files."""
+        folder_id = "folder-page-1"
+        self.mock_client.mock_files.extend([
+            {"id": "file-101", "name": "weights.pt", "parent": folder_id, "size": 100, "mimeType": "application/octet-stream"},
+            {"id": "file-102", "name": "weights.pt", "parent": folder_id, "size": 200, "mimeType": "application/octet-stream"},
+        ])
+        files = self.store._list_files_in_folder("weights.pt", folder_id)
+        self.assertEqual(len(files), 2)
+        self.assertEqual([f["id"] for f in files], ["file-101", "file-102"])
+
+    def test_6_4_2_two_pages_traversal(self):
+        """6.4.2. Two pages traversal (nextPageToken on page 1, none on page 2)."""
+        folder_id = "folder-page-2"
+        self.mock_client.list_page_size_override = 2
+        self.mock_client.mock_files.extend([
+            {"id": "file-201", "name": "model.bin", "parent": folder_id, "size": 10, "mimeType": "application/octet-stream"},
+            {"id": "file-202", "name": "model.bin", "parent": folder_id, "size": 20, "mimeType": "application/octet-stream"},
+            {"id": "file-203", "name": "model.bin", "parent": folder_id, "size": 30, "mimeType": "application/octet-stream"},
+            {"id": "file-204", "name": "model.bin", "parent": folder_id, "size": 40, "mimeType": "application/octet-stream"},
+        ])
+        files = self.store._list_files_in_folder("model.bin", folder_id)
+        self.assertEqual(len(files), 4)
+        self.assertEqual([f["id"] for f in files], ["file-201", "file-202", "file-203", "file-204"])
+
+    def test_6_4_3_five_pages_with_target_on_page_five(self):
+        """6.4.3. Five pages traversal where target candidate revision is on page 5."""
+        project_id = "proj_p5"
+        run_id = "run_p5"
+        folder_id = self.store.resolve_target_folder_id(project_id, run_id, "checkpoints")
+
+        # 12 candidate dummy files + 1 target candidate = 13 files across 5 pages of size 3
+        self.mock_client.list_page_size_override = 3
+        target_data = b"TARGET_REVISION_ON_PAGE_FIVE"
+        target_sha = hashlib.sha256(target_data).hexdigest()
+
+        for i in range(12):
+            dummy_data = f"DUMMY_REVISION_{i}".encode("utf-8")
+            self.mock_client.mock_files.append({
+                "id": f"dummy-cand-{i:02d}",
+                "name": "model.pt",
+                "parent": folder_id,
+                "content": dummy_data,
+                "mimeType": "application/octet-stream",
+                "appProperties": {
+                    "sha256": hashlib.sha256(dummy_data).hexdigest(),
+                    "is_latest": "false",
+                },
+            })
+
+        # 13th file is on page 5 (4 pages * 3 items = 12 items on pages 1-4)
+        self.mock_client.mock_files.append({
+            "id": "target-cand-page5",
+            "name": "model.pt",
+            "parent": folder_id,
+            "content": target_data,
+            "mimeType": "application/octet-stream",
+            "appProperties": {
+                "sha256": target_sha,
+                "is_latest": "true",
+            },
+        })
+
+        # Case A: Versioned retrieval finding target on page 5
+        dest_ver = Path(self.test_dir) / "dest_ver_p5.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt@sha256_{target_sha}", dest_ver)
+        self.assertEqual(dest_ver.read_bytes(), target_data)
+
+        # Case B: Unversioned retrieval finding is_latest="true" on page 5 (with no local manifest)
+        dest_unv = Path(self.test_dir) / "dest_unv_p5.pt"
+        self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_unv)
+        self.assertEqual(dest_unv.read_bytes(), target_data)
+
+    def test_6_4_4_duplicate_file_ids_across_pages_deduplicated(self):
+        """6.4.4. Duplicate file IDs across pages deduplicated deterministically."""
+        folder_id = "folder-dedup"
+        self.mock_client.list_page_size_override = 2
+        # Page 1: dup-1, file-2
+        # Page 2: dup-1, file-3
+        self.mock_client.mock_files.extend([
+            {"id": "file-dup-1", "name": "data.bin", "parent": folder_id, "size": 10, "mimeType": "application/octet-stream"},
+            {"id": "file-2", "name": "data.bin", "parent": folder_id, "size": 20, "mimeType": "application/octet-stream"},
+            {"id": "file-dup-1", "name": "data.bin", "parent": folder_id, "size": 10, "mimeType": "application/octet-stream"},
+            {"id": "file-3", "name": "data.bin", "parent": folder_id, "size": 30, "mimeType": "application/octet-stream"},
+        ])
+        files = self.store._list_files_in_folder("data.bin", folder_id)
+        self.assertEqual(len(files), 3)
+        self.assertEqual([f["id"] for f in files], ["file-dup-1", "file-2", "file-3"])
+
+    def test_6_4_5_repeating_looping_page_token_raises_error(self):
+        """6.4.5. Repeating/looping nextPageToken raises DriveTransferError."""
+        folder_id = "folder-loop"
+        self.mock_client.inject_looping_page_token = True
+        self.mock_client.mock_files.extend([
+            {"id": "file-l1", "name": "loop.bin", "parent": folder_id, "size": 10, "mimeType": "application/octet-stream"},
+            {"id": "file-l2", "name": "loop.bin", "parent": folder_id, "size": 20, "mimeType": "application/octet-stream"},
+        ])
+        with self.assertRaises(DriveTransferError) as cm:
+            self.store._list_files_in_folder("loop.bin", folder_id)
+        self.assertIn("loop", str(cm.exception).lower())
+
+    def test_6_4_6_exceeding_max_list_pages_raises_error(self):
+        """6.4.6. Exceeding max_list_pages while nextPageToken remains raises DriveTransferError."""
+        folder_id = "folder-max-pages"
+        custom_store = GoogleDriveArtifactStore(
+            credentials=self.creds,
+            credentials_file=self.credentials_file,
+            local_staging_dir=self.staging_dir,
+            http_client=self.mock_client,
+            list_page_size=2,
+            max_list_pages=2,
+            initial_backoff_sec=0.01,
+        )
+        self.mock_client.mock_files.extend([
+            {"id": "f-1", "name": "overflow.pt", "parent": folder_id, "size": 1, "mimeType": "application/octet-stream"},
+            {"id": "f-2", "name": "overflow.pt", "parent": folder_id, "size": 2, "mimeType": "application/octet-stream"},
+            {"id": "f-3", "name": "overflow.pt", "parent": folder_id, "size": 3, "mimeType": "application/octet-stream"},
+            {"id": "f-4", "name": "overflow.pt", "parent": folder_id, "size": 4, "mimeType": "application/octet-stream"},
+            {"id": "f-5", "name": "overflow.pt", "parent": folder_id, "size": 5, "mimeType": "application/octet-stream"},
+        ])
+        with self.assertRaises(DriveTransferError) as cm:
+            custom_store._list_files_in_folder("overflow.pt", folder_id)
+        self.assertIn("max_list_pages", str(cm.exception))
+
+    def test_6_4_7_exceeding_max_list_candidates_raises_error(self):
+        """6.4.7. Exceeding max_list_candidates raises DriveTransferError."""
+        folder_id = "folder-max-cands"
+        custom_store = GoogleDriveArtifactStore(
+            credentials=self.creds,
+            credentials_file=self.credentials_file,
+            local_staging_dir=self.staging_dir,
+            http_client=self.mock_client,
+            list_page_size=10,
+            max_list_candidates=3,
+            initial_backoff_sec=0.01,
+        )
+        for i in range(5):
+            self.mock_client.mock_files.append({
+                "id": f"cand-{i}", "name": "cands.pt", "parent": folder_id, "size": 1, "mimeType": "application/octet-stream"
+            })
+        with self.assertRaises(DriveTransferError) as cm:
+            custom_store._list_files_in_folder("cands.pt", folder_id)
+        self.assertIn("max_list_candidates", str(cm.exception))
+
+    def test_6_4_8_mid_pagination_failure_raises_error(self):
+        """6.4.8. Mid-pagination failure on page 2 (503 or malformed JSON) raises DriveTransferError."""
+        folder_id = "folder-mid-fail"
+        self.mock_client.list_page_size_override = 2
+        for i in range(6):
+            self.mock_client.mock_files.append({
+                "id": f"mid-{i}", "name": "fail.pt", "parent": folder_id, "size": 1, "mimeType": "application/octet-stream"
+            })
+
+        # Subtest A: HTTP 503 on page 2
+        self.mock_client.fail_list_files_status = 503
+        self.mock_client.fail_list_files_at_page = 2
+        with self.assertRaises(DriveTransferError):
+            self.store._list_files_in_folder("fail.pt", folder_id)
+
+        # Subtest B: Malformed JSON on page 2
+        self.mock_client.fail_list_files_status = None
+        self.mock_client.fail_list_files_body = b"NOT_VALID_JSON_ON_PAGE_2"
+        self.mock_client.fail_list_files_at_page = 2
+        with self.assertRaises(DriveTransferError) as cm:
+            self.store._list_files_in_folder("fail.pt", folder_id)
+        self.assertIn("Malformed JSON", str(cm.exception))
+
+    def test_6_4_9_malformed_page_token_raises_error(self):
+        """6.4.9. Malformed non-string or whitespace nextPageToken raises DriveTransferError."""
+        folder_id = "folder-mal-token"
+        self.mock_client.inject_malformed_page_token = 12345
+        self.mock_client.mock_files.append({
+            "id": "f-tok-1", "name": "tok.pt", "parent": folder_id, "size": 1, "mimeType": "application/octet-stream"
+        })
+        with self.assertRaises(DriveTransferError) as cm:
+            self.store._list_files_in_folder("tok.pt", folder_id)
+        self.assertIn("Malformed non-string", str(cm.exception))
+
+        self.mock_client.inject_malformed_page_token = "   "
+        with self.assertRaises(DriveTransferError) as cm:
+            self.store._list_files_in_folder("tok.pt", folder_id)
+        self.assertIn("whitespace nextPageToken", str(cm.exception))
+
+    # =========================================================================
+    # Section 7.4: Listing Error Classification & No Duplicate Upload Tests (F4)
+    # =========================================================================
+
+    def test_7_4_1_listing_http_401_raises_authentication_error(self):
+        """7.4.1. HTTP 401 during _list_files_in_folder raises DriveAuthenticationError."""
+        self.mock_client.fail_list_files_status = 401
+        self.mock_client.auth_expired = True
+        with self.assertRaises(DriveAuthenticationError):
+            self.store._list_files_in_folder("test.pt", "folder-1")
+
+    def test_7_4_2_listing_http_403_quota_and_forbidden_classification(self):
+        """7.4.2. HTTP 403 quota/permission during _list_files_in_folder classified strictly."""
+        # Case A: Storage quota exceeded
+        self.mock_client.fail_list_files_status = 403
+        self.mock_client.fail_list_files_body = b'{"error": {"errors": [{"reason": "storageQuotaExceeded"}]}}'
+        with self.assertRaises(DriveQuotaExceededError):
+            self.store._list_files_in_folder("test.pt", "folder-1")
+
+        # Case B: Forbidden / permission denied
+        self.mock_client.fail_list_files_body = b'{"error": {"errors": [{"reason": "forbidden"}]}}'
+        with self.assertRaises(DriveAuthenticationError):
+            self.store._list_files_in_folder("test.pt", "folder-1")
+
+    def test_7_4_3_listing_http_server_errors_raise_transfer_error(self):
+        """7.4.3. HTTP 429/500/503 during _list_files_in_folder raise DriveTransferError."""
+        for code in (429, 500, 503):
+            self.mock_client.fail_list_files_status = code
+            self.mock_client.fail_list_files_body = f'{{"error": "HTTP {code}"}}'.encode("utf-8")
+            with self.assertRaises(DriveTransferError):
+                self.store._list_files_in_folder("test.pt", "folder-1")
+
+    def test_7_4_4_listing_network_exception_raises_transfer_error(self):
+        """7.4.4. Network timeout or ConnectionResetError during _list_files_in_folder raises DriveTransferError."""
+        self.mock_client.fail_list_files_exception = ConnectionResetError("Connection reset by peer")
+        with self.assertRaises(DriveTransferError) as cm:
+            self.store._list_files_in_folder("test.pt", "folder-1")
+        self.assertIn("Connection reset by peer", str(cm.exception))
+
+    def test_7_4_5_listing_malformed_payload_structures_raise_transfer_error(self):
+        """7.4.5. Invalid JSON, non-dict JSON, missing/non-list 'files' key raise DriveTransferError."""
+        cases = [
+            (b"NOT_JSON", "Malformed JSON"),
+            (b"[1, 2, 3]", "missing 'files' list"),
+            (b'{"no_files": []}', "missing 'files' list"),
+            (b'{"files": "not_a_list"}', "missing 'files' list"),
+            (b'{"files": ["not_a_dict"]}', "missing string 'id'"),
+            (b'{"files": [{"name": "no_id"}]}', "missing string 'id'"),
+            (b'{"files": [{"id": 12345}]}', "missing string 'id'"),
+        ]
+        for body, expected_err in cases:
+            self.mock_client.fail_list_files_body = body
+            with self.assertRaises(DriveTransferError) as cm:
+                self.store._list_files_in_folder("test.pt", "folder-1")
+            self.assertIn(expected_err, str(cm.exception))
+
+    def test_7_4_6_listing_valid_empty_files_returns_empty_list(self):
+        """7.4.6. Valid HTTP 200 with {"files": []} returns empty list."""
+        self.mock_client.mock_files.clear()
+        files = self.store._list_files_in_folder("non_existent.pt", "folder-empty")
+        self.assertEqual(files, [])
+
+    def test_7_4_7_publish_does_not_initiate_duplicate_upload_on_listing_failure(self):
+        """7.4.7. Publish raises DriveTransferError and does NOT initiate upload session on listing failure."""
+        project_id = "proj_dup_prev"
+        run_id = "run_dup_prev"
+        file_path = Path(self.test_dir) / "dup_model.pt"
+        data = b"MODEL_DATA_FOR_DUPLICATE_PREVENTION_TEST"
+        file_path.write_bytes(data)
+
+        # Pre-resolve target folder
+        target_folder_id = self.store.resolve_target_folder_id(project_id, run_id, "checkpoints")
+
+        # Pre-populate remote file as already existing on Drive
+        self.mock_client.mock_files.append({
+            "id": "existing-drive-file-999",
+            "name": file_path.name,
+            "parent": target_folder_id,
+            "content": data,
+            "mimeType": "application/octet-stream",
+            "appProperties": {
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "is_latest": "true",
+            },
+        })
+
+        initial_upload_sessions = self.mock_client.upload_sessions_initiated
+
+        # Subtest A: Listing fails with HTTP 503
+        self.mock_client.fail_list_files_status = 503
+        with self.assertRaises(DriveTransferError):
+            self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Crucial assertion: no upload session was initiated
+        self.assertEqual(self.mock_client.upload_sessions_initiated, initial_upload_sessions)
+
+        # Subtest B: Listing fails with malformed JSON
+        self.mock_client.fail_list_files_status = None
+        self.mock_client.fail_list_files_body = b"GARBAGE_JSON"
+        with self.assertRaises(DriveTransferError):
+            self.store.publish(file_path, project_id, run_id, ArtifactType.CHECKPOINT.value)
+
+        # Still no upload session was initiated
+        self.assertEqual(self.mock_client.upload_sessions_initiated, initial_upload_sessions)
+
+    def test_7_4_8_find_or_create_folder_failure_does_not_send_post(self):
+        """7.4.8. _find_or_create_folder failing with HTTP 500/503 raises DriveTransferError and does not POST."""
+        self.mock_client.fail_folder_lookup_status = 503
+        initial_posts = [r for r in self.mock_client.requests_log if r[0] == "POST"]
+
+        with self.assertRaises(DriveTransferError):
+            self.store._find_or_create_folder("fail_folder", parent_id="root")
+
+        current_posts = [r for r in self.mock_client.requests_log if r[0] == "POST"]
+        self.assertEqual(len(current_posts), len(initial_posts))
+
+        # Also test malformed JSON on folder lookup
+        self.mock_client.fail_folder_lookup_status = None
+        self.mock_client.fail_folder_lookup_body = b"NOT_JSON_FOLDER"
+        with self.assertRaises(DriveTransferError):
+            self.store._find_or_create_folder("fail_folder_2", parent_id="root")
+
+        current_posts = [r for r in self.mock_client.requests_log if r[0] == "POST"]
+        self.assertEqual(len(current_posts), len(initial_posts))
+
+    def test_7_4_9_listing_parent_folder_404_raises_artifact_not_found(self):
+        """7.4.9. Parent folder HTTP 404 during _list_files_in_folder raises ArtifactNotFoundError."""
+        self.mock_client.fail_list_files_status = 404
+        self.mock_client.fail_list_files_body = b'{"error": {"code": 404, "message": "File not found"}}'
+        with self.assertRaises(ArtifactNotFoundError):
+            self.store._list_files_in_folder("test.pt", "missing-folder-id")
+
+    # =========================================================================
+    # Additional Verification: Init Param Validation & Error Propagation
+    # =========================================================================
+
+    def test_init_pagination_parameter_validation(self):
+        """GoogleDriveArtifactStore validates pagination parameters >= 1."""
+        with self.assertRaises(ValueError):
+            GoogleDriveArtifactStore(list_page_size=0)
+        with self.assertRaises(ValueError):
+            GoogleDriveArtifactStore(list_page_size=-5)
+        with self.assertRaises(ValueError):
+            GoogleDriveArtifactStore(max_list_pages=0)
+        with self.assertRaises(ValueError):
+            GoogleDriveArtifactStore(max_list_candidates=0)
+
+        store = GoogleDriveArtifactStore(
+            list_page_size=25,
+            max_list_pages=10,
+            max_list_candidates=500,
+        )
+        self.assertEqual(store.list_page_size, 25)
+        self.assertEqual(store.max_list_pages, 10)
+        self.assertEqual(store.max_list_candidates, 500)
+
+    def test_retrieve_and_exists_error_propagation(self):
+        """retrieve() and exists() re-raise DriveTransferError / DriveAuthenticationError."""
+        project_id = "proj_err_prop"
+        run_id = "run_err_prop"
+        dest = Path(self.test_dir) / "err_dest.pt"
+
+        # Folder lookup failure during retrieve() raises DriveTransferError, NOT ArtifactNotFoundError
+        self.mock_client.fail_folder_lookup_status = 503
+        with self.assertRaises(DriveTransferError):
+            self.store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest)
+
+        # File listing failure during exists() re-raises DriveTransferError, does NOT return False
+        self.mock_client.fail_folder_lookup_status = None
+        self.mock_client.fail_list_files_status = 503
+        with self.assertRaises(DriveTransferError):
+            self.store.exists(f"{project_id}/{run_id}/checkpoints/model.pt")
+
+        # 401 during exists() re-raises DriveAuthenticationError
+        self.mock_client.fail_list_files_status = 401
+        self.mock_client.auth_expired = True
+        with self.assertRaises(DriveAuthenticationError):
+            self.store.exists(f"{project_id}/{run_id}/checkpoints/model.pt")
 
 
 if __name__ == "__main__":

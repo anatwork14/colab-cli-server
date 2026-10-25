@@ -5,12 +5,14 @@ Part of Colab V2 Cross-Device Workspaces & Google Drive (Issue #21).
 import multiprocessing
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -1065,6 +1067,426 @@ class TestUploadWorker(unittest.TestCase):
         record = corrupt_journal.get_transfer(f"mock_cloud-p9-r9-after_corrupt.pt")
         self.assertIsNotNone(record)
         self.assertEqual(record.status, TransferStatus.PUBLISHED.value)
+
+    def test_section_5_umask_zero_preserves_strict_permissions(self):
+        """Scenario: System os.umask(0o000) active: .staged_uploads and per-revision staging dirs have exact mode 0o700, staged checkpoint files have exact mode 0o600, journal and lock files have exact mode 0o600."""
+        old_umask = os.umask(0o000)
+        try:
+            umask_dir = Path(self.test_dir) / "umask_test_dir"
+            umask_dir.mkdir(parents=True, exist_ok=True)
+            journal_path = umask_dir / "transfers.json"
+            journal = TransferJournal(journal_path)
+
+            store = MockStoreForWorker()
+            worker = ArtifactUploadWorker(store=store, journal=journal, max_workers=1)
+
+            ckpt = umask_dir / "umask_model.pt"
+            ckpt.write_bytes(b"UMASK_SENSITIVE_WEIGHTS")
+            rec = worker.enqueue(ckpt, project_id="p_umask", run_id="r_umask")
+
+            # Check trusted staging root permissions
+            staging_root = journal.path.parent / ".staged_uploads"
+            self.assertTrue(staging_root.exists())
+            self.assertEqual(stat.S_IMODE(staging_root.stat().st_mode), 0o700)
+
+            # Check per-revision directory permissions
+            staged_path = Path(rec.local_path)
+            self.assertTrue(staged_path.exists())
+            rev_dir = staged_path.parent
+            self.assertEqual(stat.S_IMODE(rev_dir.stat().st_mode), 0o700)
+
+            # Check staged checkpoint file permissions
+            self.assertEqual(stat.S_IMODE(staged_path.stat().st_mode), 0o600)
+
+            # Check journal file permissions
+            self.assertEqual(stat.S_IMODE(journal.path.stat().st_mode), 0o600)
+
+            # Check locks directory and lock files
+            locks_dir = journal.path.parent / ".transfer_locks"
+            self.assertTrue(locks_dir.exists())
+            self.assertEqual(stat.S_IMODE(locks_dir.stat().st_mode), 0o700)
+            lock_files = list(locks_dir.glob("*.lock"))
+            self.assertGreaterEqual(len(lock_files), 1)
+            for lf in lock_files:
+                self.assertEqual(stat.S_IMODE(lf.stat().st_mode), 0o600)
+        finally:
+            os.umask(old_umask)
+
+    def test_section_5_source_mode_0644_staged_as_0600(self):
+        """Scenario: Source file mode 0o644 -> staged copy has mode 0o600."""
+        ckpt = Path(self.test_dir) / "model_0644.pt"
+        ckpt.write_bytes(b"WEIGHTS_ORIGINALLY_0644")
+        os.chmod(str(ckpt), 0o644)
+        self.assertEqual(stat.S_IMODE(ckpt.stat().st_mode), 0o644)
+
+        store = MockStoreForWorker()
+        worker = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+        rec = worker.enqueue(ckpt, project_id="p_perm", run_id="r_0644")
+
+        staged_path = Path(rec.local_path)
+        self.assertTrue(staged_path.exists())
+        self.assertEqual(stat.S_IMODE(staged_path.stat().st_mode), 0o600)
+
+    def test_section_5_source_mode_0777_staged_as_0600(self):
+        """Scenario: Source file mode 0o777 -> staged copy has mode 0o600."""
+        ckpt = Path(self.test_dir) / "model_0777.pt"
+        ckpt.write_bytes(b"WEIGHTS_ORIGINALLY_0777")
+        os.chmod(str(ckpt), 0o777)
+        self.assertEqual(stat.S_IMODE(ckpt.stat().st_mode), 0o777)
+
+        store = MockStoreForWorker()
+        worker = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+        rec = worker.enqueue(ckpt, project_id="p_perm", run_id="r_0777")
+
+        staged_path = Path(rec.local_path)
+        self.assertTrue(staged_path.exists())
+        self.assertEqual(stat.S_IMODE(staged_path.stat().st_mode), 0o600)
+
+    def test_section_5_symlink_source_rejected(self):
+        """Scenario: Symlink to a file outside the project -> rejected with ArtifactValidationError."""
+        real_target = Path(self.test_dir) / "real_external_secret.pt"
+        real_target.write_bytes(b"SENSITIVE_EXTERNAL_DATA")
+
+        symlink_file = Path(self.test_dir) / "symlink_pointer.pt"
+        symlink_file.symlink_to(real_target)
+        self.assertTrue(symlink_file.is_symlink())
+
+        store = MockStoreForWorker()
+        worker = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+
+        with self.assertRaises(ArtifactValidationError) as ctx:
+            worker.enqueue(symlink_file, project_id="p_sym", run_id="r_sym")
+        self.assertIn("symlink", str(ctx.exception).lower())
+
+        # Also test with allowed_source_root
+        allowed_root = Path(self.test_dir) / "allowed_project"
+        allowed_root.mkdir(parents=True, exist_ok=True)
+        outside_dir = Path(self.test_dir) / "outside_dir"
+        outside_dir.mkdir(parents=True, exist_ok=True)
+        outside_file = outside_dir / "target.pt"
+        outside_file.write_bytes(b"OUTSIDE_DATA")
+
+        sym_parent = allowed_root / "sym_sub"
+        sym_parent.symlink_to(outside_dir)
+
+        worker_restricted = ArtifactUploadWorker(
+            store=store, journal=self.journal, max_workers=1, allowed_source_root=allowed_root
+        )
+        with self.assertRaises(ArtifactValidationError):
+            worker_restricted.enqueue(sym_parent / "target.pt", project_id="p_sym", run_id="r_sym2")
+
+    def test_section_5_symlinked_staging_directory_rejected(self):
+        """Scenario: Symlinked staging directory (.staged_uploads is a symlink) -> rejected with ArtifactValidationError."""
+        test_jdir = Path(self.test_dir) / "sym_stage_journal_dir"
+        test_jdir.mkdir(parents=True, exist_ok=True)
+        journal = TransferJournal(test_jdir / "transfers.json")
+
+        outside_target = Path(self.test_dir) / "outside_staging_target"
+        outside_target.mkdir(parents=True, exist_ok=True)
+
+        symlinked_staging = test_jdir / ".staged_uploads"
+        symlinked_staging.symlink_to(outside_target)
+        self.assertTrue(symlinked_staging.is_symlink())
+
+        store = MockStoreForWorker()
+        worker = ArtifactUploadWorker(store=store, journal=journal, max_workers=1)
+
+        valid_file = Path(self.test_dir) / "valid_file.pt"
+        valid_file.write_bytes(b"VALID_WEIGHTS")
+
+        with self.assertRaises(ArtifactValidationError) as ctx:
+            worker.enqueue(valid_file, project_id="p_symdir", run_id="r_symdir")
+        self.assertIn("symlink", str(ctx.exception).lower())
+
+    def test_section_5_adversarial_fake_staging_dir_not_trusted(self):
+        """Scenario: Adversarial fake .staged_uploads directory outside the journal's owned staging root -> not trusted, properly staged into the real 0700 staging root."""
+        fake_root = Path(self.test_dir) / "fake_outside_dir" / ".staged_uploads"
+        fake_root.mkdir(parents=True, exist_ok=True)
+        fake_ckpt = fake_root / "fake_model.pt"
+        fake_ckpt.write_bytes(b"CONTENT_IN_FAKE_STAGING_DIR")
+
+        store = MockStoreForWorker()
+        worker = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+
+        rec = worker.enqueue(fake_ckpt, project_id="p_fake", run_id="r_fake")
+
+        # The staged copy must be located in the trusted staging root, NOT the fake dir!
+        staged_path = Path(rec.local_path)
+        self.assertNotEqual(staged_path.resolve(), fake_ckpt.resolve())
+        self.assertTrue(worker._is_trusted_staged_path(staged_path))
+        self.assertEqual(stat.S_IMODE(staged_path.stat().st_mode), 0o600)
+        self.assertEqual(staged_path.read_bytes(), b"CONTENT_IN_FAKE_STAGING_DIR")
+        # Ensure fake source file was not removed
+        self.assertTrue(fake_ckpt.exists())
+
+    def test_section_5_in_place_checkpoint_mutation_during_copy(self):
+        """Scenario: In-place checkpoint mutation during copy -> detected, temp file cleaned up, raises ArtifactValidationError, never leaves partial/corrupt staged file."""
+        src = Path(self.test_dir) / "mutating_checkpoint.pt"
+        src.write_bytes(b"INITIAL_CHUNK_DATA" * 5000)  # ~90 KiB (>64 KiB chunk size)
+
+        store = MockStoreForWorker()
+        worker = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+
+        orig_open = open
+        def mock_open_mutating(file, mode="r", *args, **kwargs):
+            fp = orig_open(file, mode, *args, **kwargs)
+            if str(file) == str(src) and "b" in mode:
+                class MutatingReader:
+                    def __init__(self, real_fp):
+                        self.real_fp = real_fp
+                        self.mutated = False
+                    def read(self, n=-1):
+                        chunk = self.real_fp.read(n)
+                        if chunk and not self.mutated:
+                            self.mutated = True
+                            return chunk + b"_MUTATED_TAIL_EXTRA"
+                        return chunk
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *a):
+                        return self.real_fp.__exit__(*a)
+                return MutatingReader(fp)
+            return fp
+
+        with unittest.mock.patch("builtins.open", side_effect=mock_open_mutating):
+            with self.assertRaises(ArtifactValidationError) as ctx:
+                worker.enqueue(src, project_id="p_mut", run_id="r_mut")
+            self.assertIn("mutated during enqueue staging", str(ctx.exception))
+
+        # Verify no temp files left in trusted staging root
+        trusted_root = worker.trusted_staging_root
+        if trusted_root.exists():
+            tmp_files = list(trusted_root.rglob("*.tmp.*"))
+            self.assertEqual(len(tmp_files), 0, f"Found leaked temp files: {tmp_files}")
+            # Ensure no corrupted staged file exists
+            staged_files = list(trusted_root.rglob("mutating_checkpoint.pt"))
+            self.assertEqual(len(staged_files), 0, "No corrupt staged file should exist")
+
+    def test_section_5_process_interruption_before_os_replace_preserves_valid_checkpoint(self):
+        """Scenario: Process interruption before os.replace rename -> temp file cleaned up, existing valid staged checkpoint preserved."""
+        src = Path(self.test_dir) / "interrupted_replace.pt"
+        original_bytes = b"ORIGINAL_VALID_CHECKPOINT_DATA"
+        src.write_bytes(original_bytes)
+
+        store = MockStoreForWorker()
+        worker = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+
+        # Stage initially valid checkpoint
+        rec = worker.enqueue(src, project_id="p_intr", run_id="r_intr")
+        staged_file = Path(rec.local_path)
+        self.assertTrue(staged_file.exists())
+        self.assertEqual(staged_file.read_bytes(), original_bytes)
+
+        # Update source file to force restaging
+        new_bytes = b"NEW_ATTEMPTED_DATA"
+        src.write_bytes(new_bytes)
+
+        # Simulate interruption during os.replace
+        with unittest.mock.patch("os.replace", side_effect=KeyboardInterrupt("Simulated SIGINT before os.replace")):
+            with self.assertRaises(KeyboardInterrupt):
+                worker.enqueue(src, project_id="p_intr", run_id="r_intr")
+
+        # Verify temp files cleaned up
+        trusted_root = worker.trusted_staging_root
+        tmp_files = list(trusted_root.rglob("*.tmp.*"))
+        self.assertEqual(len(tmp_files), 0, f"Found leaked temp files after interrupt: {tmp_files}")
+
+        # Verify existing valid staged checkpoint was preserved untouched!
+        self.assertTrue(staged_file.exists())
+        self.assertEqual(staged_file.read_bytes(), original_bytes)
+        self.assertEqual(stat.S_IMODE(staged_file.stat().st_mode), 0o600)
+
+    def test_section_5_process_interruption_after_staged_copy_recovered(self):
+        """Scenario: Process interruption after staged copy -> recovery record and staged file preserved across worker restart."""
+        src = Path(self.test_dir) / "post_copy_crash.pt"
+        data = b"CRASH_AFTER_STAGED_COPY_DATA"
+        src.write_bytes(data)
+
+        store = MockStoreForWorker()
+        # Worker 1 stages the file into journal and staging root, but is stopped before starting background threads
+        worker1 = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+        rec = worker1.enqueue(src, project_id="p_post", run_id="r_post")
+        staged_file = Path(rec.local_path)
+        self.assertTrue(staged_file.exists())
+        self.assertEqual(stat.S_IMODE(staged_file.stat().st_mode), 0o600)
+
+        # Simulate process termination and worker restart
+        worker2 = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+        worker2.start()
+        self.addCleanup(worker2.stop)
+        self.assertTrue(worker2.wait_for_completion(timeout=3.0))
+
+        # Successfully published from preserved staged file
+        self.assertEqual(len(store.published), 1)
+        self.assertEqual(store.published[0].sha256, rec.sha256)
+        final_rec = self.journal.get_transfer(rec.transfer_id)
+        self.assertIsNotNone(final_rec)
+        self.assertEqual(final_rec.status, TransferStatus.PUBLISHED.value)
+
+    def test_section_5_two_concurrent_workers_same_checkpoint_idempotent(self):
+        """Scenario: Two concurrent workers using the same checkpoint -> safe, idempotent, 0600 mode preserved."""
+        src = Path(self.test_dir) / "concurrent_shared.pt"
+        src.write_bytes(b"SHARED_CONCURRENT_DATA")
+
+        store = MockStoreForWorker()
+        worker1 = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+        worker2 = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+
+        results = []
+        def enqueue_worker(w):
+            r = w.enqueue(src, project_id="p_conc", run_id="r_conc")
+            results.append(r)
+
+        t1 = threading.Thread(target=enqueue_worker, args=(worker1,))
+        t2 = threading.Thread(target=enqueue_worker, args=(worker2,))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        self.assertEqual(len(results), 2)
+        staged_p1 = Path(results[0].local_path)
+        self.assertTrue(staged_p1.exists())
+        self.assertEqual(stat.S_IMODE(staged_p1.stat().st_mode), 0o600)
+
+        worker1.start()
+        worker2.start()
+        self.addCleanup(worker1.stop)
+        self.addCleanup(worker2.stop)
+
+        self.assertTrue(worker1.wait_for_completion(timeout=3.0))
+        self.assertTrue(worker2.wait_for_completion(timeout=3.0))
+
+        # Idempotent: published exactly once
+        self.assertEqual(len(store.published), 1)
+
+    def test_section_5_staged_checkpoint_tampered_rejected_before_upload(self):
+        """Scenario: A staged checkpoint tampered with on disk (incorrect SHA256) before worker upload -> worker detects hash mismatch and refuses to upload corrupted bytes."""
+        src = Path(self.test_dir) / "tamper_target.pt"
+        src.write_bytes(b"UNMODIFIED_INITIAL_BYTES")  # 24 bytes
+
+        store = MockStoreForWorker()
+        worker = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+
+        rec = worker.enqueue(src, project_id="p_tamp", run_id="r_tamp")
+        staged_file = Path(rec.local_path)
+        self.assertTrue(staged_file.exists())
+
+        # Tamper with staged checkpoint on disk with exact same byte length to test SHA256 verification
+        tampered_bytes = b"TAMPERED_MALICIOUS_BYTES"  # exactly 24 bytes
+        self.assertEqual(len(tampered_bytes), len(b"UNMODIFIED_INITIAL_BYTES"))
+        staged_file.write_bytes(tampered_bytes)
+
+        # Direct verification via _upload_with_lease / _process_single_transfer raises ArtifactValidationError
+        with self.assertRaises(ArtifactValidationError):
+            worker._process_single_transfer(rec)
+
+        # Worker starts processing queue
+        worker.start()
+        self.addCleanup(worker.stop)
+        self.assertTrue(worker.wait_for_completion(timeout=3.0))
+
+        # Assert no corrupted bytes were published to cloud store!
+        self.assertEqual(len(store.published), 0, "No corrupted bytes should be uploaded to cloud store")
+
+        final_rec = self.journal.get_transfer(rec.transfer_id)
+        self.assertIsNotNone(final_rec)
+        self.assertEqual(final_rec.status, TransferStatus.UPLOAD_FAILED.value)
+        self.assertIn("modified before publication", final_rec.last_error)
+
+    def test_section_5_source_checkpoint_deleted_after_enqueue_still_uploads(self):
+        """Scenario: Source checkpoint deleted after enqueue() staging -> background worker still completes upload from the immutable 0600 staged snapshot!"""
+        src = Path(self.test_dir) / "ephemeral_to_delete.pt"
+        src.write_bytes(b"EPHEMERAL_TRAINING_CHECKPOINT_WILL_DISAPPEAR")
+
+        store = MockStoreForWorker()
+        worker = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+
+        # Enqueue stages snapshot
+        rec = worker.enqueue(src, project_id="p_del", run_id="r_del")
+        staged_file = Path(rec.local_path)
+        self.assertTrue(staged_file.exists())
+        self.assertEqual(stat.S_IMODE(staged_file.stat().st_mode), 0o600)
+
+        # Delete original source file immediately
+        src.unlink()
+        self.assertFalse(src.exists())
+
+        # Start worker - should cleanly upload from staged snapshot
+        worker.start()
+        self.addCleanup(worker.stop)
+        self.assertTrue(worker.wait_for_completion(timeout=3.0))
+
+        self.assertEqual(len(store.published), 1)
+        self.assertEqual(store.published[0].sha256, rec.sha256)
+        final_rec = self.journal.get_transfer(rec.transfer_id)
+        self.assertIsNotNone(final_rec)
+        self.assertEqual(final_rec.status, TransferStatus.PUBLISHED.value)
+
+    def test_upload_worker_retries_cleanly_on_transient_drive_errors(self):
+        """Verify that ArtifactUploadWorker handles multi-revision sequential publication
+        (rev1 then rev2) for the same checkpoint path without overwriting rev1 in the manifest,
+        and cleanly recovers / retries through transient store errors."""
+        store_dir = Path(self.test_dir) / "store_multi_rev"
+        store = MockStoreForWorker(manifest_dir=store_dir)
+        # Inject 1 transient failure so worker exercises its retry loop
+        store.fail_first_n = 1
+        store.error_message = "Transient 503 Service Unavailable"
+
+        worker = ArtifactUploadWorker(
+            store=store,
+            journal=self.journal,
+            max_workers=1,
+            initial_retry_delay_sec=0.05,
+        )
+        worker.start()
+        self.addCleanup(worker.stop)
+
+        f = Path(self.test_dir) / "model.pt"
+
+        # 1. Publish Revision 1
+        rev1_bytes = b"REVISION_1_WEIGHTS_CONTENT"
+        f.write_bytes(rev1_bytes)
+        sha_1 = compute_file_sha256(f)
+        rec_1 = worker.enqueue(f, project_id="p_seq", run_id="r_seq", category="checkpoints")
+        self.assertTrue(worker.wait_for_completion(timeout=5.0), "Worker did not complete rev1 upload after transient retry")
+
+        # 2. Publish Revision 2
+        rev2_bytes = b"REVISION_2_WEIGHTS_CONTENT_UPDATED_LARGER"
+        f.write_bytes(rev2_bytes)
+        sha_2 = compute_file_sha256(f)
+        rec_2 = worker.enqueue(f, project_id="p_seq", run_id="r_seq", category="checkpoints")
+        self.assertTrue(worker.wait_for_completion(timeout=5.0), "Worker did not complete rev2 upload")
+
+        # 3. Verify Manifest preserves both revisions without overwriting rev1
+        manifest = store.get_manifest("p_seq", "r_seq")
+        self.assertIsNotNone(manifest)
+        self.assertEqual(len(manifest.artifacts), 2, "Expected exactly 2 revisions in manifest")
+
+        art1 = manifest.get_artifact(rec_1.artifact_id)
+        art2 = manifest.get_artifact(rec_2.artifact_id)
+        self.assertIsNotNone(art1, f"Revision 1 ({rec_1.artifact_id}) missing from manifest!")
+        self.assertIsNotNone(art2, f"Revision 2 ({rec_2.artifact_id}) missing from manifest!")
+        self.assertEqual(art1.sha256, sha_1)
+        self.assertEqual(art2.sha256, sha_2)
+
+        # Logical path query returns latest revision (Revision 2)
+        latest_art = manifest.get_artifact("p_seq/r_seq/checkpoints/model.pt")
+        self.assertIsNotNone(latest_art)
+        self.assertEqual(latest_art.sha256, sha_2)
+
+        # 4. Both revisions present in journal
+        transfers = self.journal.list_transfers_for_run("p_seq", "r_seq")
+        self.assertEqual(len(transfers), 2)
+        self.assertEqual({t.sha256 for t in transfers}, {sha_1, sha_2})
+
+        # 5. Both revisions are retrievable
+        dest1 = Path(self.test_dir) / "retrieved_rev1.pt"
+        dest2 = Path(self.test_dir) / "retrieved_rev2.pt"
+        store.retrieve(rec_1.artifact_id, dest1)
+        store.retrieve(rec_2.artifact_id, dest2)
+        self.assertEqual(dest1.read_bytes(), rev1_bytes)
+        self.assertEqual(dest2.read_bytes(), rev2_bytes)
 
 
 if __name__ == "__main__":

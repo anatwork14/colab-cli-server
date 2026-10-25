@@ -43,18 +43,20 @@ See [agent setup steps](docs/AGENT_SETUP.md) and the [copyable prompt](docs/AGEN
 
 ## V2 project workspace operations and agent guidelines
 
-V2 adds project workspace workflows (`colab-adapter project ...`) and compute monitoring (`colab-adapter monitor ...`). All autonomous agents operating in this repository or interacting with Colab must adhere to these rules:
+> **V2 Release Status:** Colab CLI Server V2 was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Post-merge hardening and multi-revision catastrophic recovery (Review `5642047783` F1–F4) are delivered in **Issue #23 (`fix/v2-postmerge-hardening-23`)**. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW pending CI only`. All human approval gates strictly preserved (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
+
+V2 adds project workspace workflows (`python3 -m colab_adapter.cli project ...`) and compute monitoring (`python3 -m colab_adapter.cli monitor ...`). All autonomous agents operating in this repository or interacting with Colab must adhere to these rules:
 
 1. **Always plan and validate offline first:**
-   Use `colab-adapter project validate <dir> --json` and `colab-adapter project plan <dir> --json`. These perform dry-run file diffing and schema checks with zero cloud allocation.
+   Use `python3 -m colab_adapter.cli project validate <dir> --json` and `python3 -m colab_adapter.cli project plan <dir> --json`. These perform dry-run file diffing and schema checks with zero cloud allocation.
 2. **Never allocate compute without explicit human approval:**
-   `colab-adapter project up` provisions paid Colab compute. Agents running autonomously must obtain explicit operator authorization and verify session ownership before execution.
+   `python3 -m colab_adapter.cli project up` provisions paid Colab compute. Agents running autonomously must obtain explicit operator authorization and verify session ownership before execution.
 3. **Machine-readable JSON output:**
-   Pass `--json` to all `colab-adapter project` subcommands (`plan`, `up`, `sync`, `exec`, `status`, `stop`, `reconcile`) for structured JSON output.
+   Pass `--json` to all `python3 -m colab_adapter.cli project` subcommands (`plan`, `up`, `sync`, `exec`, `status`, `stop`, `reconcile`) for structured JSON output.
 4. **Strict isolation from unmanaged sessions:**
    The adapter strictly manages only sessions prefixed with its managed namespace. Never attempt to attach to, execute on, or terminate external user sessions (Q08 fail-closed invariant).
 5. **Read-only monitoring:**
-   `colab-adapter monitor snapshot` and `server` query account usage without provisioning resources. The monitor web dashboard is strictly read-only: do not construct or expose mutating endpoints.
+   `python3 -m colab_adapter.cli usage` and `python3 -m colab_adapter.cli monitor` query account usage without provisioning resources. The monitor web dashboard is strictly read-only: do not construct or expose mutating endpoints.
 6. **Backward compatibility & host safety:**
    Ensure `colab_adapter` remains compatible with standard Python 3.8+ on the host. Upstream `google-colab-cli` remains isolated in Python >=3.12. Do not touch host GPU drivers.
 
@@ -72,7 +74,27 @@ V2 adds project workspace workflows (`colab-adapter project ...`) and compute mo
 - **Independent Drive OAuth**: Drive API credentials must remain completely separate from Colab CLI OAuth credentials. Never transmit Drive access tokens or refresh tokens to the remote Colab VM, client browsers, or logs.
 - **Protected Server-Side Credential Storage**: All secret token files must be stored server-side with strict `0600` (user read/write only) filesystem permissions.
 - **Zero Cloud Allocation on Attach**: Viewing an active or historical run via the Workspace Broker or web dashboard must **never** provoke a new Colab GPU allocation or auto-create a VM.
+- **Google Drive Custom Property Limit (124 UTF-8 Bytes)**: Google Drive strictly limits each custom property (`appProperties`) to 124 UTF-8 bytes counting key and value together, with at most 30 properties per file (see [Google Drive API limits of custom file properties](https://developers.google.com/workspace/drive/api/guides/properties#limits_of_custom_file_properties)). `validate_drive_properties` is called before every remote write (resumable session initialization and metadata PATCH). Any property set exceeding limits is rejected with `DriveTransferError` locally *before* transmitting over the network, logging only the property key and byte lengths while redacting property values.
+- **Compact Metadata Schema v2**: Remote Drive files carry only compact, fixed-size properties (`schema: "2"`, `sha256: <64-hex>`, `path_sha256: <64-hex>`, `is_latest: "true"|"false"`, `next_sha256: <64-hex>`). Full canonical artifact IDs (`project/run/path@sha256_<64hex>`) live exclusively in local `PublicationManifest` (persisted in `manifest.json` and `manifest.json.bak` with mode `0600`). Local `superseded_by` is the full canonical ID reconstructed from project/run/path + `next_sha256`. Legacy properties (`logical_path`, `revision_id`, `project_id`, `run_id`, `superseded_by`) are read-only for backward compatibility, never written for new revisions, and cleaned up via `None` on remote PATCH.
+- **Unicode & Long-Path Safety**: Arbitrary long or Unicode logical paths are bound via collision-safe SHA-256 digests (`path_sha256`), eliminating any risk of Drive property size overflow regardless of path length or multi-byte characters.
+- **Replay Safety & Idempotence**: Republishing an existing historical revision is strictly idempotent: historical revisions stay historical (`is_latest="false"`). Replay executes **NO new upload session, NO data transfer, and issues NO Drive PATCH request**. Interrupted publications (`pending` state) are safely promoted to latest on retry. Explicit rollback is NOT implemented (republishing an earlier revision does not revert the remote latest pointer).
+- **Remote Coordination & Fail-Closed Integrity**: Remote latest revision coordination demotes prior revisions before promoting a new verified revision. If unversioned recovery encounters an ambiguous remote state (0 or >1 remote revisions marked `is_latest="true"`), it fails closed with `DriveIntegrityError`.
 - **Durable Local Retention & Immutable Revision History**: The last valid local checkpoint must **never** be deleted before Google Drive upload and verification succeed. Publishing a new revision of the same checkpoint filename (`model.pt`) must preserve all prior verified revisions under canonical `@sha256_<full_sha256>` identities (`PublicationManifest` v2) and never overwrite historical revision metadata or Drive objects. Local retention pruning must never delete remote Drive objects without explicit human authorization.
 - **Bit-Reproducible Snapshots**: Source snapshots must be deterministic (normalized headers) and strictly filter out `.env`, private keys, SSH keys, git internals, and cache directories.
 - **Reproducible Real-Browser Security Verification**: Dashboard changes must maintain zero `.innerHTML` / inline handler usage, per-response cryptographic CSP nonces, and pass `COLAB_REQUIRE_BROWSER_TESTS=1 python3 -m unittest tests/test_browser_xss_and_cross_process_qa.py -v` in headless Chromium.
+- **Testing Demarcation**: All functionality is verified offline with deterministic mock clients (`OFFLINE_RELEASE_READY`). Real Google Drive and Colab environments have never been exercised in this worktree or automated tests; live OAuth credentials and cloud writes are not authorized without explicit operator consent (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
+
+### V2 storage & monitor invariants (PR #24, offline)
+
+See [docs/ARTIFACT_RECOVERY.md](docs/ARTIFACT_RECOVERY.md), [docs/GOOGLE_DRIVE_ARTIFACTS.md](docs/GOOGLE_DRIVE_ARTIFACTS.md), [docs/ARCHITECTURE_V2.md](docs/ARCHITECTURE_V2.md) sections 14–15, and [docs/MONITORING_DASHBOARD_V2.md](docs/MONITORING_DASHBOARD_V2.md) section 8.
+
+- **Exact revisions**: a versioned id must carry a full 64-hex sha256. Resolve it only from the manifest or `.revisions/<full sha>/` (legacy `<sha16>/` is read-only). Never fall back to the mutable alias.
+- **Manifest is authoritative**: the `checkpoints/<name>` alias is a cache of the head. Reconcile it only under the manifest lock. Replaying a historical revision never moves the head or the alias. If the manifest is lost while revisions exist, fail closed.
+- **One lock per manifest**: `<run_dir>/.locks/manifest.lock` is shared by the local and Drive stores (thread RLock plus `fcntl.flock`, 0700 directory and 0600 file, bounded timeout raising `JournalLockError`). Do not add a second lock for the same manifest.
+- **Drive pending revisions**: capture `base_sha256` once at intent and keep it in the journal. Promote only on `PROMOTE` or `ALREADY_LATEST`. A `STALE` revision stays pending and retrievable. Legacy records without a base follow the legacy rules and fail closed when ambiguous. `DriveIntegrityError` is terminal in the upload worker.
+- **Drive has no compare-and-swap**: the stale and promote guarantee holds only if every writer to the folder goes through this host's locks. Do not describe it as holding for external writers.
+- **Validation before side effects**: validate ids, file names, logical paths and artifact types (`storage/validation.py`) before any path, lock, staging directory or remote call. Ids are ASCII. File names are NFC with no separators or control/format characters. Staging names are hashed. Re-validate journal-read ids. Drive read paths validate too.
+- **Drive 403 classification**: quota reasons are never retried. Rate reasons get bounded retries. Retry-After is capped at 60 s. Other 403s are auth errors and are never retried.
+- **Monitor identity**: runs are keyed by `(project_id, run_id)`. Use `?project=`. A bare run id that matches several projects returns 409 `ambiguous_run`. Skip symlinks and exclude `.locks`. Label account-wide counters as account-wide. `is_runtime_active` is conservative.
+- **Offline only**: do not describe mock or offline results as live Colab, Drive or OAuth validation, and never claim `PRODUCTION_READY` or `LIVE_VERIFIED`.
 

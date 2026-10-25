@@ -132,18 +132,47 @@ class WorkspaceBroker:
                 self.auth_tokens = set(data.get("tokens", []))
 
     def _save_tokens_to_file(self) -> None:
-        """Save tokens to protected tokens_file with 0600 mode and 0700 parent."""
+        """Atomically save tokens to the protected tokens_file (0600, new private temp file, no symlink follow).
+
+        The parent directory is created 0700 only when this call creates it; an existing directory
+        (for example a home directory) is never re-chmodded.
+        """
         if not self.tokens_file:
             return
+        import contextlib
         import stat
-        self.tokens_file.parent.mkdir(parents=True, exist_ok=True)
+        import uuid
+
+        target = Path(self.tokens_file)
+        parent = target.parent
+        if not parent.exists():
+            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with contextlib.suppress(OSError):
+                os.chmod(parent, 0o700)
+        tmp = parent / f".{target.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        payload = json.dumps({"tokens": sorted(self.auth_tokens)}, indent=2).encode("utf-8")
+        fd = None
         try:
-            os.chmod(self.tokens_file.parent, 0o700)
-        except OSError:
-            pass
-        fd = os.open(str(self.tokens_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"tokens": list(self.auth_tokens)}, f, indent=2)
+            fd = os.open(
+                str(tmp),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)  # before any secret byte is written
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            os.replace(str(tmp), str(target))
+        except BaseException:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            with contextlib.suppress(OSError):
+                os.unlink(str(tmp))
+            raise
 
     def verify_token(self, token: Optional[str]) -> bool:
         """Verify client bearer token against authorized set with constant-time compare."""

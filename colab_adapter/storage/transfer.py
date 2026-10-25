@@ -100,6 +100,8 @@ class TransferRecord:
     fencing_epoch: int = 0
     expected_sha256: Optional[str] = None
     source_path: Optional[str] = None
+    # Base marker captured once at transfer intent ("none" or a full sha256); None for legacy records.
+    base_sha256: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.expected_sha256 is None and self.sha256:
@@ -156,7 +158,7 @@ class TransferRecord:
             "retry_count", "max_retries", "next_retry_at", "last_error",
             "created_at", "updated_at", "metadata",
             "owner_pid", "lease_token", "lease_expires_at", "fencing_epoch",
-            "expected_sha256", "source_path",
+            "expected_sha256", "source_path", "base_sha256",
         }
         filtered = {k: v for k, v in data.items() if k in valid}
         return cls(**filtered)
@@ -187,9 +189,15 @@ class TransferJournal:
 
     def __init__(self, journal_path: Union[str, Path]):
         self.path = Path(journal_path).resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             os.chmod(str(self.path.parent), 0o700)
+        except OSError:
+            pass
+        self._locks_dir = self.path.parent / ".transfer_locks"
+        self._locks_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(str(self._locks_dir), 0o700)
         except OSError:
             pass
         self.lock_path = self.path.with_suffix(".lock")
@@ -198,6 +206,11 @@ class TransferJournal:
             with self._acquire_locks():
                 if not self.path.exists():
                     self._write_records({})
+        else:
+            try:
+                os.chmod(str(self.path), 0o600)
+            except OSError:
+                pass
 
     @contextmanager
     def _acquire_locks(self):
@@ -209,6 +222,10 @@ class TransferJournal:
             if fcntl is not None:
                 try:
                     lock_fd = os.open(str(self.lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+                    try:
+                        os.chmod(str(self.lock_path), 0o600)
+                    except OSError:
+                        pass
                     fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 except (OSError, AttributeError) as e:
                     raise JournalLockError(f"Failed to acquire exclusive lock on {self.lock_path}: {e}") from e
@@ -228,7 +245,7 @@ class TransferJournal:
             return {}
         try:
             mode = stat.S_IMODE(self.path.stat().st_mode)
-            if mode & 0o077:
+            if mode != 0o600:
                 os.chmod(str(self.path), 0o600)
         except OSError:
             pass
@@ -274,10 +291,20 @@ class TransferJournal:
         payload = json.dumps(records, indent=2, sort_keys=True)
 
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.chmod(str(tmp), 0o600)
+        except OSError:
+            pass
+
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
+
+        try:
+            os.chmod(str(tmp), 0o600)
+        except OSError:
+            pass
 
         os.replace(str(tmp), str(self.path))
         try:
@@ -425,8 +452,8 @@ class TransferJournal:
     def acquire_named_lock(self, lock_name: str, timeout: float = 30.0) -> Iterator[Path]:
         """Cross-process and re-entrant thread lock for a named resource."""
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(lock_name))
-        locks_dir = self.path.parent / ".transfer_locks"
-        locks_dir.mkdir(parents=True, exist_ok=True)
+        locks_dir = getattr(self, "_locks_dir", self.path.parent / ".transfer_locks")
+        locks_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             os.chmod(str(locks_dir), 0o700)
         except OSError:

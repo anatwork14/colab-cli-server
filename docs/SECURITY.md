@@ -31,3 +31,25 @@ Only install the real `google-colab-cli` from the official package or Google Git
 ## Responsible disclosure
 
 If you discover a vulnerability involving Google's CLI or Colab backend, follow Google's official vulnerability reporting process. For this wrapper, open a private maintainer contact channel first rather than publishing exploit details or tokens in a public issue.
+
+## Storage hardening controls (PR #24, offline)
+
+These controls are implemented in `colab_adapter/storage/` and are verified only by offline tests. They do not replace the approval gates above.
+
+- **Input validation before side effects.** Project, run, file-name, logical-path and artifact-type inputs are checked against the rules in `colab_adapter/storage/validation.py` before any path, lock, staging directory, journal record or remote request is derived from them. Ids are ASCII. File names are NFC Unicode with no separators, control or format characters. The upload worker re-validates ids read from the transfer journal, which is not trusted as input.
+- **Lock files.** The per-manifest lock is `<run_dir>/.locks/manifest.lock`. The directory is mode 0700 and the file is mode 0600. Symlinked lock paths are refused.
+- **Staging.** Staging directories use hashed names (`stg-<40 hex>`), so raw ids never form a path. Symlinked staging roots and directories are refused, and the resolved path must stay inside the staging root.
+- **Errors.** Untrusted values in validation errors are escaped with `ascii()` and truncated. Drive property error messages show key names and sizes, never values.
+- **Drive quota versus auth.** Drive 403 responses are classified by reason. Quota and auth errors are never retried. Rate-limit errors are retried with a 60-second cap on each wait.
+- **Monitor.** The monitor remains read-only. Its selectors are validated and its listings skip symlinks and internal directories. See `docs/MONITORING_DASHBOARD_V2.md` section 8.
+
+Limit: the Drive store has no compare-and-swap. Its guarantees hold only when every writer to the folder uses this host's locks (see `docs/GOOGLE_DRIVE_ARTIFACTS.md`, "Drive Store Hardening", section 5).
+
+
+## OAuth token file writes (PR #24 follow-up, offline-verified)
+
+- `DriveCredentials.save()` and the workspace broker's token file save never write secret bytes into an existing file. They create a fresh temp file in the same directory (`O_EXCL|O_NOFOLLOW`, mode `0600`, `fchmod(0600)` before the first byte), fsync it, and `os.replace` it over the target. A pre-existing `0644`/`0666`/`0777` token file therefore ends up `0600`, and a failed write leaves the previous file intact with no temp file left behind.
+- A symlink at the Drive credentials path is *replaced* by a regular `0600` file (never written through). If you deliberately symlinked that file elsewhere, the link is replaced after the next token refresh. The broker resolves its operator-configured `tokens_file` once at construction, so a symlinked path means "use that target" for both load and save, and the target ends up `0600`.
+- Parent directories are created `0700` only when the call creates them; existing directories are never re-chmodded.
+- Limitation: a process killed (`SIGKILL`) between the temp write and the rename can leave a `0600` `.<name>.tmp.<pid>.<hex>` file holding tokens in the token directory. Nothing sweeps it; delete such files manually. A failed save after a successful token refresh fails closed (the refresh raises `DriveAuthenticationError`) rather than continuing with an unpersisted token.
+- POSIX only (`fchmod`, `O_NOFOLLOW`). Parent-chain symlinks are still resolved; keep the token directory private to the service user.

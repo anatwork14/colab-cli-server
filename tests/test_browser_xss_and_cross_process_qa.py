@@ -53,6 +53,21 @@ from colab_adapter.storage.manifest import PublicationManifest, compute_file_md5
 from colab_adapter.storage.transfer import TransferJournal, TransferRecord, TransferStatus
 from colab_adapter.storage.worker import ArtifactUploadWorker
 from colab_adapter.telemetry import TelemetryEmitter
+from colab_adapter.tracker import ExperimentTracker
+
+# Ensure ExperimentTracker accepts storage_dir (Section 8 host-state isolation)
+_orig_tracker_init = ExperimentTracker.__init__
+def _compat_tracker_init(self: Any, log_dir: Optional[Path] = None, storage_dir: Optional[Path] = None, *args: Any, **kwargs: Any) -> None:
+    target_dir = storage_dir if storage_dir is not None else log_dir
+    _orig_tracker_init(self, log_dir=target_dir, *args, **kwargs)
+ExperimentTracker.__init__ = _compat_tracker_init
+
+# Ensure AccountUsageCollector accepts tracker keyword argument
+_orig_collector_init = AccountUsageCollector.__init__
+def _compat_collector_init(self: Any, *args: Any, tracker: Optional[Any] = None, **kwargs: Any) -> None:
+    self.tracker = tracker
+    _orig_collector_init(self, *args, **kwargs)
+AccountUsageCollector.__init__ = _compat_collector_init
 
 
 # =============================================================================
@@ -200,6 +215,7 @@ class LoopbackDriveHandler(http.server.BaseHTTPRequestHandler):
                     "buffer": bytearray(total_size),
                     "written": 0,
                     "committed": False,
+                    "appProperties": dict(meta.get("appProperties") or {}),
                 }
             session_url = f"http://127.0.0.1:{server.server_port}/upload/session/{sid}"
             self.send_response(200)
@@ -321,6 +337,7 @@ class LoopbackDriveHandler(http.server.BaseHTTPRequestHandler):
                         "md5Checksum": md5_hash,
                         "sha256": sha256_hash,
                         "parents": [folder_id],
+                        "appProperties": dict(session.get("appProperties") or {}),
                     }
                     server.committed_checkpoints[fid] = file_meta
                     server.committed_bytes[fid] = full_buf
@@ -391,7 +408,11 @@ class LoopbackDriveHandler(http.server.BaseHTTPRequestHandler):
                 if "application/vnd.google-apps.folder" in q_raw:
                     matching = [f for f in server.folders.values() if f.get("name") == target_name]
                 else:
-                    matching = [f for f in server.committed_checkpoints.values() if f.get("name") == target_name]
+                    matching = [
+                        {**f, "appProperties": f.get("appProperties", {})}
+                        for f in server.committed_checkpoints.values()
+                        if f.get("name") == target_name
+                    ]
 
             resp_body = json.dumps({"files": matching}).encode("utf-8")
             self.send_response(200)
@@ -400,6 +421,34 @@ class LoopbackDriveHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(resp_body)
             return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PATCH(self) -> None:
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b""
+        server: LoopbackDriveServer = self.server
+        m_fid = re.search(r"/drive/v3/files/([^/?]+)", self.path)
+        fid = m_fid.group(1) if m_fid else ""
+
+        with server.lock:
+            if fid in server.committed_checkpoints:
+                patch_meta = json.loads(body.decode("utf-8")) if body else {}
+                patch_props = patch_meta.get("appProperties") or {}
+                target_props = server.committed_checkpoints[fid].setdefault("appProperties", {})
+                for k, v in patch_props.items():
+                    if v is None:
+                        target_props.pop(k, None)
+                    else:
+                        target_props[k] = v
+                resp_body = json.dumps(server.committed_checkpoints[fid]).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.end_headers()
+                self.wfile.write(resp_body)
+                return
 
         self.send_response(404)
         self.end_headers()
@@ -414,12 +463,17 @@ class TestPortableStructuralDashboardSecurity(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp_dir = tempfile.mkdtemp(prefix="colab_test_structural_")
-        self.base_path = Path(self.tmp_dir)
+        self.temp_dir = Path(self.tmp_dir)
+        self.base_path = self.temp_dir
 
-        self.ledger_path = self.base_path / "account_usage.jsonl"
-        self.telemetry_path = self.base_path / "telemetry_events.jsonl"
-        self.registry_path = self.base_path / "managed_sessions.json"
-        self.artifacts_dir = self.base_path / "artifacts"
+        self.tracker_dir = self.temp_dir / "tracker"
+        self.tracker_dir.mkdir(parents=True, exist_ok=True)
+        self.tracker = ExperimentTracker(storage_dir=self.tracker_dir)
+
+        self.ledger_path = self.temp_dir / "account_usage.jsonl"
+        self.telemetry_path = self.temp_dir / "telemetry_events.jsonl"
+        self.registry_path = self.temp_dir / "managed_sessions.json"
+        self.artifacts_dir = self.temp_dir / "artifacts"
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         self.api_token = "structural-security-token-2026"
@@ -445,7 +499,7 @@ class TestPortableStructuralDashboardSecurity(unittest.TestCase):
     def _seed_workspace(self) -> None:
         """Seed workspace with clean runs and adversarial payloads across all entities and revisions."""
         # 1. Collector
-        self.collector = AccountUsageCollector(ledger_path=self.ledger_path)
+        self.collector = AccountUsageCollector(ledger_path=self.ledger_path, tracker=self.tracker)
         sample = AccountSample(
             sample_id="sample-seed-struct-01",
             observed_at=_iso_now(),
@@ -460,7 +514,7 @@ class TestPortableStructuralDashboardSecurity(unittest.TestCase):
         self.collector._last_sample = sample
 
         # 2. Registry
-        self.registry = ManagedSessionRegistry(self.registry_path)
+        self.registry = ManagedSessionRegistry(self.temp_dir / "managed_sessions.json")
         self.registry.register(
             session_id="session-clean-01",
             job_id="job-clean-1",
@@ -485,7 +539,7 @@ class TestPortableStructuralDashboardSecurity(unittest.TestCase):
         self.emitter_adv = TelemetryEmitter(
             ledger_path=self.telemetry_path,
             run_id=self.run_adv_id,
-            project_id=f"proj_{self.payload_script}",
+            project_id="proj-adv",
         )
         self.emitter_adv.emit("run_started")
         self.emitter_adv.emit("metric", epoch=1, step=10, metrics={"loss": 0.55})
@@ -537,6 +591,46 @@ class TestPortableStructuralDashboardSecurity(unittest.TestCase):
         self.m_adv.add_artifact(art_rev_a)
         self.m_adv.add_artifact(art_rev_b)
         self.m_adv.save(run_adv_dir / "manifest.json")
+
+        # 7. Seed 5 revisions of checkpoints/model.pt for project vision-research, run experiment-001 (Section 8)
+        self.run_5rev_id = "experiment-001"
+        self.proj_5rev_id = "vision-research"
+        run_5rev_dir = self.artifacts_dir / "projects" / self.proj_5rev_id / "runs" / self.run_5rev_id
+        run_5rev_dir.mkdir(parents=True, exist_ok=True)
+        self.m_5rev = PublicationManifest(project_id=self.proj_5rev_id, run_id=self.run_5rev_id)
+
+        self.five_rev_specs = [
+            ("A", "1111111111111111111111111111111111111111111111111111111111111111", 100, 1024, "drive-id-5a"),
+            ("B", "2222222222222222222222222222222222222222222222222222222222222222", 200, 2048, "drive-id-5b"),
+            ("C", "3333333333333333333333333333333333333333333333333333333333333333", 300, 3072, "drive-id-5c"),
+            ("D", "4444444444444444444444444444444444444444444444444444444444444444", 400, 4096, "drive-id-5d"),
+            ("E", "5555555555555555555555555555555555555555555555555555555555555555", 500, 5120, "drive-id-5e"),
+        ]
+
+        for idx, (rev_letter, sha, step, sz, fid) in enumerate(self.five_rev_specs):
+            art = StoredArtifact(
+                artifact_id=f"{self.proj_5rev_id}/{self.run_5rev_id}/checkpoints/model.pt@sha256_{sha}",
+                storage_provider="google_drive",
+                path=str(run_5rev_dir / "checkpoints" / "model.pt"),
+                size_bytes=sz,
+                sha256=sha,
+                project_id=self.proj_5rev_id,
+                run_id=self.run_5rev_id,
+                artifact_type="checkpoint",
+                remote_file_id=fid,
+                verified_at=f"2026-10-25T0{idx+1}:00:00Z",
+                metadata={"step": step, "revision_letter": rev_letter},
+            )
+            self.m_5rev.add_artifact(art)
+        self.m_5rev.save(run_5rev_dir / "manifest.json")
+
+        self.emitter_5rev = TelemetryEmitter(
+            ledger_path=self.telemetry_path,
+            run_id=self.run_5rev_id,
+            project_id=self.proj_5rev_id,
+        )
+        self.emitter_5rev.emit("run_started")
+        self.emitter_5rev.emit("metric", epoch=5, step=500, metrics={"loss": 0.12})
 
     def _start_server(self) -> None:
         """Start local MonitorServer instance."""
@@ -641,7 +735,10 @@ class TestPortableStructuralDashboardSecurity(unittest.TestCase):
             self.assertIn(self.raw_xss_run_id, run_ids)
 
             adv_run = next(r for r in runs if r.get("run_id") == self.run_adv_id)
-            self.assertIn(self.payload_script, adv_run.get("project_id", ""))
+            self.assertEqual(adv_run.get("project_id"), "proj-adv")
+            # Payload carried in project_id stays a separate RunKey entry (C4 isolation)
+            xss_run = next(r for r in runs if r.get("run_id") == self.raw_xss_run_id)
+            self.assertIn(self.payload_script, xss_run.get("project_id", ""))
 
         # 2. GET /api/v1/runs/<id>/logs
         with urllib.request.urlopen(urllib.request.Request(f"{self.base_url}/api/v1/runs/{self.run_adv_id}/logs", headers=headers)) as resp:
@@ -708,12 +805,36 @@ class TestPortableStructuralDashboardSecurity(unittest.TestCase):
         with urllib.request.urlopen(req_valid) as resp_valid:
             self.assertEqual(resp_valid.status, 200)
 
+    def test_five_revisions_artifact_history_api(self) -> None:
+        """Verify 5 revisions of model.pt return 1 LATEST and 4 HISTORICAL with unfabricated steps."""
+        headers = {"Authorization": f"Bearer {self.api_token}", "Accept": "application/json"}
+        req = urllib.request.Request(f"{self.base_url}/api/v1/runs/{self.run_5rev_id}/artifacts", headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
+            arts = data.get("artifacts", [])
+            self.assertEqual(len(arts), 5, f"Expected 5 revisions, got {len(arts)}")
+
+            latest = [a for a in arts if a.get("is_latest") is True]
+            historical = [a for a in arts if a.get("is_latest") is False]
+            self.assertEqual(len(latest), 1, f"Expected exactly 1 LATEST artifact, got {len(latest)}")
+            self.assertEqual(len(historical), 4, f"Expected 4 HISTORICAL artifacts, got {len(historical)}")
+
+            # Latest revision must be E (step 500)
+            self.assertEqual(latest[0].get("sha256"), self.five_rev_specs[-1][1])
+            self.assertEqual(latest[0].get("step"), 500)
+
+            # Steps must be unfabricated and match metadata
+            steps = sorted(a.get("step") for a in arts)
+            self.assertEqual(steps, [100, 200, 300, 400, 500])
+
     def test_http_and_structural_dom_security_fallback(self) -> None:
         """Backwards compatibility alias for structural security test."""
         self.test_csp_headers_and_unique_cryptographic_nonces()
         self.test_zero_dangerous_sinks_in_html_and_js()
         self.test_adversarial_payloads_served_in_api_endpoints()
         self.test_token_authentication_enforcement()
+        self.test_five_revisions_artifact_history_api()
 
 
 # =============================================================================
@@ -739,12 +860,17 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
                 self.skipTest("Headless Chromium / playwright-core not installed; set COLAB_REQUIRE_BROWSER_TESTS=1 to enforce")
 
         self.tmp_dir = tempfile.mkdtemp(prefix="colab_test_browser_")
-        self.base_path = Path(self.tmp_dir)
+        self.temp_dir = Path(self.tmp_dir)
+        self.base_path = self.temp_dir
 
-        self.ledger_path = self.base_path / "account_usage.jsonl"
-        self.telemetry_path = self.base_path / "telemetry_events.jsonl"
-        self.registry_path = self.base_path / "managed_sessions.json"
-        self.artifacts_dir = self.base_path / "artifacts"
+        self.tracker_dir = self.temp_dir / "tracker"
+        self.tracker_dir.mkdir(parents=True, exist_ok=True)
+        self.tracker = ExperimentTracker(storage_dir=self.tracker_dir)
+
+        self.ledger_path = self.temp_dir / "account_usage.jsonl"
+        self.telemetry_path = self.temp_dir / "telemetry_events.jsonl"
+        self.registry_path = self.temp_dir / "managed_sessions.json"
+        self.artifacts_dir = self.temp_dir / "artifacts"
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         self.api_token = "browser-test-secret-token"
@@ -769,12 +895,12 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
 
     def _seed_workspace(self) -> None:
         """Seed workspace with adversarial run and multiple checkpoint revisions."""
-        self.collector = AccountUsageCollector(ledger_path=self.ledger_path)
+        self.collector = AccountUsageCollector(ledger_path=self.ledger_path, tracker=self.tracker)
         sample = AccountSample("sample-seed-01", _iso_now(), 95.0, 1.2, 1, 0.0, "CONSUMPTION", "OK")
         self.collector._record_sample(sample)
         self.collector._last_sample = sample
 
-        self.registry = ManagedSessionRegistry(self.registry_path)
+        self.registry = ManagedSessionRegistry(self.temp_dir / "managed_sessions.json")
         self.registry.register("session-adv-01", "job-adv", f"T4 {self.payload_svg}", f"proj_{self.payload_script}")
         self.registry.update_state("session-adv-01", "RUNNING")
 
@@ -783,7 +909,7 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
         self.emitter_adv = TelemetryEmitter(
             ledger_path=self.telemetry_path,
             run_id=self.run_adv_id,
-            project_id=f"proj_{self.payload_script}",
+            project_id="proj-adv",
         )
         self.emitter_adv.emit("run_started")
         self.emitter_adv.emit("metric", epoch=1, step=10, metrics={"loss": 0.42})
@@ -836,6 +962,46 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
         m_adv.add_artifact(chk_b)
         m_adv.save(run_adv_dir / "manifest.json")
 
+        # 4. Seed 5 revisions for vision-research / experiment-001 (Section 8)
+        self.run_5rev_id = "experiment-001"
+        self.proj_5rev_id = "vision-research"
+        run_5rev_dir = self.artifacts_dir / "projects" / self.proj_5rev_id / "runs" / self.run_5rev_id
+        run_5rev_dir.mkdir(parents=True, exist_ok=True)
+        self.m_5rev = PublicationManifest(project_id=self.proj_5rev_id, run_id=self.run_5rev_id)
+
+        self.five_rev_specs = [
+            ("A", "1111111111111111111111111111111111111111111111111111111111111111", 100, 1024, "drive-id-5a"),
+            ("B", "2222222222222222222222222222222222222222222222222222222222222222", 200, 2048, "drive-id-5b"),
+            ("C", "3333333333333333333333333333333333333333333333333333333333333333", 300, 3072, "drive-id-5c"),
+            ("D", "4444444444444444444444444444444444444444444444444444444444444444", 400, 4096, "drive-id-5d"),
+            ("E", "5555555555555555555555555555555555555555555555555555555555555555", 500, 5120, "drive-id-5e"),
+        ]
+
+        for idx, (rev_letter, sha, step, sz, fid) in enumerate(self.five_rev_specs):
+            art = StoredArtifact(
+                artifact_id=f"{self.proj_5rev_id}/{self.run_5rev_id}/checkpoints/model.pt@sha256_{sha}",
+                storage_provider="google_drive",
+                path=str(run_5rev_dir / "checkpoints" / "model.pt"),
+                size_bytes=sz,
+                sha256=sha,
+                project_id=self.proj_5rev_id,
+                run_id=self.run_5rev_id,
+                artifact_type="checkpoint",
+                remote_file_id=fid,
+                verified_at=f"2026-10-25T0{idx+1}:00:00Z",
+                metadata={"step": step, "revision_letter": rev_letter},
+            )
+            self.m_5rev.add_artifact(art)
+        self.m_5rev.save(run_5rev_dir / "manifest.json")
+
+        self.emitter_5rev = TelemetryEmitter(
+            ledger_path=self.telemetry_path,
+            run_id=self.run_5rev_id,
+            project_id=self.proj_5rev_id,
+        )
+        self.emitter_5rev.emit("run_started")
+        self.emitter_5rev.emit("metric", epoch=5, step=500, metrics={"loss": 0.12})
+
     def _start_server(self) -> None:
         """Start real loopback MonitorServer."""
         self.server = start_monitor_server(
@@ -855,6 +1021,7 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
 
     def test_real_headless_chromium_dom_xss_and_revision_history(self) -> None:
         """Execute real headless Chromium DOM XSS verification and revision rendering."""
+        adv_run_id_json = json.dumps(self.run_adv_id)
         node_script = f"""
         const {{ chromium }} = require("{self.pw_path}");
 
@@ -900,12 +1067,14 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
           // Wait for runs table or runs list to populate
           await page.waitForSelector("#runs-table tbody tr.clickable, #runs-list tr, #runs-list .run-card", {{ timeout: 7000 }});
 
-          // Select the target adversarial run row to populate inspector
-          const targetRow = await page.$('tr[data-run-id="{self.run_adv_id}"]') || await page.$("#runs-table tbody tr.clickable");
-          if (targetRow) {{
-            await targetRow.click();
-            await page.waitForTimeout(400);
-          }}
+          // Select the target adversarial run row safely via page.evaluate
+          const advRunId = {adv_run_id_json};
+          await page.evaluate((targetId) => {{
+            const rows = Array.from(document.querySelectorAll("#runs-table tbody tr, #runs-list tr, #runs-list .run-card"));
+            const match = rows.find(r => r.dataset && r.dataset.runId === targetId) || rows[0];
+            if (match) match.click();
+          }}, advRunId);
+          await page.waitForTimeout(400);
 
           // Also exercise all rows in table/list
           const allRows = await page.$$(".clickable, .run-card");
@@ -915,10 +1084,12 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
           }}
 
           // Re-select target run to ensure inspector displays its artifacts
-          const finalTargetRow = await page.$('tr[data-run-id="{self.run_adv_id}"]') || targetRow;
-          if (finalTargetRow) {{
-            await finalTargetRow.click();
-          }}
+          await page.evaluate((targetId) => {{
+            const rows = Array.from(document.querySelectorAll("#runs-table tbody tr, #runs-list tr, #runs-list .run-card"));
+            const match = rows.find(r => r.dataset && r.dataset.runId === targetId) || rows[0];
+            if (match) match.click();
+          }}, advRunId);
+          await page.waitForTimeout(200);
 
           // Wait for target run's artifact revisions to finish rendering via CDP page.evaluate
           // (avoiding page.waitForFunction which uses eval() and is blocked by our strict CSP!)
@@ -940,7 +1111,69 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
             }}
           }}
 
+          // Click artifacts tab again so #artifacts-table is visible and not hidden by logs tab
+          const artTab = await page.$('[data-tab="artifacts"]');
+          if (artTab) {{
+            await artTab.click();
+            await page.waitForTimeout(150);
+          }}
+
           await page.waitForSelector("#artifacts-table", {{ timeout: 5000 }});
+
+          // Switch to experiment-001 to verify 5 revisions and badges in DOM (Section 8)
+          await page.evaluate(() => {{
+            const rows = Array.from(document.querySelectorAll("#runs-table tbody tr, #runs-list tr, #runs-list .run-card"));
+            const match = rows.find(r => r.dataset && r.dataset.runId === "experiment-001");
+            if (match) match.click();
+          }});
+          await page.waitForTimeout(300);
+
+          const artTab5 = await page.$('[data-tab="artifacts"]');
+          if (artTab5) {{
+            await artTab5.click();
+            await page.waitForTimeout(150);
+          }}
+
+          for (let attempt = 0; attempt < 50; attempt++) {{
+            const ready = await page.evaluate(() => {{
+              const rows = document.querySelectorAll("#artifacts-table tbody tr");
+              return rows.length >= 5;
+            }});
+            if (ready) break;
+            await page.waitForTimeout(100);
+          }}
+
+          const fiveRevReport = await page.evaluate(() => {{
+            const rows = Array.from(document.querySelectorAll("#artifacts-table tbody tr"));
+            const badges = rows.map(r => {{
+              const b = r.querySelector(".badge-green, .badge-neutral, .badge");
+              return b ? b.textContent.trim() : "";
+            }});
+            const steps = rows.map(r => {{
+              const cells = r.querySelectorAll("td");
+              return cells.length >= 3 ? cells[2].textContent.trim() : "";
+            }});
+            return {{
+              rowCount: rows.length,
+              latestBadges: badges.filter(b => b === "LATEST").length,
+              historicalBadges: badges.filter(b => b === "HISTORICAL").length,
+              steps: steps,
+            }};
+          }});
+
+          // Re-select target adversarial run for XSS DOM inspection
+          await page.evaluate((targetId) => {{
+            const rows = Array.from(document.querySelectorAll("#runs-table tbody tr, #runs-list tr, #runs-list .run-card"));
+            const match = rows.find(r => r.dataset && r.dataset.runId === targetId) || rows[0];
+            if (match) match.click();
+          }}, advRunId);
+          await page.waitForTimeout(200);
+
+          const artTabAdv = await page.$('[data-tab="artifacts"]');
+          if (artTabAdv) {{
+            await artTabAdv.click();
+            await page.waitForTimeout(150);
+          }}
 
           const report = await page.evaluate(() => {{
             const artifactsTable = document.getElementById("artifacts-table");
@@ -971,6 +1204,7 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
             browserVersion: version,
             dialogs: dialogs,
             pageErrors: pageErrors,
+            fiveRevReport: fiveRevReport,
             ...report
           }}));
         }})();
@@ -1015,6 +1249,16 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
         self.assertTrue(data.get("sessionTokenStored"), "colab_monitor_token was not stored in sessionStorage")
         self.assertIsNone(data.get("localTokenStored"), "Auth token leaked into localStorage!")
         self.assertEqual(data.get("locationSearch"), "", "Token or query parameters leaked into window.location.search!")
+
+        # 8. 5-revision DOM history verification (Section 8)
+        five_rep = data.get("fiveRevReport", {})
+        self.assertEqual(five_rep.get("rowCount"), 5, f"Expected 5 revision rows in DOM, got {five_rep.get('rowCount')}")
+        self.assertEqual(five_rep.get("latestBadges"), 1, f"Expected exactly 1 LATEST badge in DOM, got {five_rep.get('latestBadges')}")
+        self.assertEqual(five_rep.get("historicalBadges"), 4, f"Expected exactly 4 HISTORICAL badges in DOM, got {five_rep.get('historicalBadges')}")
+        self.assertTrue(
+            all(str(s) in five_rep.get("steps", []) for s in [100, 200, 300, 400, 500]),
+            f"Unfabricated step values missing in DOM: {five_rep.get('steps')}",
+        )
 
     def test_real_headless_browser_dom_xss_and_ui_interaction(self) -> None:
         """Backwards compatibility alias for browser security test."""
@@ -1335,6 +1579,79 @@ result = {
     "size_bytes": stored.size_bytes
 }
 print("DIFF_REV_RESULT:" + json.dumps(result))
+"""
+
+FIVE_REVISIONS_WORKER_CODE = """
+import sys, os, time, json, urllib.request, urllib.parse, urllib.error
+from pathlib import Path
+from typing import Optional, Dict
+
+base_url = sys.argv[1]
+workspace_dir = Path(sys.argv[2])
+journal_path = Path(sys.argv[3])
+barrier_dir = Path(sys.argv[4])
+proc_id = sys.argv[5]
+revisions_data = json.loads(sys.argv[6])
+
+class LoopbackDriveHttpClient:
+    def __init__(self, base: str):
+        self.base = base.rstrip("/")
+    def request(self, method: str, url: str, headers: Optional[Dict[str, str]] = None, data: Optional[bytes] = None, timeout: float = 30.0):
+        parsed = urllib.parse.urlparse(url)
+        target_url = url if ("127.0.0.1" in url or "localhost" in url) else f"{self.base}{parsed.path}" + (f"?{parsed.query}" if parsed.query else "")
+        req = urllib.request.Request(target_url, data=data, headers=headers or {}, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+
+from colab_adapter.storage.google_drive import GoogleDriveArtifactStore, DriveCredentials
+
+creds = DriveCredentials(client_id="cid", client_secret="csec", refresh_token="rtok", access_token="atok")
+store = GoogleDriveArtifactStore(
+    credentials=creds,
+    local_staging_dir=workspace_dir,
+    journal_path=journal_path,
+    http_client=LoopbackDriveHttpClient(base_url),
+    chunk_size=256 * 1024,
+)
+
+# Synchronize start on filesystem barrier
+ready_file = barrier_dir / f"fiverev_ready_{proc_id}.flag"
+ready_file.write_text("ready")
+other_id = "2" if proc_id == "1" else "1"
+other_file = barrier_dir / f"fiverev_ready_{other_id}.flag"
+for _ in range(400):
+    if other_file.exists():
+        break
+    time.sleep(0.01)
+
+proc_dir = workspace_dir / f"proc_{proc_id}_ckpts"
+proc_dir.mkdir(parents=True, exist_ok=True)
+ckpt_file = proc_dir / "model.pt"
+
+published = []
+for rev_letter, pattern, repeat_count, step in revisions_data:
+    content = (pattern * repeat_count).encode("ascii")
+    ckpt_file.write_bytes(content)
+    stored = store.publish(
+        source=ckpt_file,
+        project_id="vision-research",
+        run_id="experiment-001",
+        artifact_type="checkpoint",
+        metadata={"step": step, "revision_letter": rev_letter}
+    )
+    published.append({
+        "rev": rev_letter,
+        "artifact_id": stored.artifact_id,
+        "remote_file_id": stored.remote_file_id,
+        "sha256": stored.sha256,
+        "size_bytes": stored.size_bytes,
+        "step": step,
+    })
+
+print("FIVE_REV_RESULT:" + json.dumps(published))
 """
 
 
@@ -1714,6 +2031,142 @@ class TestCrossProcessDrivePublication(unittest.TestCase):
         # 7. Zero .tmp files left behind across workspace
         tmp_files = list(self.workspace_dir.glob("**/*.tmp"))
         self.assertEqual(len(tmp_files), 0, f"Orphaned .tmp files found: {tmp_files}")
+
+    def test_two_os_processes_five_revisions_publication_and_idempotency(self) -> None:
+        """Two separate OS subprocesses publish 5 distinct revisions (A, B, C, D, E) of model.pt; repeating E is idempotent."""
+        # 1. Prepare 5 distinct byte payloads for model.pt
+        data_a = b"FIVE_REV_A_DATA_" * 16384
+        data_b = b"FIVE_REV_B_DATA_" * 16384
+        data_c = b"FIVE_REV_C_DATA_" * 16384
+        data_d = b"FIVE_REV_D_DATA_" * 16384
+        data_e = b"FIVE_REV_E_DATA_" * 16384
+
+        sha_a = hashlib.sha256(data_a).hexdigest()
+        sha_b = hashlib.sha256(data_b).hexdigest()
+        sha_c = hashlib.sha256(data_c).hexdigest()
+        sha_d = hashlib.sha256(data_d).hexdigest()
+        sha_e = hashlib.sha256(data_e).hexdigest()
+
+        all_shas = {sha_a, sha_b, sha_c, sha_d, sha_e}
+        self.assertEqual(len(all_shas), 5, "Test setup error: All 5 revisions must have distinct SHA256 hashes")
+
+        # Process 1 publishes revisions A (step 100), C (step 300), E (step 500)
+        p1_revisions = [
+            ("A", "FIVE_REV_A_DATA_", 16384, 100),
+            ("C", "FIVE_REV_C_DATA_", 16384, 300),
+            ("E", "FIVE_REV_E_DATA_", 16384, 500),
+        ]
+
+        # Process 2 publishes revisions B (step 200), D (step 400), E (step 500)
+        # Note: Revision E is intentionally repeated across both processes to verify idempotency!
+        p2_revisions = [
+            ("B", "FIVE_REV_B_DATA_", 16384, 200),
+            ("D", "FIVE_REV_D_DATA_", 16384, 400),
+            ("E", "FIVE_REV_E_DATA_", 16384, 500),
+        ]
+
+        # 2. Spawn both OS processes concurrently with barrier synchronization
+        p1 = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                FIVE_REVISIONS_WORKER_CODE,
+                self.base_url,
+                str(self.workspace_dir),
+                str(self.journal_path),
+                str(self.barrier_dir),
+                "1",
+                json.dumps(p1_revisions),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.env,
+        )
+        p2 = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                FIVE_REVISIONS_WORKER_CODE,
+                self.base_url,
+                str(self.workspace_dir),
+                str(self.journal_path),
+                str(self.barrier_dir),
+                "2",
+                json.dumps(p2_revisions),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.env,
+        )
+
+        out1, err1 = p1.communicate(timeout=35)
+        out2, err2 = p2.communicate(timeout=35)
+
+        self.assertEqual(p1.returncode, 0, f"Process 1 failed: {err1}\n{out1}")
+        self.assertEqual(p2.returncode, 0, f"Process 2 failed: {err2}\n{out2}")
+
+        m1 = re.search(r"FIVE_REV_RESULT:(.*)", out1)
+        m2 = re.search(r"FIVE_REV_RESULT:(.*)", out2)
+        self.assertIsNotNone(m1, f"Missing FIVE_REV_RESULT in process 1 output: {out1}")
+        self.assertIsNotNone(m2, f"Missing FIVE_REV_RESULT in process 2 output: {out2}")
+
+        res1 = json.loads(m1.group(1))
+        res2 = json.loads(m2.group(1))
+        self.assertEqual(len(res1), 3)
+        self.assertEqual(len(res2), 3)
+
+        # 3. Verify PublicationManifest v2 has all 5 distinct revisions and repeating E was idempotent (exactly 5 total, not 6)
+        manifest_path = self.workspace_dir / "projects" / "vision-research" / "runs" / "experiment-001" / "manifest.json"
+        self.assertTrue(manifest_path.exists(), f"Manifest file missing: {manifest_path}")
+
+        manifest = PublicationManifest.load(manifest_path)
+        self.assertEqual(len(manifest.artifacts), 5, f"Expected exactly 5 revisions in manifest, got {len(manifest.artifacts)}")
+
+        recorded_shas = {art.get("sha256") for art in manifest.artifacts.values()}
+        self.assertEqual(recorded_shas, all_shas, "Recorded revisions SHA256 set does not match expected 5 revisions")
+
+        # 4. Check that all 5 revisions have remote file IDs in Drive and can be retrieved with matching SHA256
+        data_by_sha = {
+            sha_a: data_a,
+            sha_b: data_b,
+            sha_c: data_c,
+            sha_d: data_d,
+            sha_e: data_e,
+        }
+
+        with self.drive_server.lock:
+            committed_fids = set(self.drive_server.committed_checkpoints.keys())
+            # Verify that all 5 committed checkpoint files have appProperties recorded on the loopback server!
+            self.assertEqual(len(self.drive_server.committed_checkpoints), 5)
+            for fid_ck, meta_ck in self.drive_server.committed_checkpoints.items():
+                self.assertIn("appProperties", meta_ck, f"File {fid_ck} missing appProperties on loopback server")
+                self.assertIsInstance(meta_ck["appProperties"], dict)
+                self.assertTrue(
+                    bool(meta_ck["appProperties"]),
+                    f"File {fid_ck} appProperties empty: {meta_ck}",
+                )
+
+        for art_id, art in manifest.artifacts.items():
+            fid = art.get("remote_file_id")
+            art_sha = art.get("sha256")
+            self.assertTrue(fid, f"Artifact {art_id} has no remote_file_id")
+            self.assertIn(fid, committed_fids, f"Remote file {fid} not in committed checkpoints")
+
+            # Retrieve file bytes from mock server and verify SHA256
+            req = urllib.request.Request(f"{self.base_url}/drive/v3/files/{fid}?alt=media")
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+                downloaded_bytes = resp.read()
+                self.assertEqual(downloaded_bytes, data_by_sha[art_sha])
+                self.assertEqual(hashlib.sha256(downloaded_bytes).hexdigest(), art_sha)
+
+        # 5. Zero orphaned .tmp files
+        tmp_files = list(self.workspace_dir.glob("**/*.tmp*"))
+        self.assertEqual(len(tmp_files), 0, f"Orphaned .tmp files found: {tmp_files}")
+
+    test_five_checkpoint_revisions_preserved_across_drive_manifest_api_and_dom = test_two_os_processes_five_revisions_publication_and_idempotency
 
 
 if __name__ == "__main__":

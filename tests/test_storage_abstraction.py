@@ -2,6 +2,7 @@
 
 Part of Colab V2 Cross-Device Workspaces & Google Drive (Issue #21).
 """
+import hashlib
 import json
 import os
 import shutil
@@ -19,6 +20,7 @@ from colab_adapter.errors import (
     ArtifactValidationError,
     InvalidStateTransitionError,
     JournalCorruptionError,
+    StorageError,
 )
 from colab_adapter.monitor.collector import AccountUsageCollector
 from colab_adapter.storage import (
@@ -826,6 +828,629 @@ class TestStorageAbstraction(unittest.TestCase):
         arts = loaded.list_artifacts()
         self.assertEqual(len(arts), 1)
         self.assertEqual(arts[0].artifact_id, expected_rev_id)
+
+    def test_local_store_retrieve_tampered_size_mismatch_and_dest_preservation(self):
+        """Section 6: Tampered artifact size mismatch raises ArtifactValidationError with details, cleans up part file, and preserves dest."""
+        src = Path(self.test_dir) / "source_weights.bin"
+        payload = b"ORIGINAL_100_BYTES_OF_DATA_" + b"0" * 73
+        self.assertEqual(len(payload), 100)
+        src.write_bytes(payload)
+
+        stored = self.store.publish(
+            source=src,
+            project_id="tamper_proj",
+            run_id="run_tamper",
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+
+        dest = Path(self.test_dir) / "output_dest" / "weights.bin"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        pre_existing_data = b"PRE_EXISTING_VALID_DEST_CONTENT_SHOULD_REMAIN_UNTOUCHED"
+        dest.write_bytes(pre_existing_data)
+
+        stored_file = Path(stored.path)
+        self.assertTrue(stored_file.exists())
+
+        # 1. Tamper to be SMALLER than recorded size (50 bytes vs 100 bytes)
+        stored_file.write_bytes(b"S" * 50)
+        with self.assertRaises(ArtifactValidationError) as ctx_smaller:
+            self.store.retrieve(stored.artifact_id, dest)
+
+        err_smaller = ctx_smaller.exception
+        self.assertEqual(err_smaller.details.get("recorded_size"), 100)
+        self.assertEqual(err_smaller.details.get("actual_size"), 50)
+        self.assertEqual(err_smaller.details.get("expected_size"), 100)
+        self.assertEqual(err_smaller.details.get("artifact_id"), stored.artifact_id)
+        self.assertIn("100", str(err_smaller))
+        self.assertIn("50", str(err_smaller))
+        # Verify pre-existing valid file at dest remains completely untouched
+        self.assertEqual(dest.read_bytes(), pre_existing_data)
+        # Verify .part. temporary file was cleanly unlinked
+        part_files = list(dest.parent.glob("*.part.*"))
+        self.assertEqual(len(part_files), 0, f"Leaked part files: {part_files}")
+
+        # 2. Tamper to be LARGER than recorded size (200 bytes vs 100 bytes)
+        stored_file.write_bytes(b"L" * 200)
+        with self.assertRaises(ArtifactValidationError) as ctx_larger:
+            self.store.retrieve(stored.artifact_id, dest)
+
+        err_larger = ctx_larger.exception
+        self.assertEqual(err_larger.details.get("recorded_size"), 100)
+        self.assertEqual(err_larger.details.get("actual_size"), 200)
+        self.assertEqual(err_larger.details.get("expected_size"), 100)
+        self.assertEqual(err_larger.details.get("artifact_id"), stored.artifact_id)
+        self.assertIn("100", str(err_larger))
+        self.assertIn("200", str(err_larger))
+        self.assertEqual(dest.read_bytes(), pre_existing_data)
+        self.assertEqual(len(list(dest.parent.glob("*.part.*"))), 0)
+
+        # 3. Tamper with same size (100 bytes) but DIFFERENT SHA256
+        stored_file.write_bytes(b"D" * 100)
+        with self.assertRaises(ArtifactValidationError) as ctx_hash:
+            self.store.retrieve(stored.artifact_id, dest)
+
+        err_hash = ctx_hash.exception
+        self.assertEqual(err_hash.details.get("artifact_id"), stored.artifact_id)
+        self.assertEqual(dest.read_bytes(), pre_existing_data)
+        self.assertEqual(len(list(dest.parent.glob("*.part.*"))), 0)
+
+    def test_local_store_private_permissions_under_zero_umask(self):
+        """Section 6: Private local permissions under os.umask(0o000) enforce 0700 on dirs and 0600 on files."""
+        old_umask = os.umask(0o000)
+        try:
+            src = Path(self.test_dir) / "secure_weights.pt"
+            src.write_bytes(b"TOP_SECRET_MODEL_PARAMETERS")
+
+            stored = self.store.publish(
+                source=src,
+                project_id="priv_proj",
+                run_id="priv_run",
+                artifact_type=ArtifactType.CHECKPOINT.value,
+            )
+
+            stored_file = Path(stored.path)
+            rev_dir = stored_file.parent
+            revs_base = rev_dir.parent
+            latest_file = revs_base.parent / stored_file.name
+
+            # .revisions/<sha16> is 0700
+            self.assertEqual(stat.S_IMODE(rev_dir.stat().st_mode), 0o700)
+            # .revisions base is 0700
+            self.assertEqual(stat.S_IMODE(revs_base.stat().st_mode), 0o700)
+            # Stored revision file is 0600
+            self.assertEqual(stat.S_IMODE(stored_file.stat().st_mode), 0o600)
+            # Latest dest file is 0600
+            self.assertEqual(stat.S_IMODE(latest_file.stat().st_mode), 0o600)
+
+            # Manifest and backup file are 0600
+            manifest_path = self.artifacts_dir / "projects" / "priv_proj" / "runs" / "priv_run" / "manifest.json"
+            manifest_bak = Path(str(manifest_path) + ".bak")
+            self.assertTrue(manifest_path.exists())
+            self.assertTrue(manifest_bak.exists())
+            self.assertEqual(stat.S_IMODE(manifest_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(manifest_bak.stat().st_mode), 0o600)
+
+            # Retrieval part_file and dest also enforce 0600
+            dest_out = Path(self.test_dir) / "priv_retrieved.pt"
+            self.store.retrieve(stored.artifact_id, dest_out)
+            self.assertEqual(stat.S_IMODE(dest_out.stat().st_mode), 0o600)
+        finally:
+            os.umask(old_umask)
+
+    def test_local_store_symlink_and_non_regular_file_rejection(self):
+        """Section 6: LocalArtifactStore rejects symlinks and non-regular files during publish and retrieve."""
+        real_file = Path(self.test_dir) / "real_file.pt"
+        real_file.write_bytes(b"REAL_CONTENT")
+
+        # Symlink source to publish raises ArtifactValidationError
+        symlink_src = Path(self.test_dir) / "symlink_src.pt"
+        symlink_src.symlink_to(real_file)
+        with self.assertRaises(ArtifactValidationError):
+            self.store.publish(symlink_src, "p_link", "r_link")
+
+        # Directory source raises ArtifactValidationError
+        with self.assertRaises(ArtifactValidationError):
+            self.store.publish(self.test_dir, "p_link", "r_link")
+
+        # Publish real file successfully
+        stored = self.store.publish(real_file, "p_link", "r_link")
+
+        # Symlink destination in retrieve raises ArtifactValidationError
+        symlink_dest = Path(self.test_dir) / "symlink_dest.pt"
+        target_dest = Path(self.test_dir) / "target_dest.pt"
+        symlink_dest.symlink_to(target_dest)
+        with self.assertRaises(ArtifactValidationError):
+            self.store.retrieve(stored.artifact_id, symlink_dest)
+
+    def test_section_8_vision_research_5_revisions_history_and_migration_recovery(self):
+        """Section 8: 5-revision history A..E under vision-research / experiment-001 with migration, idempotence, and backup recovery."""
+        project_id = "vision-research"
+        run_id = "experiment-001"
+
+        # 5 distinct payloads for checkpoints/model.pt
+        payloads = [
+            b"VISION_RESEARCH_WEIGHTS_EPOCH_10_SHA_A",
+            b"VISION_RESEARCH_WEIGHTS_EPOCH_20_SHA_B_LARGER_BATCH",
+            b"VISION_RESEARCH_WEIGHTS_EPOCH_30_SHA_C_LEARNING_RATE_DECAY",
+            b"VISION_RESEARCH_WEIGHTS_EPOCH_40_SHA_D_STRUCTURED_PRUNING",
+            b"VISION_RESEARCH_WEIGHTS_EPOCH_50_SHA_E_FINAL_EXPORT",
+        ]
+
+        stored_revisions = []
+        for i, payload in enumerate(payloads):
+            stage_dir = Path(self.test_dir) / f"stage_{i}"
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            src_file = stage_dir / "model.pt"
+            src_file.write_bytes(payload)
+            stored = self.store.publish(
+                source=src_file,
+                project_id=project_id,
+                run_id=run_id,
+                artifact_type=ArtifactType.CHECKPOINT.value,
+                metadata={"epoch": (i + 1) * 10, "version_letter": chr(ord("A") + i)},
+            )
+            stored_revisions.append(stored)
+
+        rev_a, rev_b, rev_c, rev_d, rev_e = stored_revisions
+        hash_e = rev_e.sha256.lower()
+
+        # 1. Verify 5 distinct immutable revisions in PublicationManifest v2
+        manifest_path = self.artifacts_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+        manifest = PublicationManifest.load(manifest_path)
+        self.assertEqual(manifest.manifest_version, 2)
+        self.assertEqual(len(manifest.artifacts), 5)
+
+        # 2. Verify 5 independently addressable revision IDs
+        expected_ids = [
+            f"vision-research/experiment-001/checkpoints/model.pt@sha256_{r.sha256.lower()}"
+            for r in stored_revisions
+        ]
+        for rev, exp_id in zip(stored_revisions, expected_ids):
+            self.assertEqual(rev.artifact_id, exp_id)
+            self.assertIn(exp_id, manifest.artifacts)
+
+        self.assertEqual(len(set(expected_ids)), 5)
+
+        # 3. Complete manifest history (is_latest=False and superseded_by on A..D, is_latest=True on E)
+        rev_a_obj = manifest.get_artifact(rev_a.artifact_id)
+        rev_b_obj = manifest.get_artifact(rev_b.artifact_id)
+        rev_c_obj = manifest.get_artifact(rev_c.artifact_id)
+        rev_d_obj = manifest.get_artifact(rev_d.artifact_id)
+
+        self.assertEqual(rev_a_obj.superseded_by, rev_b.artifact_id)
+        self.assertEqual(rev_b_obj.superseded_by, rev_c.artifact_id)
+        self.assertEqual(rev_c_obj.superseded_by, rev_d.artifact_id)
+        self.assertEqual(rev_d_obj.superseded_by, rev_e.artifact_id)
+        self.assertNotEqual(rev_a_obj.superseded_by, rev_e.artifact_id)
+
+        for rev in [rev_a, rev_b, rev_c, rev_d]:
+            art_dict = manifest.artifacts[rev.artifact_id]
+            self.assertFalse(art_dict["is_latest"])
+            self.assertTrue(art_dict.get("superseded_by"))
+            art_obj = manifest.get_artifact(rev.artifact_id)
+            self.assertFalse(art_obj.is_latest)
+            self.assertTrue(art_obj.superseded_by)
+            self.assertTrue(art_obj.metadata.get("superseded_by"))
+            self.assertIs(type(art_obj.superseded_by), str)
+
+        # Revision E is latest
+        art_e_dict = manifest.artifacts[rev_e.artifact_id]
+        self.assertTrue(art_e_dict["is_latest"])
+        self.assertIsNone(art_e_dict.get("superseded_by"))
+        art_e_obj = manifest.get_artifact(rev_e.artifact_id)
+        self.assertTrue(art_e_obj.is_latest)
+        self.assertIsNone(art_e_obj.superseded_by)
+
+        # latest_by_path["checkpoints/model.pt"] is canonical str rev_e.artifact_id
+        self.assertIs(type(manifest.latest_by_path["checkpoints/model.pt"]), str)
+        self.assertEqual(manifest.latest_by_path["checkpoints/model.pt"], rev_e.artifact_id)
+        self.assertEqual(manifest.get_latest_revision_id("checkpoints/model.pt"), f"sha256_{hash_e}")
+        self.assertEqual(manifest.get_latest_sha256("checkpoints/model.pt"), hash_e)
+        latest_art = manifest.get_latest_artifact("checkpoints/model.pt")
+        self.assertIsNotNone(latest_art)
+        self.assertEqual(latest_art.artifact_id, rev_e.artifact_id)
+
+        # 4. No history loss after reloading store from disk (simulated restart)
+        reloaded_store = LocalArtifactStore(root_dir=self.artifacts_dir)
+        reloaded_manifest = reloaded_store._load_manifest(project_id, run_id)
+        self.assertEqual(len(reloaded_manifest.artifacts), 5)
+        self.assertEqual(reloaded_manifest.manifest_version, 2)
+        self.assertIs(type(reloaded_manifest.latest_by_path["checkpoints/model.pt"]), str)
+        self.assertEqual(reloaded_manifest.latest_by_path["checkpoints/model.pt"], rev_e.artifact_id)
+        self.assertEqual(reloaded_manifest.get_latest_revision_id("checkpoints/model.pt"), f"sha256_{hash_e}")
+        self.assertEqual(reloaded_manifest.get_latest_sha256("checkpoints/model.pt"), hash_e)
+
+        all_history = reloaded_store.list_artifacts(project_id, run_id, include_history=True)
+        self.assertEqual(len(all_history), 5)
+        latest_only = reloaded_store.list_artifacts(project_id, run_id, include_history=False)
+        self.assertEqual(len(latest_only), 1)
+        self.assertEqual(latest_only[0].artifact_id, rev_e.artifact_id)
+
+        # 5. All 5 revisions (A, B, C, D, E) are independently retrievable via store.retrieve(rev_id, dest) and match their original bytes and SHA256
+        for i, (rev, expected_payload) in enumerate(zip(stored_revisions, payloads)):
+            dest = Path(self.test_dir) / "retrievals" / f"retrieved_rev_{i}.pt"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            out = reloaded_store.retrieve(rev.artifact_id, dest)
+            self.assertTrue(out.exists())
+            self.assertEqual(out.read_bytes(), expected_payload)
+            self.assertEqual(compute_file_sha256(out), rev.sha256)
+
+        # Unversioned logical path retrieval returns Revision E
+        dest_latest = Path(self.test_dir) / "retrievals" / "retrieved_latest_model.pt"
+        out_latest = reloaded_store.retrieve(f"{project_id}/{run_id}/checkpoints/model.pt", dest_latest)
+        self.assertTrue(out_latest.exists())
+        self.assertEqual(out_latest.read_bytes(), payloads[4])
+        self.assertEqual(compute_file_sha256(out_latest), rev_e.sha256)
+
+        # 6. Repeating publication of version E (SHA256 E) is idempotent and does NOT create a 6th duplicate entry
+        repeat_src = Path(self.test_dir) / "stage_repeat_e" / "model.pt"
+        repeat_src.parent.mkdir(parents=True, exist_ok=True)
+        repeat_src.write_bytes(payloads[4])
+        repeat_stored = reloaded_store.publish(
+            source=repeat_src,
+            project_id=project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+            metadata={"epoch": 50, "note": "repeated publication"},
+        )
+        self.assertEqual(repeat_stored.artifact_id, rev_e.artifact_id)
+        manifest_after_repeat = reloaded_store._load_manifest(project_id, run_id)
+        self.assertEqual(len(manifest_after_repeat.artifacts), 5)
+        self.assertEqual(len(manifest_after_repeat.list_revisions("checkpoints/model.pt")), 5)
+
+        # 7. Manifest v1-to-v2 migration test: load a legacy v1 manifest JSON, verify it migrates to v2 cleanly without inventing unrecorded historical revisions or fake step numbers
+        v1_manifest = {
+            "project_id": "legacy_vision",
+            "run_id": "legacy_run_01",
+            "manifest_version": 1,
+            "artifacts": {
+                "legacy_vision/legacy_run_01/checkpoints/model.pt": {
+                    "artifact_id": "legacy_vision/legacy_run_01/checkpoints/model.pt",
+                    "storage_provider": "local",
+                    "path": "/some/path/model.pt",
+                    "size_bytes": 1024,
+                    "sha256": "aaaa0000bbbb1111cccc2222dddd3333aaaa0000bbbb1111cccc2222dddd3333",
+                    "project_id": "legacy_vision",
+                    "run_id": "legacy_run_01",
+                    "artifact_type": "checkpoint",
+                    "metadata": {"recorded_param": "val"},
+                }
+            },
+        }
+        v1_path = Path(self.test_dir) / "legacy_v1_manifest.json"
+        v1_path.write_text(json.dumps(v1_manifest, indent=2), encoding="utf-8")
+        migrated = PublicationManifest.load(v1_path)
+        self.assertEqual(migrated.manifest_version, 2)
+        # Verify it migrates cleanly to exactly 1 revision without inventing unrecorded historical revisions
+        self.assertEqual(len(migrated.artifacts), 1)
+        # Verify it preserves metadata without inventing fake step numbers
+        migrated_art = list(migrated.artifacts.values())[0]
+        self.assertNotIn("step", migrated_art.get("metadata", {}))
+        self.assertEqual(migrated_art["metadata"]["recorded_param"], "val")
+        self.assertEqual(
+            migrated.latest_by_path["checkpoints/model.pt"],
+            "legacy_vision/legacy_run_01/checkpoints/model.pt@sha256_aaaa0000bbbb1111cccc2222dddd3333aaaa0000bbbb1111cccc2222dddd3333",
+        )
+        self.assertGreaterEqual(len(migrated.migration_notes), 1)
+
+        # 8. Corrupted manifest.json with valid manifest.json.bak recovers all 5 revisions cleanly
+        bak_path = Path(str(manifest_path) + ".bak")
+        self.assertTrue(manifest_path.exists())
+        self.assertTrue(bak_path.exists())
+
+        # Corrupt primary manifest.json with malformed JSON
+        manifest_path.write_text("{\"project_id\": \"vision-research\", broken json [[")
+
+        # allow_backup_recovery=False strictly raises StorageError
+        with self.assertRaises(StorageError):
+            PublicationManifest.load(manifest_path, allow_backup_recovery=False)
+
+        # allow_backup_recovery=True recovers all 5 revisions cleanly from .bak
+        recovered = PublicationManifest.load(manifest_path, allow_backup_recovery=True)
+        self.assertEqual(recovered.manifest_version, 2)
+        self.assertEqual(len(recovered.artifacts), 5)
+        for exp_id in expected_ids:
+            self.assertIn(exp_id, recovered.artifacts)
+        self.assertIs(type(recovered.latest_by_path["checkpoints/model.pt"]), str)
+        self.assertEqual(recovered.latest_by_path["checkpoints/model.pt"], rev_e.artifact_id)
+        self.assertEqual(recovered.get_latest_revision_id("checkpoints/model.pt"), f"sha256_{hash_e}")
+        self.assertEqual(recovered.get_latest_sha256("checkpoints/model.pt"), hash_e)
+        self.assertTrue(any("recovered" in note.lower() for note in recovered.migration_notes))
+
+        # Also verify LocalArtifactStore._load_manifest recovers when manifest.json is corrupted
+        store_recovered_manifest = reloaded_store._load_manifest(project_id, run_id)
+        self.assertEqual(len(store_recovered_manifest.artifacts), 5)
+
+        # Also verify LocalArtifactStore._load_manifest recovers when manifest.json is deleted
+        manifest_path.unlink()
+        self.assertFalse(manifest_path.exists())
+        self.assertTrue(bak_path.exists())
+        store_deleted_recovered = reloaded_store._load_manifest(project_id, run_id)
+        self.assertEqual(len(store_deleted_recovered.artifacts), 5)
+
+    def test_canonical_revision_identity_and_chain_semantics(self):
+        """Verify Finding F1 fix:
+        1. Removal of RevisionRef; plain immutable Python str used everywhere.
+        2. Strict immediate-successor superseded_by chain semantics (A->B->C and A->B->C->D->E).
+        3. A.superseded_by is never conflated with the latest revision tip E.
+        4. Python equality, symmetry, transitivity, and hash() invariants.
+        5. Set membership and dict key lookup integrity.
+        6. Manifest save/load and to_dict/from_dict round-trip preservation.
+        7. Explicit accessor methods get_latest_artifact, get_latest_revision_id, get_latest_sha256.
+        """
+        project_id = "test_f1_proj"
+        run_id = "test_f1_run"
+        manifest = PublicationManifest(project_id=project_id, run_id=run_id)
+
+        # Helper to create a StoredArtifact with distinct payload/hash
+        def _make_art(letter: str, payload_bytes: bytes) -> StoredArtifact:
+            sha = hashlib.sha256(payload_bytes).hexdigest()
+            art_id = format_revision_artifact_id(project_id, run_id, "checkpoints/model.pt", sha)
+            return StoredArtifact(
+                artifact_id=art_id,
+                storage_provider="local",
+                path=f"/fake/path/{letter}/model.pt",
+                size_bytes=len(payload_bytes),
+                sha256=sha,
+                project_id=project_id,
+                run_id=run_id,
+                artifact_type=ArtifactType.CHECKPOINT.value,
+                logical_path="checkpoints/model.pt",
+                metadata={"letter": letter},
+            )
+
+        art_a = _make_art("A", b"WEIGHTS_A_11111111")
+        art_b = _make_art("B", b"WEIGHTS_B_22222222")
+        art_c = _make_art("C", b"WEIGHTS_C_33333333")
+        art_d = _make_art("D", b"WEIGHTS_D_44444444")
+        art_e = _make_art("E", b"WEIGHTS_E_55555555")
+
+        # --- Phase 1: 3-revision progression A -> B -> C ---
+        manifest.add_artifact(art_a)
+        self.assertIs(type(manifest.latest_by_path["checkpoints/model.pt"]), str)
+        self.assertEqual(manifest.latest_by_path["checkpoints/model.pt"], art_a.artifact_id)
+        self.assertEqual(manifest.get_latest_revision_id("checkpoints/model.pt"), art_a.revision_id)
+        self.assertEqual(manifest.get_latest_sha256("checkpoints/model.pt"), art_a.sha256)
+        rec_a = manifest.get_artifact(art_a.artifact_id)
+        self.assertTrue(rec_a.is_latest)
+        self.assertIsNone(rec_a.superseded_by)
+
+        manifest.add_artifact(art_b)
+        rec_a = manifest.get_artifact(art_a.artifact_id)
+        rec_b = manifest.get_artifact(art_b.artifact_id)
+        self.assertFalse(rec_a.is_latest)
+        self.assertEqual(rec_a.superseded_by, art_b.artifact_id)
+        self.assertIs(type(rec_a.superseded_by), str)
+        self.assertTrue(rec_b.is_latest)
+        self.assertIsNone(rec_b.superseded_by)
+        self.assertEqual(manifest.latest_by_path["checkpoints/model.pt"], art_b.artifact_id)
+
+        manifest.add_artifact(art_c)
+        rec_a = manifest.get_artifact(art_a.artifact_id)
+        rec_b = manifest.get_artifact(art_b.artifact_id)
+        rec_c = manifest.get_artifact(art_c.artifact_id)
+        self.assertFalse(rec_a.is_latest)
+        # Critical: rec_a.superseded_by MUST STILL be art_b, NOT art_c!
+        self.assertEqual(rec_a.superseded_by, art_b.artifact_id)
+        self.assertNotEqual(rec_a.superseded_by, art_c.artifact_id)
+        self.assertFalse(rec_b.is_latest)
+        self.assertEqual(rec_b.superseded_by, art_c.artifact_id)
+        self.assertTrue(rec_c.is_latest)
+        self.assertIsNone(rec_c.superseded_by)
+        self.assertEqual(manifest.latest_by_path["checkpoints/model.pt"], art_c.artifact_id)
+
+        # --- Phase 2: Extend to 5-revision chain A -> B -> C -> D -> E ---
+        manifest.add_artifact(art_d)
+        manifest.add_artifact(art_e)
+
+        rec_a = manifest.get_artifact(art_a.artifact_id)
+        rec_b = manifest.get_artifact(art_b.artifact_id)
+        rec_c = manifest.get_artifact(art_c.artifact_id)
+        rec_d = manifest.get_artifact(art_d.artifact_id)
+        rec_e = manifest.get_artifact(art_e.artifact_id)
+
+        # Verify strict immediate-successor chain
+        self.assertEqual(rec_a.superseded_by, art_b.artifact_id)
+        self.assertEqual(rec_b.superseded_by, art_c.artifact_id)
+        self.assertEqual(rec_c.superseded_by, art_d.artifact_id)
+        self.assertEqual(rec_d.superseded_by, art_e.artifact_id)
+        self.assertIsNone(rec_e.superseded_by)
+
+        # Verify no conflation with latest tip
+        self.assertNotEqual(rec_a.superseded_by, art_e.artifact_id)
+        self.assertNotEqual(rec_b.superseded_by, art_e.artifact_id)
+        self.assertNotEqual(rec_c.superseded_by, art_e.artifact_id)
+
+        # Check types: NO RevisionRef subclass anywhere, strictly plain str or None
+        self.assertIs(type(manifest.latest_by_path["checkpoints/model.pt"]), str)
+        for rec in [rec_a, rec_b, rec_c, rec_d]:
+            self.assertIs(type(rec.superseded_by), str)
+            self.assertFalse(rec.is_latest)
+            self.assertEqual(rec.metadata.get("superseded_by"), rec.superseded_by)
+        self.assertIsNone(rec_e.superseded_by)
+        self.assertTrue(rec_e.is_latest)
+
+        # Verify accessors with varied input path normalization
+        for path_query in [
+            "checkpoints/model.pt",
+            "/checkpoints/model.pt",
+            f"{project_id}/{run_id}/checkpoints/model.pt",
+            f"/{project_id}/{run_id}/checkpoints/model.pt",
+            f"{project_id}/{run_id}/checkpoints/model.pt@sha256_unmatched",
+        ]:
+            latest_obj = manifest.get_latest_artifact(path_query)
+            self.assertIsNotNone(latest_obj, f"Failed for query: {path_query}")
+            self.assertEqual(latest_obj.artifact_id, art_e.artifact_id)
+            self.assertEqual(manifest.get_latest_revision_id(path_query), art_e.revision_id)
+            self.assertEqual(manifest.get_latest_sha256(path_query), art_e.sha256)
+
+        # Nonexistent path returns None
+        self.assertIsNone(manifest.get_latest_artifact("nonexistent/file.pt"))
+        self.assertIsNone(manifest.get_latest_revision_id("nonexistent/file.pt"))
+        self.assertIsNone(manifest.get_latest_sha256("nonexistent/file.pt"))
+
+        # --- Phase 3: Python equality, symmetry, transitivity, and hash() invariants ---
+        all_ids = [
+            art_a.artifact_id, art_b.artifact_id, art_c.artifact_id, art_d.artifact_id, art_e.artifact_id,
+            manifest.latest_by_path["checkpoints/model.pt"],
+            rec_a.superseded_by, rec_b.superseded_by, rec_c.superseded_by, rec_d.superseded_by,
+            f"sha256_{art_e.sha256}", art_e.sha256,
+        ]
+
+        for x in all_ids:
+            # Reflexivity
+            self.assertEqual(x, x)
+            # Type is plain str
+            self.assertIs(type(x), str)
+            for y in all_ids:
+                # Symmetry
+                self.assertEqual(x == y, y == x)
+                # Hash invariant: x == y implies hash(x) == hash(y)
+                if x == y:
+                    self.assertEqual(hash(x), hash(y))
+                for z in all_ids:
+                    # Transitivity: x == y and y == z implies x == z
+                    if (x == y) and (y == z):
+                        self.assertEqual(x, z)
+
+        # Explicitly verify NO magical equality between full artifact ID and short revision digests
+        self.assertNotEqual(manifest.latest_by_path["checkpoints/model.pt"], f"sha256_{art_e.sha256}")
+        self.assertNotEqual(manifest.latest_by_path["checkpoints/model.pt"], art_e.sha256)
+        self.assertNotEqual(rec_a.superseded_by, f"sha256_{art_b.sha256}")
+        self.assertNotEqual(rec_a.superseded_by, art_b.sha256)
+
+        # Set membership integrity
+        id_set = set(manifest.artifacts.keys())
+        self.assertEqual(len(id_set), 5)
+        self.assertIn(art_e.artifact_id, id_set)
+        self.assertIn(manifest.latest_by_path["checkpoints/model.pt"], id_set)
+        self.assertNotIn(f"sha256_{art_e.sha256}", id_set)
+        self.assertNotIn(art_e.sha256, id_set)
+
+        # Dict key lookup integrity
+        lookup_dict = {k: f"val_{i}" for i, k in enumerate(manifest.artifacts.keys())}
+        self.assertEqual(len(lookup_dict), 5)
+        self.assertEqual(lookup_dict[manifest.latest_by_path["checkpoints/model.pt"]], "val_4")
+        self.assertNotIn(f"sha256_{art_e.sha256}", lookup_dict)
+        self.assertNotIn(art_e.sha256, lookup_dict)
+
+        # --- Phase 4: Persistence and round-trip verification ---
+        save_path = Path(self.test_dir) / "f1_manifest_test.json"
+        manifest.save(save_path)
+
+        loaded_manifest = PublicationManifest.load(save_path)
+        deserialized_manifest = PublicationManifest.from_dict(manifest.to_dict())
+
+        for check_m in [loaded_manifest, deserialized_manifest]:
+            self.assertEqual(len(check_m.artifacts), 5)
+            self.assertIs(type(check_m.latest_by_path["checkpoints/model.pt"]), str)
+            self.assertEqual(check_m.latest_by_path["checkpoints/model.pt"], art_e.artifact_id)
+
+            c_a = check_m.get_artifact(art_a.artifact_id)
+            c_b = check_m.get_artifact(art_b.artifact_id)
+            c_c = check_m.get_artifact(art_c.artifact_id)
+            c_d = check_m.get_artifact(art_d.artifact_id)
+            c_e = check_m.get_artifact(art_e.artifact_id)
+
+            self.assertIs(type(c_a.superseded_by), str)
+            self.assertEqual(c_a.superseded_by, art_b.artifact_id)
+            self.assertEqual(c_b.superseded_by, art_c.artifact_id)
+            self.assertEqual(c_c.superseded_by, art_d.artifact_id)
+            self.assertEqual(c_d.superseded_by, art_e.artifact_id)
+            self.assertIsNone(c_e.superseded_by)
+
+            self.assertEqual(check_m.get_latest_revision_id("checkpoints/model.pt"), art_e.revision_id)
+            self.assertEqual(check_m.get_latest_sha256("checkpoints/model.pt"), art_e.sha256)
+            self.assertEqual(check_m.get_latest_artifact("checkpoints/model.pt").artifact_id, art_e.artifact_id)
+
+    def test_v1_to_v2_migration_chain_and_plain_str(self):
+        """Verify that migrating a legacy v1 manifest with multiple sequential revisions
+        enforces immediate successor chain semantics and plain str types for all keys and values.
+        """
+        sha_1 = "1111111111111111111111111111111111111111111111111111111111111111"
+        sha_2 = "2222222222222222222222222222222222222222222222222222222222222222"
+        sha_3 = "3333333333333333333333333333333333333333333333333333333333333333"
+
+        v1_data = {
+            "project_id": "legacy_chain",
+            "run_id": "run_chain",
+            "manifest_version": 1,
+            "artifacts": {
+                "legacy_chain/run_chain/checkpoints/model.pt": {
+                    "artifact_id": "legacy_chain/run_chain/checkpoints/model.pt",
+                    "storage_provider": "local",
+                    "path": "/storage/model_1.pt",
+                    "size_bytes": 100,
+                    "sha256": sha_1,
+                    "project_id": "legacy_chain",
+                    "run_id": "run_chain",
+                    "artifact_type": "checkpoint",
+                    "created_at": "2026-01-01T12:00:00Z",
+                },
+                "legacy_chain/run_chain/checkpoints/model.pt_v2": {
+                    "artifact_id": "legacy_chain/run_chain/checkpoints/model.pt",
+                    "storage_provider": "local",
+                    "path": "/storage/model_2.pt",
+                    "size_bytes": 200,
+                    "sha256": sha_2,
+                    "project_id": "legacy_chain",
+                    "run_id": "run_chain",
+                    "artifact_type": "checkpoint",
+                    "created_at": "2026-01-01T12:01:00Z",
+                },
+                "legacy_chain/run_chain/checkpoints/model.pt_v3": {
+                    "artifact_id": "legacy_chain/run_chain/checkpoints/model.pt",
+                    "storage_provider": "local",
+                    "path": "/storage/model_3.pt",
+                    "size_bytes": 300,
+                    "sha256": sha_3,
+                    "project_id": "legacy_chain",
+                    "run_id": "run_chain",
+                    "artifact_type": "checkpoint",
+                    "created_at": "2026-01-01T12:02:00Z",
+                },
+            },
+        }
+
+        migrated = PublicationManifest.from_dict(v1_data)
+        self.assertEqual(migrated.manifest_version, 2)
+        self.assertEqual(len(migrated.artifacts), 3)
+
+        expected_id_1 = f"legacy_chain/run_chain/checkpoints/model.pt@sha256_{sha_1}"
+        expected_id_2 = f"legacy_chain/run_chain/checkpoints/model.pt@sha256_{sha_2}"
+        expected_id_3 = f"legacy_chain/run_chain/checkpoints/model.pt@sha256_{sha_3}"
+
+        # All artifact keys are plain str
+        for k in migrated.artifacts.keys():
+            self.assertIs(type(k), str)
+
+        # latest_by_path is plain str
+        latest_id = migrated.latest_by_path["checkpoints/model.pt"]
+        self.assertIs(type(latest_id), str)
+        self.assertEqual(latest_id, expected_id_3)
+
+        art_1 = migrated.get_artifact(expected_id_1)
+        art_2 = migrated.get_artifact(expected_id_2)
+        art_3 = migrated.get_artifact(expected_id_3)
+
+        self.assertFalse(art_1.is_latest)
+        self.assertEqual(art_1.superseded_by, expected_id_2)
+        self.assertIs(type(art_1.superseded_by), str)
+
+        self.assertFalse(art_2.is_latest)
+        self.assertEqual(art_2.superseded_by, expected_id_3)
+        self.assertIs(type(art_2.superseded_by), str)
+
+        self.assertTrue(art_3.is_latest)
+        self.assertIsNone(art_3.superseded_by)
+
+        # No conflation of art_1.superseded_by with latest tip expected_id_3
+        self.assertNotEqual(art_1.superseded_by, expected_id_3)
+
+        # Accessors work as expected on migrated manifest
+        self.assertEqual(migrated.get_latest_artifact("checkpoints/model.pt").artifact_id, expected_id_3)
+        self.assertEqual(migrated.get_latest_revision_id("checkpoints/model.pt"), f"sha256_{sha_3}")
+        self.assertEqual(migrated.get_latest_sha256("checkpoints/model.pt"), sha_3)
 
 
 

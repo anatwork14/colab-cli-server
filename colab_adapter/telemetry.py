@@ -128,8 +128,16 @@ class TelemetryEmitter:
 
         return sanitized
 
-    def get_events(self, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Read events from ledger, optionally filtering by run_id."""
+    def get_events(
+        self,
+        run_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read events from ledger, optionally filtering by run_id and/or project_id.
+
+        Records without a project_id never match a named project (they only appear
+        when no project_id filter is given).
+        """
         if not self.ledger_path.exists():
             return []
         events = []
@@ -141,8 +149,11 @@ class TelemetryEmitter:
                         continue
                     try:
                         record = json.loads(line)
-                        if run_id is None or record.get("run_id") == run_id:
-                            events.append(sanitize_data(record))
+                        if run_id is not None and record.get("run_id") != run_id:
+                            continue
+                        if project_id is not None and (record.get("project_id") or "") != project_id:
+                            continue
+                        events.append(sanitize_data(record))
                     except json.JSONDecodeError:
                         continue
         return events
