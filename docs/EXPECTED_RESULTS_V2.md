@@ -1,10 +1,10 @@
 # Expected Results, Metrics & Acceptance Matrix — V2
 
-> **Status:** Colab CLI Server V2 (M0–M8 & V2-Drive) was merged into `main` via **PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`)**. Issue #23 (`fix/v2-postmerge-hardening-23`) delivers post-merge hardening and a comprehensive 21-stage offline E2E verification test.
+> **Status:** Colab CLI Server V2 (M0–M8 & V2-Drive) was merged into `main` via **PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`)**. Issue #23 (`fix/v2-postmerge-hardening-23`) and Review `5642047783` (F1–F4) deliver post-merge hardening, 5-revision multi-epoch history, two-phase remote coordination, bounded pagination, catastrophic recovery, and comprehensive 21-stage + Section 9 offline E2E verification tests. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW`.
 >
 > **Release Categories:**
 > - **`OFFLINE_RELEASE_READY`**: Fully automated offline unit tests, integration tests, mock Drive uploads/downloads, mock Colab sessions, and headless Chromium browser tests passing 100% in CI without cloud credentials or compute charges.
-> - **`LIVE_VALIDATION_REQUIRES_APPROVAL`**: Live cloud GPU allocation and real Google Drive cloud API calls require explicit human operator approval, valid credentials, budget caps, and are executed manually using the smoke-test procedures below.
+> - **`LIVE_VALIDATION_REQUIRES_APPROVAL`**: Live cloud GPU allocation and real Google Drive cloud API calls require explicit human operator approval, valid credentials, budget caps, and are executed manually using the smoke-test procedures below. All human approval gates strictly preserved.
 
 ## User-visible outcomes (release G7)
 
@@ -36,6 +36,10 @@
 | Q16 | CLI machine format | Stable schema, deterministic ordering and nonzero error exits |
 | Q17 | Dry-run authorization | No TTY prompt or secret/OAuth read needed for local manifest validation |
 | Q18 | Version compatibility | stdlib adapter imports on Python 3.8; CI on 3.12/3.13; upstream separate Python >=3.12 |
+| Q32 | 5-revision checkpoint manifest history (F1) | 100% preservation of all 5 revisions in PublicationManifest v2 (`len(artifacts) == 5`), `is_latest` True only on head revision, immediate-successor `superseded_by` chain (`A -> B -> C -> D -> E -> None`), and `latest_by_path` pointing directly to head |
+| Q33 | Two-phase remote is_latest coordination (F2) | Drive uploads initialized with `is_latest="false"`, content verified, prior demoted and head promoted via Drive v3 `PATCH`; 0 unverified files promoted |
+| Q34 | Bounded pagination & strict listing errors (F3) | `pageSize=100`, bounded `max_list_pages=50`, `max_list_candidates=5000`, loop detection via visited ID tracking; 0 empty list `[]` fallback on HTTP/network errors |
+| Q35 | Catastrophic local state loss recovery (F4) | Exact historical retrieval via canonical `@sha256_<HASH>` succeeds; unversioned retrieval succeeds if and only if exactly 1 remote revision claims `is_latest="true"`, failing closed with `DriveIntegrityError` if 0 or >1 remote revisions claim `is_latest="true"` |
 
 **Sync byte accounting:** Q04 counts source payload bytes sent, not protocol headers, hashes or manifest metadata. Q05 deliberately measures *planned files* offline. Network benchmarks and speedup claims require a later, separately approved real run.
 

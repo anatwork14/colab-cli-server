@@ -43,7 +43,7 @@ See [agent setup steps](docs/AGENT_SETUP.md) and the [copyable prompt](docs/AGEN
 
 ## V2 project workspace operations and agent guidelines
 
-> **V2 Release Status:** Colab CLI Server V2 was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Post-merge hardening and end-to-end integration verification are tracked under Issue #23 (`fix/v2-postmerge-hardening-23`).
+> **V2 Release Status:** Colab CLI Server V2 was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Post-merge hardening and multi-revision catastrophic recovery (Review `5642047783` F1–F4) are delivered in **Issue #23 (`fix/v2-postmerge-hardening-23`)**. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW`. All human approval gates strictly preserved (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 
 V2 adds project workspace workflows (`python3 -m colab_adapter.cli project ...`) and compute monitoring (`python3 -m colab_adapter.cli monitor ...`). All autonomous agents operating in this repository or interacting with Colab must adhere to these rules:
 

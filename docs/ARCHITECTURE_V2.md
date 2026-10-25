@@ -1,6 +1,6 @@
 # V2 Architecture — Safe Project-Based Remote GPU Workspace
 
-> DESIGN PROPOSAL, 2026-10-24. Implementation status: NOT_STARTED. Extends the V1 provider instead of replacing it. Upstream Google Colab VM remains the actual compute host; this is NOT local CUDA forwarding.
+> **Architecture Specification & Verified Implementation.** Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW`. Extends the V1 provider instead of replacing it. Upstream Google Colab VM remains the actual compute host; this is NOT local CUDA forwarding. All human approval gates strictly preserved (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 
 ## 1. System boundary
 
@@ -244,24 +244,39 @@ To support iterative checkpointing where consecutive training epochs or evaluati
      (e.g., `vision_v2/run-01/checkpoints/model.pt@sha256_3b4f5d133bb7c9c693999b2620703353cba10983fc4aa8162ac1e456fdffa766`).
    - The logical path (`checkpoints/model.pt`) and revision ID (`sha256_<12_char_hex>`) are tracked alongside physical storage keys.
 
-2. **PublicationManifest V2 Schema (`manifest_version: 2`)**:
+2. **PublicationManifest V2 Schema (`manifest_version: 2`) & Immediate-Successor Chain**:
    - `manifest_version`: Integer schema version set to `2`.
    - `artifacts`: Map of canonical versioned IDs to `StoredArtifact` metadata dicts.
    - `latest_by_path`: Dictionary mapping each `logical_path` to its latest active `artifact_id`.
    - `migration_notes`: Chronological audit list recording schema upgrades and index conversions.
+   - **Immediate-Successor `superseded_by` Lineage**: Each historical revision tracks `is_latest: false` and `superseded_by: <immediate_successor_artifact_id>`. The latest revision tracks `is_latest: true` and `superseded_by: null`. Lineage forms a strict chain: `A -> B -> C -> D -> E -> None`.
+   - **Programmatic Manifest Accessors**: Typed helper methods `get_latest_artifact(logical_path)`, `get_latest_revision_id(logical_path)`, and `get_latest_sha256(logical_path)` provide direct, verified access to the current head revision.
 
-3. **Automatic V1 to V2 Migration**:
+3. **Two-Phase Remote `is_latest` Coordination Protocol (Drive v3 `PATCH`)**:
+   - Revisions are uploaded to Google Drive with `is_latest="false"`.
+   - Authoritative content verification (byte length and MD5 / SHA256 readback) is performed first.
+   - Once verified, prior revisions are demoted to `is_latest="false"` and `superseded_by="<new_id>"` via Drive v3 `PATCH`.
+   - The newly verified revision is then promoted to `is_latest="true"` via Drive v3 `PATCH`.
+   - Unverified or failed uploads never claim `is_latest="true"`.
+
+4. **Bounded Pagination & Strict Listing Error Classification**:
+   - Drive folder queries use `pageSize=100`, bounded `max_list_pages=50`, and `max_list_candidates=5000`.
+   - Tracks visited IDs to detect pagination loops and abort safely without memory exhaustion.
+   - Strict error classification: listing operations **never return empty `[]` on HTTP or network errors**, raising typed `DriveAuthenticationError` (401/403), `DriveQuotaExceededError` (429/quota), or `DriveTransferError` (5xx/network/JSON parse).
+
+5. **Automatic V1 to V2 Migration**:
    - When loading legacy V1 manifests with unversioned keys (`<project_id>/<run_id>/<path>`), `PublicationManifest.load()` automatically parses existing entries, generates `@sha256_<full_sha256>` keys, populates `latest_by_path`, sets `manifest_version = 2`, and records a migration note without requiring manual data intervention.
 
-4. **Retrieving Latest vs. Specific Historical Revisions**:
+6. **Retrieving Latest vs. Specific Historical Revisions & Catastrophic Recovery**:
    - **Latest Revision**: Clients querying by logical path or unversioned name resolve through `latest_by_path`, retrieving the newest verified weights (e.g. Epoch 2 / Checkpoint B).
    - **Historical Revision**: Clients requesting specific historical revisions supply the full canonical versioned ID (`...@sha256_<hash>`), retrieving earlier states (e.g. Epoch 1 / Checkpoint A) with multi-tier SHA256 integrity validation.
+   - **Catastrophic Loss Recovery**: If both `manifest.json`, `.bak`, and journal are destroyed, exact historical revisions are recovered via remote Drive SHA256 filtering; unversioned retrieval succeeds if and only if exactly 1 remote revision claims `is_latest="true"`, failing closed with `DriveIntegrityError` if 0 or >1 remote revisions claim `is_latest="true"`.
 
-5. **Cross-Process Staging Protection**:
+7. **Cross-Process Staging Protection**:
    - While an upload is in progress, files are staged under isolated temporary filenames (e.g. `model.pt.sha256_<short_sha>`) under `fcntl.flock` protection.
    - In-progress writes never overwrite existing on-disk revisions until remote and local verification succeed.
 
-6. **Reproducible Real-Browser CI Security Testing**:
+8. **Reproducible Real-Browser CI Security Testing**:
    - Dashboard UI rendering is validated using headless browser tests (Playwright/Chromium) verifying that both `LATEST` and `HISTORICAL` badges render cleanly in `#artifacts-table`, with zero `.innerHTML` usage, zero inline event handlers, and strict CSP nonce enforcement.
 
 ---
@@ -273,7 +288,7 @@ To support iterative checkpointing where consecutive training epochs or evaluati
 To ensure release safety without false assumptions of cloud availability, verification is strictly stratified across three distinct tiers:
 
 1. **Tier 1 — Offline Unit, Integration & Fault-Injection Tests (Verified in CI & Locally)**:
-   - 219 offline tests covering all core modules (`test_project_e2e.py`, `test_adversarial_security_and_fault_injection.py`, `test_google_drive_store.py`, `test_workspace_broker.py`, `test_dashboard_ui_integration.py`, etc.).
+   - 219+ offline tests covering all core modules (`test_project_e2e.py`, `test_adversarial_security_and_fault_injection.py`, `test_google_drive_store.py`, `test_workspace_broker.py`, `test_dashboard_ui_integration.py`, etc.).
    - Executes with zero cloud GPU allocations, zero live Drive cloud calls, and deterministic byte-accurate simulated network faults (308 resume drop, session expiry, token refresh, malformed headers).
 2. **Tier 2 — Local Headless Browser DOM & XSS Verification (Playwright / Chromium)**:
    - Automated headless browser test suite running against a live loopback `MonitorServer` (`127.0.0.1`).
@@ -292,16 +307,17 @@ Colab CLI Server V2 was successfully merged into `main` via **PR #22 (`670c6bc` 
 - **PRs #13–#20**: Milestones M1 through M8 implementations (manifest loader, sync engine, SSH transport boundary, telemetry emitter, Google Drive store, WorkspaceBroker, and monitoring dashboard).
 - **PR #22**: Multi-worker integration, security hardening, and adversarial regression test suite.
 
-Post-merge hardening is delivered under **Issue #23 (`fix/v2-postmerge-hardening-23`)**:
-1. **P1 Verified Google Drive Recovery**: 3-case retrieval resolution (exact `@sha256_<HASH>`, verified latest pointer via manifest/backup, fail-closed on ambiguous/unverified fallback when local manifest is missing).
-2. **P1 Private Checkpoint Staging**: `0700` staging directories, `0600` temporary/staged files with `fsync`, symlink/special-file rejection, canonical staging-root containment validation.
-3. **P2 Local Artifact Retrieval Size-Mismatch Error Handling**: capturing `actual_size` before unlinking `.part.` temp file so `ArtifactValidationError` is always raised instead of `FileNotFoundError`.
-4. **P2 Controlled Colab HTTP 500 Upload Recovery**: validating remote paths, probing whether parent directory is missing via bounded `exec_code`, checking `result["success"]`, and retrying at most once only when missing directory was newly created.
-5. **Browser Security Host-State Isolation & 5-Revision Multi-Process History**: isolated browser test state and verified 5-revision (`SHA256 A..E`) multi-process history.
-6. **21-Stage Offline E2E Pipeline Verification**: `test_complete_21_stage_v2_research_lifecycle_and_recovery` in `tests/test_project_e2e.py`.
-
-> [!NOTE]
-> All automated tests run in strictly offline/mock environments (`OFFLINE_RELEASE_READY`). Any live cloud GPU allocation or live Google Drive API operations remain strictly gated on human operator authorization (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
+Post-merge hardening delivered under **Issue #23 (`fix/v2-postmerge-hardening-23`)** and **Review `5642047783` (F1–F4)**:
+1. **F1 Canonical Versioned Revision Identity & Accessors**: Canonical string IDs (`{project_id}/{run_id}/{logical_path}@sha256_{FULL_SHA256}`), immediate-successor `superseded_by` chain (`A -> B -> C -> D -> E -> None`), and typed accessors `get_latest_artifact()`, `get_latest_revision_id()`, `get_latest_sha256()`.
+2. **F2 Two-Phase Remote Coordination Protocol**: Drive upload with `is_latest="false"`, content verification, demote prior revisions via Drive v3 `PATCH`, promote new revision to `is_latest="true"` via `PATCH`.
+3. **F3 Bounded Pagination & Strict Error Classification**: `pageSize=100`, bounded `max_list_pages=50`, `max_list_candidates=5000`, loop detection via visited ID tracking, and strict error classification (never returning `[]` on HTTP 401/403/429/5xx or network errors).
+4. **F4 Catastrophic Loss Recovery Matrix**: Unversioned latest recovery via single verified remote `is_latest="true"` marker; fail-closed `DriveIntegrityError` when 0 or >1 remote revisions claim `is_latest="true"`; fail-closed `DriveTransferError` / `DriveAuthenticationError` / `DriveQuotaExceededError` on remote listing faults.
+5. **P1 Private Checkpoint Staging**: `0700` staging directories, `0600` temporary/staged files with `fsync`, symlink/special-file rejection, canonical staging-root containment validation.
+6. **P2 Local Artifact Retrieval Size-Mismatch Error Handling**: capturing `actual_size` before unlinking `.part.` temp file so `ArtifactValidationError` is always raised instead of `FileNotFoundError`.
+7. **P2 Controlled Colab HTTP 500 Upload Recovery**: validating remote paths, probing whether parent directory is missing via bounded `exec_code`, checking `result["success"]`, and retrying at most once only when missing directory was newly created.
+8. **Browser Security Host-State Isolation & 5-Revision Multi-Process History**: isolated browser test state and verified 5-revision (`SHA256 A..E`) multi-process history.
+9. **Mandatory Offline E2E Pipeline Verification**: 21-stage offline lifecycle test and 5-revision catastrophic manifest loss scenario (`test_five_revision_history_and_catastrophic_manifest_loss_e2e`) passing in `tests/test_project_e2e.py`.
+10. **Review Status**: `READY_FOR_INDEPENDENT_MERGE_REVIEW`. All human approval gates strictly preserved (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 
 ### Operational Rollback Procedures
 

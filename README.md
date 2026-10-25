@@ -152,7 +152,7 @@ This wrapper and its documentation are licensed under [MIT](LICENSE). Google's `
 
 ## V2 — VKong-Inspired Project Workspaces and Training Monitor
 
-> **Status:** Colab CLI Server V2 (Milestones M1–M8, Google Drive Durable Storage & Cross-Device Workspaces) was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Post-merge hardening and end-to-end verification are delivered in **Issue #23 (`fix/v2-postmerge-hardening-23`)**.
+> **Status:** Colab CLI Server V2 (Milestones M1–M8, Google Drive Durable Storage & Cross-Device Workspaces) was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Post-merge hardening and multi-revision catastrophic recovery (Review `5642047783` F1–F4) are delivered in **Issue #23 (`fix/v2-postmerge-hardening-23`)**. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW`. All human approval gates strictly preserved.
 
 The V2 implementation extends the original one-shot adapter into a comprehensive project-centric remote GPU workspace system and real-time training monitor:
 
@@ -289,9 +289,9 @@ A step-by-step operator guide using strictly real, supported CLI commands (`pyth
     chmod 0600 ~/.config/colab-cli/drive_credentials.json
     ```
 16. **Multi-Revision Checkpoint Publishing**:
-    Publish successive training epochs (`model.pt`) to Google Drive; each revision is preserved under immutable `@sha256_<HASH>` identity in `PublicationManifest` v2.
+    Publish successive training epochs (`model.pt`) to Google Drive; each revision is preserved under immutable `@sha256_<HASH>` identity in `PublicationManifest` v2 with immediate-successor `superseded_by` chain (`A -> B -> C -> D -> E -> None`) and coordinated via two-phase Drive v3 `PATCH`.
 17. **Historical & Latest Checkpoint Recovery**:
-    Retrieve latest weights or a specific historical checkpoint revision (`@sha256_<HASH>`) with bitwise verification:
+    Retrieve latest weights via logical path or specific historical checkpoint revision (`@sha256_<HASH>`) with bitwise verification; catastrophic local state loss safely falls back to remote Drive listing with fail-closed integrity checks:
     ```bash
     python3 -c "from colab_adapter.storage import GoogleDriveArtifactStore, DriveCredentials; store = GoogleDriveArtifactStore(credentials_file='~/.config/colab-cli/drive_credentials.json'); store.retrieve('research-project/<run_id>/checkpoints/model.pt', './model_latest.pt')"
     ```

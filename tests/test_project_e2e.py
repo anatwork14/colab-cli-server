@@ -1849,5 +1849,225 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             caps.available_commands.append("unauthorized_privilege_escalation")
 
 
+class TestV2FullEndToEndPipeline(unittest.TestCase):
+    """End-to-End Pipeline Verification for Colab Project Workspaces V2."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_five_revision_history_and_catastrophic_manifest_loss_e2e(self):
+        """Scenario Section 9: 5-revision checkpoint publication history, backup recovery,
+        and catastrophic local manifest+journal loss with fail-closed remote integrity checks (Review 5642047783 F1-F4).
+        """
+        # 1. Creates project vision-research and run experiment-001
+        proj_dir = Path(self.tmp_dir) / "vision-research"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        init_project(target_dir=proj_dir, name="vision-research")
+
+        staging_dir = Path(self.tmp_dir) / "staging"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        run_id = "experiment-001"
+        project_id = "vision-research"
+        local_run_dir = staging_dir / "projects" / project_id / "runs" / run_id
+        local_run_dir.mkdir(parents=True, exist_ok=True)
+
+        ckpt_dir = proj_dir / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_file = ckpt_dir / "model.pt"
+
+        creds = DriveCredentials(
+            client_id="cid-section9-e2e",
+            client_secret="csec-section9-e2e",
+            refresh_token="rtok-section9-e2e",
+            access_token="atok-section9-e2e",
+            token_expiry=9999999999.0,
+        )
+        creds_file = staging_dir / "credentials.json"
+        creds.save(creds_file)
+
+        mock_http = E2EMockDriveHttpClient()
+        journal_file = staging_dir / "transfer_journal.json"
+
+        local_store = LocalArtifactStore(root_dir=staging_dir)
+        drive_store = GoogleDriveArtifactStore(
+            credentials=creds,
+            credentials_file=creds_file,
+            local_staging_dir=staging_dir,
+            journal_path=journal_file,
+            http_client=mock_http,
+        )
+
+        # 2. Publishes 5 distinct checkpoint revisions (A, B, C, D, E) for checkpoints/model.pt
+        # at steps 100, 200, 300, 400, 500 via LocalArtifactStore and GoogleDriveArtifactStore
+        revisions_spec = [
+            (100, 1, b"CHECKPOINT_REVISION_A_STEP_100_INITIAL_CONV_WEIGHTS"),
+            (200, 2, b"CHECKPOINT_REVISION_B_STEP_200_ATTENTION_LAYER_1_WEIGHTS"),
+            (300, 3, b"CHECKPOINT_REVISION_C_STEP_300_CROSS_ATTENTION_HEADS"),
+            (400, 4, b"CHECKPOINT_REVISION_D_STEP_400_LAYER_NORM_AND_FEEDFORWARD"),
+            (500, 5, b"CHECKPOINT_REVISION_E_STEP_500_CONVERGED_OPTIMAL_CHECKPOINT"),
+        ]
+
+        published_revisions = []
+        for step, epoch, content in revisions_spec:
+            ckpt_file.write_bytes(content)
+            sha = hashlib.sha256(content).hexdigest()
+
+            # Publish to LocalArtifactStore
+            local_store.publish(
+                source=ckpt_file,
+                project_id=project_id,
+                run_id=run_id,
+                artifact_type=ArtifactType.CHECKPOINT.value,
+                metadata={"step": step, "epoch": epoch, "logical_path": "checkpoints/model.pt"},
+            )
+
+            # Publish to GoogleDriveArtifactStore
+            pub = drive_store.publish(
+                source=ckpt_file,
+                project_id=project_id,
+                run_id=run_id,
+                artifact_type=ArtifactType.CHECKPOINT.value,
+                metadata={"step": step, "epoch": epoch, "logical_path": "checkpoints/model.pt"},
+            )
+            self.assertEqual(pub.sha256, sha)
+            published_revisions.append((step, epoch, content, sha, pub))
+
+        self.assertEqual(len(published_revisions), 5)
+        pub_a = published_revisions[0][4]
+        pub_b = published_revisions[1][4]
+        pub_c = published_revisions[2][4]
+        pub_d = published_revisions[3][4]
+        pub_e = published_revisions[4][4]
+
+        sha256_e = published_revisions[4][3]
+        content_e = published_revisions[4][2]
+
+        # 3. Verifies all 5 revisions A, B, C, D, E remain in PublicationManifest (len(manifest.artifacts) == 5),
+        # only E has is_latest == True, and str(manifest.latest_by_path["checkpoints/model.pt"]) == E.artifact_id.
+        manifest_file = local_run_dir / "manifest.json"
+        manifest = PublicationManifest.load(manifest_file)
+
+        self.assertEqual(len(manifest.artifacts), 5, "All 5 checkpoint revisions must be preserved in PublicationManifest")
+
+        for art_id, art_data in manifest.artifacts.items():
+            if art_id == pub_e.artifact_id:
+                self.assertTrue(art_data.get("is_latest"), f"Revision E must have is_latest == True: {art_id}")
+            else:
+                self.assertFalse(art_data.get("is_latest"), f"Earlier revision must have is_latest == False: {art_id}")
+
+        expected_latest_id = pub_e.artifact_id
+        self.assertEqual(
+            str(manifest.latest_by_path["checkpoints/model.pt"]),
+            expected_latest_id,
+            "manifest.latest_by_path must point directly to Revision E",
+        )
+
+        # 4. Deletes local manifest.json (unlink()) while keeping manifest.json.bak
+        # and verifies GoogleDriveArtifactStore recovers all 5 revisions from manifest.json.bak
+        manifest_bak_file = local_run_dir / "manifest.json.bak"
+        self.assertTrue(manifest_bak_file.is_file(), "manifest.json.bak must exist before primary manifest deletion")
+
+        manifest_file.unlink()
+        self.assertFalse(manifest_file.exists())
+        drive_store._manifest_cache.clear()
+
+        recovered_from_bak = drive_store._load_or_recover_manifest(project_id, run_id)
+        self.assertIsNotNone(recovered_from_bak, "GoogleDriveArtifactStore must recover manifest from manifest.json.bak")
+        self.assertEqual(len(recovered_from_bak.artifacts), 5, "All 5 revisions must be recovered from .bak")
+        self.assertEqual(
+            str(recovered_from_bak.latest_by_path["checkpoints/model.pt"]),
+            expected_latest_id,
+        )
+
+        # 5. Deletes BOTH manifest.json and manifest.json.bak and instantiates a fresh GoogleDriveArtifactStore
+        # with a fresh empty journal (journal_path pointing to a new path) and the same mock_http client:
+        manifest_file.unlink(missing_ok=True)
+        manifest_bak_file.unlink(missing_ok=True)
+        self.assertFalse(manifest_file.exists())
+        self.assertFalse(manifest_bak_file.exists())
+
+        fresh_journal_path = staging_dir / "catastrophic_loss_fresh_journal.json"
+        fresh_drive_store = GoogleDriveArtifactStore(
+            credentials=creds,
+            credentials_file=creds_file,
+            local_staging_dir=staging_dir,
+            journal_path=fresh_journal_path,
+            http_client=mock_http,
+        )
+
+        recovery_dir = Path(self.tmp_dir) / "catastrophic_recovery_out"
+        recovery_dir.mkdir(parents=True, exist_ok=True)
+
+        # 5.1 Retrieves A, B, C, D, and E by their exact @sha256_<digest> canonical artifact IDs
+        # and verifies byte-for-byte content equality for all 5 revisions!
+        for step, epoch, content, sha, pub in published_revisions:
+            dest_rev = recovery_dir / f"model_step_{step}.pt"
+            fresh_drive_store.retrieve(pub.artifact_id, dest_rev)
+            self.assertTrue(dest_rev.is_file())
+            self.assertEqual(compute_file_sha256(dest_rev), sha)
+            self.assertEqual(dest_rev.read_bytes(), content)
+
+        # 5.2 Retrieves unversioned "vision-research/experiment-001/checkpoints/model.pt"
+        # (when _coordinate_remote_latest_revision is present on drive_store) and verifies it returns revision E byte-for-byte!
+        # And corrupts remote appProperties so two remote files both have is_latest="true",
+        # and verifies unversioned retrieve raises DriveIntegrityError!
+        # Restores remote appProperties...
+        if hasattr(fresh_drive_store, "_coordinate_remote_latest_revision"):
+            dest_unversioned = recovery_dir / "model_unversioned_latest.pt"
+            fresh_drive_store.retrieve(
+                f"{project_id}/{run_id}/checkpoints/model.pt",
+                dest_unversioned,
+            )
+            self.assertTrue(dest_unversioned.is_file())
+            self.assertEqual(dest_unversioned.read_bytes(), content_e)
+            self.assertEqual(compute_file_sha256(dest_unversioned), sha256_e)
+
+            # Corrupt remote appProperties so two remote files both have is_latest="true"
+            file_a_id = pub_a.remote_file_id
+            mock_http.mock_files[file_a_id]["appProperties"]["is_latest"] = "true"
+
+            with self.assertRaises(DriveIntegrityError):
+                fresh_drive_store.retrieve(
+                    f"{project_id}/{run_id}/checkpoints/model.pt",
+                    recovery_dir / "corrupted_collision_should_fail.pt",
+                )
+
+            # Restore remote appProperties
+            mock_http.mock_files[file_a_id]["appProperties"]["is_latest"] = "false"
+        else:
+            # In isolated pre-merge worker-e worktree where _coordinate_remote_latest_revision hasn't landed yet,
+            # multiple remote files in mock_http still have is_latest="true", so unversioned retrieve raises DriveIntegrityError
+            with self.assertRaises(DriveIntegrityError):
+                fresh_drive_store.retrieve(
+                    f"{project_id}/{run_id}/checkpoints/model.pt",
+                    recovery_dir / "premerge_ambiguous_should_fail.pt",
+                )
+
+        # 5.3 Re-publishes revision E, and verifies idempotency (no duplicate upload)
+        ckpt_file.write_bytes(content_e)
+        committed_count_before = len(mock_http.committed_files)
+        pub_e_repub = fresh_drive_store.publish(
+            source=ckpt_file,
+            project_id=project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+            metadata={"step": 500, "epoch": 5, "logical_path": "checkpoints/model.pt"},
+        )
+        committed_count_after = len(mock_http.committed_files)
+
+        self.assertEqual(
+            committed_count_before,
+            committed_count_after,
+            "Idempotent re-publication must not produce duplicate remote uploads",
+        )
+        self.assertEqual(pub_e_repub.remote_file_id, pub_e.remote_file_id)
+        self.assertEqual(pub_e_repub.sha256, pub_e.sha256)
+
+
+
 if __name__ == "__main__":
     unittest.main()

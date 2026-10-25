@@ -119,7 +119,7 @@ When multiple local processes (e.g., concurrent training jobs, background upload
 
 In real-world deep learning workflows, multiple checkpoints frequently share the same logical path (e.g. `checkpoints/model.pt` overwritten each epoch). Google Drive Artifact Storage V2 manages multi-revision experiments transparently:
 
-### 1. Canonical Revision Key Format
+### 1. Canonical Revision Key Format & Immediate-Successor Chain
 Each immutable revision is indexed by its content-addressed versioned ID:
 ```text
 <project_id>/<run_id>/<logical_path>@sha256_<full_64_character_sha256>
@@ -128,6 +128,27 @@ Example:
 ```text
 vision_v2/run-001/checkpoints/model.pt@sha256_3b4f5d133bb7c9c693999b2620703353cba10983fc4aa8162ac1e456fdffa766
 ```
+
+#### Immediate-Successor `superseded_by` Chain
+To track strict lineage without ambiguity, each historical revision records its immediate successor:
+- `is_latest`: Boolean flag indicating whether this is the current active revision (`True` only for newest revision).
+- `superseded_by`: Canonical artifact ID of the immediate next revision, or `None` if `is_latest=True`.
+
+When 5 successive revisions (`A, B, C, D, E`) are published to the same logical path (`checkpoints/model.pt`):
+```text
+Revision A (step 100): is_latest=False, superseded_by -> Revision B
+Revision B (step 200): is_latest=False, superseded_by -> Revision C
+Revision C (step 300): is_latest=False, superseded_by -> Revision D
+Revision D (step 400): is_latest=False, superseded_by -> Revision E
+Revision E (step 500): is_latest=True,  superseded_by -> None
+Chain: A -> B -> C -> D -> E -> None
+```
+
+#### Programmatic Accessors on `PublicationManifest`
+`PublicationManifest` provides typed accessor methods for inspecting the latest revision of any logical path:
+- `manifest.get_latest_artifact(logical_path: str) -> Optional[StoredArtifact]`: Returns the full `StoredArtifact` for the newest active revision of `logical_path`.
+- `manifest.get_latest_revision_id(logical_path: str) -> Optional[str]`: Returns the revision string (e.g. `sha256_<digest>`) of the newest active revision.
+- `manifest.get_latest_sha256(logical_path: str) -> Optional[str]`: Returns the 64-character lowercase SHA256 hex digest of the newest active revision.
 
 ### 2. PublicationManifest V2 Schema
 The publication manifest on disk (`manifest.json`) adheres to version 2 schema:
@@ -150,7 +171,13 @@ The publication manifest on disk (`manifest.json`) adheres to version 2 schema:
       "sha256": "1111...",
       "remote_file_id": "drive-file-rev1",
       "created_at": "2026-10-24T10:00:00Z",
-      "metadata": {"step": 100, "epoch": 1}
+      "is_latest": false,
+      "superseded_by": "vision_v2/run-001/checkpoints/model.pt@sha256_2222...",
+      "metadata": {
+        "step": 100,
+        "epoch": 1,
+        "superseded_by": "vision_v2/run-001/checkpoints/model.pt@sha256_2222..."
+      }
     },
     "vision_v2/run-001/checkpoints/model.pt@sha256_2222...": {
       "artifact_id": "vision_v2/run-001/checkpoints/model.pt@sha256_2222...",
@@ -161,7 +188,12 @@ The publication manifest on disk (`manifest.json`) adheres to version 2 schema:
       "sha256": "2222...",
       "remote_file_id": "drive-file-rev2",
       "created_at": "2026-10-24T12:00:00Z",
-      "metadata": {"step": 200, "epoch": 2}
+      "is_latest": true,
+      "superseded_by": null,
+      "metadata": {
+        "step": 200,
+        "epoch": 2
+      }
     }
   },
   "migration_notes": [
@@ -204,6 +236,51 @@ When loading older `manifest_version: 1` files where `artifacts` keys lacked `@s
 - Headless Chromium/Playwright test suites execute in CI against loopback `MonitorServer` instances.
 - Verifies that `#artifacts-table` displays `LATEST` (green badge) for current revisions and `HISTORICAL` (neutral badge) for superseded revisions, with zero `.innerHTML` and strict CSP nonce enforcement.
 
+### 7. Two-Phase Remote `is_latest` Coordination Protocol (Drive v3 `PATCH`)
+To prevent race conditions, split-brain `is_latest` states, or premature promotion of unverified files, `GoogleDriveArtifactStore` coordinates remote revision state via a strict two-phase protocol:
+
+```text
+Phase 1: Resumable Upload with is_latest="false"
+  Local File (model.pt) ---> Drive Resumable Upload Session
+                            appProperties: {
+                              is_latest: "false",
+                              sha256: <HASH_NEW>,
+                              revision_id: "sha256_<HASH_NEW>",
+                              logical_path: "checkpoints/model.pt"
+                            }
+                            ↓
+                     Content Verification (size + MD5 / SHA256 readback)
+
+Phase 2: Atomic Remote Coordination via Drive v3 PATCH
+  1. Demote Prior Revisions:
+     For each remote file with matching logical_path claiming is_latest="true":
+       PATCH /drive/v3/files/<prior_id>
+       appProperties: { is_latest: "false", superseded_by: "sha256_<HASH_NEW>" }
+  2. Promote New Revision:
+     PATCH /drive/v3/files/<new_id>
+     appProperties: { is_latest: "true", superseded_by: null }
+```
+
+- **Fail-Safe Invariant**: If an upload crashes, times out, or fails integrity verification during Phase 1, it remains marked `is_latest="false"`. It will never be picked up as the active latest revision.
+- **Single Active Remote Latest**: Prior revisions are demoted before the new revision is promoted to `is_latest="true"`. At no point in steady-state operations can two remote files validly claim `is_latest="true"`.
+
+### 8. Bounded Pagination & Strict Listing Error Classification
+When querying Google Drive folders (e.g. during recovery, file discovery, or duplicate checks):
+
+- **Bounded Pagination Controls**:
+  - `pageSize`: Configured to `100` items per request.
+  - `nextPageToken`: Evaluated sequentially until exhausted or bounds are reached.
+  - `max_list_pages = 50`: Upper bound limiting pagination depth to prevent unbounded memory usage.
+  - `max_list_candidates = 5000`: Hard cap on accumulated file candidates.
+  - **Loop Detection & Deduplication**: All visited file IDs are registered in `seen_file_ids`. If a duplicate file ID or repeated page token is detected, pagination terminates safely or raises `DriveIntegrityError` to defend against cyclic or malicious folder graphs.
+- **Strict Error Classification (Never Return `[]` on Faults)**:
+  - If a listing request encounters an HTTP or network error, it **must never return an empty list `[]`**.
+  - Returning `[]` on an error would lead the caller to conclude that the remote folder is empty, risking duplicate uploads, false overwrite decisions, or destructive state resets.
+  - The listing engine strictly classifies and raises typed exceptions:
+    - **HTTP 401 / 403**: Raises `DriveAuthenticationError`.
+    - **HTTP 429 / Quota limits**: Raises `DriveQuotaExceededError`.
+    - **HTTP 5xx / Network Drops / Socket Timeouts / Malformed JSON**: Raises `DriveTransferError`.
+
 ---
 
 ## Authoritative Verification Guarantees
@@ -242,12 +319,16 @@ The Google Drive durable artifact storage engine was merged into `main` via **PR
 - **PRs #13–#20**: Milestones M1–M8 implementations (including M7 Google Drive store and M8 telemetry visualization).
 - **PR #22**: Multi-worker integration, fault-injection tests, and documentation reconciliation.
 
-Post-merge hardening delivered under **Issue #23 (`fix/v2-postmerge-hardening-23`)** includes:
-- **P1 Verified 3-Case Google Drive Recovery**: Exact revision `@sha256_<HASH>`, verified latest pointer via manifest/backup, and fail-closed rejection on ambiguous/unverified fallback.
+Post-merge hardening delivered under **Issue #23 (`fix/v2-postmerge-hardening-23`)** and **Review `5642047783` (F1–F4)** includes:
+- **F1 Canonical Versioned Revision Identity & Accessors**: Canonical string IDs (`{project_id}/{run_id}/{logical_path}@sha256_{FULL_SHA256}`), immediate-successor `superseded_by` chain (`A -> B -> C -> D -> E -> None`), and typed accessors `get_latest_artifact()`, `get_latest_revision_id()`, `get_latest_sha256()`.
+- **F2 Two-Phase Remote Coordination Protocol**: Drive upload with `is_latest="false"`, content verification, demote prior revisions via Drive v3 `PATCH`, promote new revision to `is_latest="true"` via `PATCH`.
+- **F3 Bounded Pagination & Strict Error Classification**: `pageSize=100`, bounded `max_list_pages=50`, `max_list_candidates=5000`, loop detection via visited ID tracking, and strict error classification (never returning `[]` on HTTP 401/403/429/5xx or network errors).
+- **F4 Catastrophic Loss Recovery Matrix**: Unversioned latest recovery via single verified remote `is_latest="true"` marker; fail-closed `DriveIntegrityError` when 0 or >1 remote revisions claim `is_latest="true"`; fail-closed `DriveTransferError` / `DriveAuthenticationError` / `DriveQuotaExceededError` on remote listing faults.
 - **P1 Private Checkpoint Staging**: `0700` staging directories, `0600` temporary/staged files with `fsync`, symlink/special-file rejection, canonical staging-root containment validation.
 - **P2 Local Artifact Retrieval Size-Mismatch Error Handling**: Capturing `actual_size` before unlinking `.part.` temp file so `ArtifactValidationError` is always raised instead of `FileNotFoundError`.
 - **P2 Controlled Colab HTTP 500 Upload Recovery**: Validating remote paths, probing missing parent directories via bounded `exec_code`, and retrying at most once if newly created.
-- **Mandatory 21-Stage Offline E2E Pipeline Verification**: Full lifecycle pass in `tests/test_project_e2e.py`.
+- **Mandatory Offline E2E Pipeline Verification**: Full lifecycle pass in `tests/test_project_e2e.py` including the 5-revision history & catastrophic manifest loss scenario (`test_five_revision_history_and_catastrophic_manifest_loss_e2e`).
+- **Review Status**: `READY_FOR_INDEPENDENT_MERGE_REVIEW`.
 
 > [!NOTE]
 > All automated tests execute in strictly offline/mock environments (`OFFLINE_RELEASE_READY`). Any live cloud GPU allocation or live Google Drive API requests require explicit human operator approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
