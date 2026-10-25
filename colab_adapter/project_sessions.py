@@ -8,6 +8,7 @@ import enum
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -25,6 +26,14 @@ from .errors import (
     RemoteExecutionError,
     SessionNotFoundError,
     UnmanagedSessionError,
+)
+from .approval import (
+    KIND_V2_UP,
+    ApprovalStore,
+    approvals_dir_for_registry,
+    digest_of,
+    ensure_global_cap,
+    v2_plan,
 )
 from .project_manifest import ProjectSpec
 from .provider import ApprovalRequiredError, ColabProcessLock, ManagedSessionRegistry
@@ -112,6 +121,7 @@ class ProjectSession:
     owner: str = "adapter"
     pid: int = field(default_factory=os.getpid)
     approved_fingerprint: Optional[str] = None
+    approval_id: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def transition_to(self, new_state: Union[ProjectSessionState, str], reason: Optional[str] = None) -> None:
@@ -167,7 +177,7 @@ class ProjectSession:
         valid_keys = {
             "session_id", "project_id", "project_name", "state", "accelerator",
             "created_at", "updated_at", "lease_seconds", "expires_at", "remote_root",
-            "owner", "pid", "approved_fingerprint", "metadata"
+            "owner", "pid", "approved_fingerprint", "approval_id", "metadata"
         }
         filtered = {k: v for k, v in data.items() if k in valid_keys}
         return cls(**filtered)
@@ -183,13 +193,13 @@ class ProjectSessionManager:
         transport: Optional[BaseTransport] = None,
         colab_binary: Optional[str] = None,
         run_cmd_fn: Optional[Callable[..., subprocess.CompletedProcess]] = None,
-        require_approval: bool = False,
     ):
         self.registry = registry or ManagedSessionRegistry()
         self.lock = lock or ColabProcessLock()
         self.colab_binary = colab_binary or "colab"
         self._run_cmd = run_cmd_fn or subprocess.run
-        self.require_approval = require_approval
+        # Allocation approval is always enforced inside up(); there is no constructor bypass.
+        self.approvals = ApprovalStore(approvals_dir_for_registry(self.registry))
         self.transport = transport or OfficialCliTransport(
             registry=self.registry,
             cli_path=self.colab_binary,
@@ -238,41 +248,115 @@ class ProjectSessionManager:
                         return session
         return None
 
+    def _v2_plan(self, spec: ProjectSpec) -> Dict[str, Any]:
+        return v2_plan(spec, self.colab_binary)
+
+    def _has_live_session(self, project_id: str, gpu: str) -> bool:
+        for info in self.registry.get_all_managed().values():
+            if info.get("project_id") == project_id and info.get("accelerator") == gpu:
+                if info.get("state") in (ProjectSessionState.READY.value, ProjectSessionState.RUNNING.value):
+                    if ProjectSession.from_dict(info).is_lease_active():
+                        return True
+        return False
+
+    def find_reusable_session(self, project_id: str, gpu: str, fingerprint: str) -> Optional[ProjectSession]:
+        """Return an active READY/RUNNING session only if project, GPU and plan fingerprint match exactly.
+
+        Legacy sessions without a recorded fingerprint are never reusable without a fresh approval.
+        """
+        for info in self.registry.get_all_managed().values():
+            if info.get("project_id") != project_id or info.get("accelerator") != gpu:
+                continue
+            if not info.get("approved_fingerprint") or info.get("approved_fingerprint") != fingerprint:
+                continue
+            if info.get("state") not in (ProjectSessionState.READY.value, ProjectSessionState.RUNNING.value):
+                continue
+            session = ProjectSession.from_dict(info)
+            if session.is_lease_active():
+                return session
+        return None
+
+    def request_approval(self, spec: ProjectSpec, lease_seconds: float = 3600.0) -> Dict[str, Any]:
+        """Write a pending approval for this exact plan. Agent-runnable: no cloud side effects."""
+        plan = self._v2_plan(spec)
+        lease = float(lease_seconds)
+        code = f"{secrets.token_hex(4)} {int(lease)}s"
+        summary = (
+            f"Allocate a {spec.gpu} Colab runtime for project '{spec.name}' "
+            f"(max lease {int(lease)}s); may consume Colab compute units."
+        )
+        return self.approvals.request(
+            kind=KIND_V2_UP,
+            plan=plan,
+            gpu=spec.gpu,
+            summary=summary,
+            phrase_code=code,
+            max_lease_seconds=lease,
+        )
+
+    def approve(self, approval_id: str) -> Dict[str, Any]:
+        """Operator step: confirm the pending approval at /dev/tty. Never called by agents."""
+        return self.approvals.approve(approval_id)
+
     def up(
         self,
         spec: ProjectSpec,
         lease_seconds: float = 3600.0,
         reuse_active: bool = True,
-        approval_token: Optional[str] = None,
+        approval_id: Optional[str] = None,
     ) -> ProjectSession:
-        """Provision or attach a session for the given project manifest under lock."""
+        """Provision or attach a session. A new allocation requires a valid, unconsumed approval.
+
+        Order inside the ColabProcessLock critical section: reuse check, global cap, approval
+        verify-and-consume (single use, before any CLI call), registry PROVISIONING intent, `colab new`.
+        """
+        if not (0 < float(lease_seconds) <= 86400.0):
+            raise ValueError("lease_seconds must be > 0 and <= 86400.")
         project_id = getattr(spec, "project_id", None) or f"proj-{spec.name}"
         gpu = getattr(spec, "gpu", "T4")
+        # Fail fast: without an approval, only an exact live session can be reused, so refuse before planning.
+        if not approval_id and not self._has_live_session(project_id, gpu):
+            raise ApprovalRequiredError(
+                f"A human-approved allocation record is required to allocate a {gpu} runtime for "
+                f"project '{spec.name}'. Run 'project approve-request', have the operator run "
+                "'project approve <id>', then pass --approval-id.",
+                reason="missing",
+            )
+        plan = self._v2_plan(spec)
+        fingerprint = plan["fingerprint"]
+        plan_digest = digest_of(plan)
 
-        # 1. Enforce explicit approval gate if enabled
-        if self.require_approval:
-            expected_prefix = f"ALLOCATE {gpu}"
-            if not approval_token or not approval_token.startswith(expected_prefix):
-                raise ApprovalRequiredError(
-                    f"Explicit approval token required to allocate {gpu} GPU. "
-                    f"Expected token starting with '{expected_prefix}', got '{approval_token}'."
-                )
-
-        # 2. Check if reusable active session exists
+        # Reuse of an exact, active match needs no approval and never calls `colab new`.
         if reuse_active:
-            existing = self.get_active_session_for_project(project_id)
+            existing = self.find_reusable_session(project_id, gpu, fingerprint)
             if existing is not None:
                 return existing
 
-        # 2. Acquire cross-process lock to prevent concurrent allocation
+        # Acquire cross-process lock to prevent concurrent allocation
         with self.lock:
-            # Re-check active session after lock acquisition
             if reuse_active:
-                existing = self.get_active_session_for_project(project_id)
+                existing = self.find_reusable_session(project_id, gpu, fingerprint)
                 if existing is not None:
                     return existing
 
+            if not approval_id:
+                raise ApprovalRequiredError(
+                    f"A human-approved allocation record is required to allocate a {gpu} runtime for "
+                    f"project '{spec.name}'. Run 'project approve-request', have the operator run "
+                    "'project approve <id>', then pass --approval-id.",
+                    reason="missing",
+                )
+            ensure_global_cap(self.registry)
+            self.approvals.verify_and_consume(
+                approval_id,
+                kind=KIND_V2_UP,
+                plan_digest=plan_digest,
+                lease_seconds=lease_seconds,
+            )
+
             session = self.plan_session(spec, lease_seconds=lease_seconds)
+            session.approved_fingerprint = fingerprint
+            session.approval_id = approval_id
             session_id = session.session_id
 
             # Register intent in registry BEFORE invoking CLI

@@ -36,6 +36,10 @@ from .tracker import ExperimentMetadata, ExperimentTracker, sanitize_text
 
 SUPPORTED_GPUS = ("T4", "L4", "G4", "A100", "H100")
 MAX_TIMEOUT_SECONDS = 86400.0  # 24 hours
+# Registry states that still hold (or may still hold) a billable Colab runtime.
+ACTIVE_MANAGED_STATES = frozenset({
+    "PROVISIONING", "READY", "RUNNING", "STOPPING", "ACTIVE", "INTERRUPTED", "NEEDS_RECONCILIATION",
+})
 
 
 class ColabProviderError(Exception):
@@ -63,7 +67,17 @@ class UnsupportedGPUError(ColabProviderError):
 
 
 class ApprovalRequiredError(ColabProviderError):
-    """Raised when job has not been explicitly authorized by a human."""
+    """Raised when job has not been explicitly authorized by a human.
+
+    ``reason`` is a short machine-readable code (for example ``missing``, ``expired``, ``consumed``).
+    """
+
+    def __init__(self, message: str = "Approval required.", reason: Optional[str] = None):
+        super().__init__(message)
+        self.reason = reason or "approval_required"
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"error": str(self), "reason": self.reason}
 
 
 class JobTamperedError(ColabProviderError):
@@ -382,7 +396,7 @@ class ManagedSessionRegistry:
             data = self._read_locked()
             return [
                 s_id for s_id, info in data.items()
-                if info.get("state") in ("PROVISIONING", "ACTIVE", "INTERRUPTED", "NEEDS_RECONCILIATION")
+                if info.get("state") in ACTIVE_MANAGED_STATES
             ]
 
     def get_all_managed(self) -> Dict[str, Any]:
@@ -446,6 +460,8 @@ class ApprovedJob:
     approved_by: str
     fingerprint: str
     approved_at: str
+    # Id of the operator-approved record; submit_job consumes it. Hand-built jobs without it are refused.
+    approval_id: Optional[str] = None
 
 
 @dataclass
@@ -687,40 +703,34 @@ class ColabGPUProvider:
         self.tracker.record_job(meta)
         return prepared
 
-    def approve_job_interactive(self, prepared_job: PreparedJob) -> ApprovedJob:
-        """Prompt human operator at interactive terminal to authorize provisioning.
+    def _approval_store(self):
+        from .approval import ApprovalStore, approvals_dir_for_registry  # local import: approval imports provider
+        return ApprovalStore(approvals_dir_for_registry(self.registry))
 
-        NOTE ON SECURITY ARCHITECTURE:
-        This interactive confirmation ensures human awareness and consent for ordinary operations.
-        It is a usability safeguard, not a cryptographic security boundary against untrusted local agents
-        sharing the same OS account. For autonomous workflows, deploy a separately protected approval executor.
+    def approve_job_interactive(self, prepared_job: PreparedJob) -> ApprovedJob:
+        """Create and grant a one-time approval record for this prepared job at the operator's terminal.
+
+        The phrase is read from /dev/tty (never piped stdin). The returned ApprovedJob carries the
+        approval id; ``submit_job`` consumes that record before any allocation. This is a human
+        safeguard: a process running as the same OS user can drive a pty (see colab_adapter/approval.py).
         """
-        if not sys.stdin.isatty():
-            raise ApprovalRequiredError(
-                "REFUSED: Colab GPU provisioning requires human authorization at an interactive terminal (stdin is not a tty)."
-            )
+        from .approval import KIND_V1_JOB, v1_job_plan
 
         gpu = prepared_job.spec.gpu.upper()
         nonce = prepared_job.approval_nonce
-        expected_phrase = f"ALLOCATE {gpu} {nonce}"
-
-        print(f"\n{'='*70}")
-        print("COLAB GPU ALLOCATION APPROVAL GATE")
-        print(f"Job ID:      {prepared_job.job_id}")
-        print(f"Project:     {prepared_job.spec.project_name}")
-        print(f"Script:      {prepared_job.spec.script_path}")
-        print(f"GPU:         {gpu} (May consume Colab compute units)")
-        print(f"Command:     {' '.join(prepared_job.command_preview)}")
-        print(f"{'='*70}")
-        print(f"To authorize allocation, enter exactly: {expected_phrase}")
-
-        try:
-            val = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            raise ApprovalRequiredError("Approval prompt aborted by user.")
-
-        if val != expected_phrase:
-            raise ApprovalRequiredError(f"Approval rejected: entered phrase did not match '{expected_phrase}'.")
+        store = self._approval_store()
+        summary = (
+            f"Colab {gpu} job {prepared_job.job_id} (project {prepared_job.spec.project_name}); "
+            f"may consume Colab compute units; command: {' '.join(prepared_job.command_preview)}"
+        )
+        record = store.request(
+            kind=KIND_V1_JOB,
+            plan=v1_job_plan(prepared_job),
+            gpu=gpu,
+            summary=summary,
+            phrase_code=nonce,
+        )
+        store.approve(record["approval_id"])
 
         now = datetime.now(timezone.utc).isoformat()
         return ApprovedJob(
@@ -729,6 +739,7 @@ class ColabGPUProvider:
             approved_by="human_terminal",
             fingerprint=prepared_job.fingerprint,
             approved_at=now,
+            approval_id=record["approval_id"],
         )
 
     def verify_job_integrity(self, approved_job: ApprovedJob) -> None:
@@ -799,6 +810,15 @@ class ColabGPUProvider:
 
             download_dir = Path(spec.output_download_dir or f"./colab_outputs/{job_id}").expanduser().resolve()
             download_dir.mkdir(parents=True, exist_ok=True)
+
+            # Shared global cap, then consume the single-use approval before any cloud allocation.
+            from .approval import KIND_V1_JOB, ensure_global_cap, v1_job_plan, digest_of
+            ensure_global_cap(self.registry)
+            self._approval_store().verify_and_consume(
+                approved_job.approval_id,
+                kind=KIND_V1_JOB,
+                plan_digest=digest_of(v1_job_plan(prep)),
+            )
 
             # Pre-register session in managed registry before invoking cloud allocation
             self.registry.register(session_id, job_id, gpu, spec.project_name)

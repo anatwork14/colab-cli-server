@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 # Support running directly or as a package module
 if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from colab_adapter.approval import GlobalCapExceededError
     from colab_adapter.artifacts import ArtifactManager
     from colab_adapter.errors import ColabProviderError, ColabV2Error
     from colab_adapter.monitor import start_monitor_server
@@ -32,6 +33,7 @@ if __package__ is None or __package__ == "":
     from colab_adapter.tracker import ExperimentTracker
     from colab_adapter.workspace import WorkspaceSyncEngine
 else:
+    from .approval import GlobalCapExceededError
     from .artifacts import ArtifactManager
     from .errors import ColabProviderError, ColabV2Error
     from .monitor import start_monitor_server
@@ -110,10 +112,31 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p.add_argument("--manifest", type=Path, default=None, help="Path to manifest file.")
     plan_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
 
+    # project approve-request (agent-runnable; writes a pending record, no cloud side effects)
+    areq_p = proj_subs.add_parser(
+        "approve-request",
+        help="Write a pending allocation approval for the manifest's exact plan (no cloud side effects).",
+    )
+    areq_p.add_argument("--manifest", type=Path, default=None, help="Path to manifest file.")
+    areq_p.add_argument("--lease-seconds", type=float, default=3600.0, help="Maximum lease the approval allows.")
+    areq_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
+
+    # project approve (operator step; reads the phrase from /dev/tty)
+    appr_p = proj_subs.add_parser(
+        "approve",
+        help="Operator step: type the approval phrase at the terminal (/dev/tty) to approve one request.",
+    )
+    appr_p.add_argument("approval_id", help="Approval id printed by 'project approve-request'.")
+    appr_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
+
     # project up
-    up_p = proj_subs.add_parser("up", help="Provision or attach a managed project session under lock.")
+    up_p = proj_subs.add_parser(
+        "up",
+        help="Provision or attach a managed project session. New allocations need --approval-id.",
+    )
     up_p.add_argument("--manifest", type=Path, default=None, help="Path to manifest file.")
     up_p.add_argument("--lease-seconds", type=float, default=3600.0, help="Lease duration in seconds.")
+    up_p.add_argument("--approval-id", default=None, help="Operator-approved id from 'project approve'.")
     up_p.add_argument("--no-reuse", action="store_true", help="Force provisioning a new session instead of reusing.")
     up_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
 
@@ -212,10 +235,40 @@ def handle_project_command(args: argparse.Namespace) -> int:
 
         mgr = ProjectSessionManager()
 
+        if action == "approve-request":
+            spec = load_manifest(manifest_path)
+            rec = mgr.request_approval(spec, lease_seconds=args.lease_seconds)
+            view = mgr.approvals.public_view(rec)
+            if is_json:
+                print(json.dumps(view, indent=2))
+            else:
+                print("Approval requested (pending; no Colab resources were allocated).")
+                print(f"Approval id:  {view['approval_id']}")
+                print(f"Summary:      {view['summary']}")
+                print(f"Expires at:   {view['expires_at']}")
+                print(f"Operator runs: python3 -m colab_adapter.cli project approve {view['approval_id']}")
+                print(f"Operator types: {view['phrase']}")
+            return 0
+
+        if action == "approve":
+            rec = mgr.approve(args.approval_id)
+            view = mgr.approvals.public_view(rec)
+            if is_json:
+                print(json.dumps(view, indent=2))
+            else:
+                print(f"Approved {view['approval_id']} (single use; expires at {view['expires_at']}).")
+                print(f"Next: python3 -m colab_adapter.cli project up --manifest <manifest> --approval-id {view['approval_id']}")
+            return 0
+
         if action == "up":
             spec = load_manifest(manifest_path)
             reuse = not getattr(args, "no_reuse", False)
-            session = mgr.up(spec, lease_seconds=args.lease_seconds, reuse_active=reuse)
+            session = mgr.up(
+                spec,
+                lease_seconds=args.lease_seconds,
+                reuse_active=reuse,
+                approval_id=getattr(args, "approval_id", None),
+            )
             if is_json:
                 print(json.dumps(session.to_dict(), indent=2))
             else:
@@ -281,6 +334,12 @@ def handle_project_command(args: argparse.Namespace) -> int:
                 print(f"Reconcile complete: stopped {len(rep['stopped'])}, failed {len(rep['failed'])}, active {len(rep['active'])}.")
             return 0
 
+    except ApprovalRequiredError as e:
+        print(json.dumps(e.to_dict(), indent=2), file=sys.stderr)
+        return 3
+    except GlobalCapExceededError as e:
+        print(json.dumps({"error": str(e), "reason": e.reason}, indent=2), file=sys.stderr)
+        return 4
     except ColabV2Error as e:
         if is_json:
             print(json.dumps(e.to_dict(), indent=2), file=sys.stderr)

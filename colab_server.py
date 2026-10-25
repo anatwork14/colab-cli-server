@@ -84,17 +84,46 @@ def render_plan(provider: str, script: Path, gpu: str, timeout: float) -> list[s
     return cmd
 
 
-def human_confirm(gpu: str) -> bool:
-    # Not a security boundary against malicious code sharing this OS identity.
-    if not sys.stdin.isatty():
-        print("REFUSED: provisioning needs a human at an interactive terminal.", file=sys.stderr)
-        return False
-    phrase = f"ALLOCATE {gpu}"
-    print(f"To authorize this specific runtime, enter exactly: {phrase}")
+def _state_registry():
+    """Managed-session registry whose directory also holds the approval records."""
+    from colab_adapter.provider import ManagedSessionRegistry
+
+    return ManagedSessionRegistry()
+
+
+def authorize_run(gpu: str, script: Path, timeout: float, auth: str) -> bool:
+    """Create, operator-approve (at /dev/tty) and consume a one-time record before `colab run`.
+
+    Not a security boundary against code running as this OS user; see colab_adapter/approval.py.
+    """
+    import hashlib
+
+    from colab_adapter.approval import ApprovalStore, KIND_SERVER_RUN, approvals_dir_for_registry, digest_of
+    from colab_adapter.provider import ApprovalRequiredError
+
+    plan = {
+        "schema": 1,
+        "kind": KIND_SERVER_RUN,
+        "gpu": gpu,
+        "auth": auth,
+        "script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+        "timeout": float(timeout),
+    }
+    store = ApprovalStore(approvals_dir_for_registry(_state_registry()))
     try:
-        return input("> ").strip() == phrase
-    except (EOFError, KeyboardInterrupt):
+        record = store.request(
+            kind=KIND_SERVER_RUN,
+            plan=plan,
+            gpu=gpu,
+            summary=f"colab run --gpu {gpu} for {script.name} (auth {auth})",
+            phrase_code="",
+        )
+        store.approve(record["approval_id"])
+        store.verify_and_consume(record["approval_id"], kind=KIND_SERVER_RUN, plan_digest=digest_of(plan))
+    except ApprovalRequiredError as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
         return False
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -118,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
     if not shutil.which("colab"):
         print("colab not found; run bash scripts/install.sh", file=sys.stderr)
         return 1
-    if not human_confirm(args.gpu):
+    if not authorize_run(args.gpu, script, args.timeout, args.auth):
         print("NOT APPROVED: no Colab allocation requested.", file=sys.stderr)
         return 3
     try:
