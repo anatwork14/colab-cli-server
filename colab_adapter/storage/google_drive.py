@@ -973,6 +973,13 @@ class GoogleDriveArtifactStore:
                 time.sleep(_backoff_delay(backoff, resp_headers))
                 backoff *= 2.0
                 continue
+            if status in (429, 500, 502, 503, 504):
+                # Session initiation creates no file until bytes are committed, so a bounded retry is safe.
+                if attempt == self.max_retries:
+                    break
+                time.sleep(_backoff_delay(backoff, resp_headers))
+                backoff *= 2.0
+                continue
             break
 
         if status != 200:

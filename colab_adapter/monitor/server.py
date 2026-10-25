@@ -302,7 +302,7 @@ if _EMBEDDED_HTML_DASHBOARD is None:
 _LOCAL_HASH_MAX_BYTES = 8 * 1024 * 1024
 
 # fullmatch (not match with "$") so a trailing newline is rejected; ASCII only.
-_IDENTIFIER_RE = re.compile(r"[a-zA-Z0-9_\-\.]{1,128}")
+_IDENTIFIER_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_\-\.]{0,127}")
 
 
 def _is_valid_identifier(value: Optional[str]) -> bool:
@@ -858,6 +858,10 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         for key in runs_map:
             run_id_counts[key[1]] = run_id_counts.get(key[1], 0) + 1
 
+        # A legacy keyless event stream must not appear as a phantom project next to a named owner of the run.
+        named_run_ids = {k[1] for k in runs_map if k[0]}
+        for legacy_key in [k for k in runs_map if not k[0] and k[1] in named_run_ids]:
+            del runs_map[legacy_key]
         ordered_keys = sorted(runs_map)
         for key in ordered_keys:
             run = runs_map[key]

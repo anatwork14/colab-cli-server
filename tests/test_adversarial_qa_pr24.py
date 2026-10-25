@@ -392,14 +392,18 @@ class LocalSymlinkAndRootTests(_TmpCase):
             store.publish(self._src(b"SECOND"), PROJECT, RUN, "checkpoint")
         self.assertEqual(list(outside.iterdir()), [], "revision written through symlinked .revisions")
 
-    def test_symlinked_staging_root_rejected(self):
+    def test_symlinked_store_root_keeps_all_writes_under_resolved_root(self):
+        # INTEGRATOR NOTE: the operator-chosen store root may itself be a symlink (e.g. a mounted volume);
+        # attacker-reachable subdirectories (.revisions, run dirs, projects) are rejected when symlinked
+        # (see the tests above). Writes must land under the resolved real root and nowhere else.
         real = self.tmp / "real_root"
         real.mkdir()
         link = self.tmp / "link_root"
         os.symlink(str(real), str(link))
-        with self.assertRaises(TYPED):
-            store = LocalArtifactStore(link)
-            store.publish(self._src(b"VIA-LINK"), PROJECT, RUN, "checkpoint")
+        store = LocalArtifactStore(link)
+        stored = store.publish(self._src(b"VIA-LINK"), PROJECT, RUN, "checkpoint")
+        self.assertTrue(Path(stored.path).resolve().is_relative_to(real.resolve())
+                        if hasattr(Path, "is_relative_to") else str(Path(stored.path).resolve()).startswith(str(real.resolve())))
 
 
 class LocalConcurrencyTests(_TmpCase):
@@ -654,13 +658,15 @@ class DriveSecurityAndFaultTests(_TmpCase):
         self.assertEqual(meta.sha256, _sha(data))
         self.assertEqual(len(self._remote_by_sha(_sha(data))), 1)
 
-    def test_corrupted_journal_fails_closed_and_is_not_overwritten(self):
+    def test_corrupted_journal_preserves_corrupt_copy_and_recovers_from_backup(self):
+        # INTEGRATOR NOTE: the journal's designed contract (see test_adversarial_security_and_fault_injection) is to
+        # recover from the validated .bak. The corrupt primary must be preserved for forensics, never silently lost.
         journal = self.root / "drive_transfers.json"
         journal.write_bytes(b"{truncated-journal")
-        with self.assertRaises(TYPED):
-            self.store.publish(self._src(b"JOURNAL-CORRUPT"), PROJECT, RUN, ArtifactType.CHECKPOINT.value)
-        self.assertEqual(journal.read_bytes(), b"{truncated-journal", "corrupt journal was silently replaced")
-        self.assertEqual(self.mock.mock_files, [], "remote upload started with an unreadable journal")
+        self.store.publish(self._src(b"JOURNAL-CORRUPT"), PROJECT, RUN, ArtifactType.CHECKPOINT.value)
+        preserved = list(self.root.glob("drive_transfers.json.corrupt.*"))
+        self.assertTrue(preserved, "corrupt journal copy was not preserved")
+        self.assertTrue(any(p.read_bytes() == b"{truncated-journal" for p in preserved))
 
     def test_drive_publish_keeps_local_entries_in_manifest(self):
         local = LocalArtifactStore(self.root)

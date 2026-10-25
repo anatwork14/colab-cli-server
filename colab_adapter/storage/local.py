@@ -721,6 +721,11 @@ class LocalArtifactStore:
         dest_dir = run_dir / lp_path.parent
         located = self._find_revision_file(dest_dir, lp_path.name, sha, verify=True)
         if located is None:
+            entry = manifest.artifacts.get(rev_id) or {}
+            if entry.get("storage_provider") not in (None, self.provider_name) and entry.get("remote_file_id"):
+                # Head was published by another provider (e.g. Drive) into the shared manifest: there are
+                # no local bytes, so return the manifest metadata only. The mutable alias is not touched.
+                return dataclasses.replace(StoredArtifact.from_dict(entry), is_latest=True)
             raise ArtifactNotFoundError(
                 f"Head revision file for {project_id}/{run_id}/{lp} is missing.",
                 details={"artifact_id": rev_id},
