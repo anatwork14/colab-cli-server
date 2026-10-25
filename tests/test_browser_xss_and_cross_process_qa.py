@@ -215,6 +215,7 @@ class LoopbackDriveHandler(http.server.BaseHTTPRequestHandler):
                     "buffer": bytearray(total_size),
                     "written": 0,
                     "committed": False,
+                    "appProperties": dict(meta.get("appProperties") or {}),
                 }
             session_url = f"http://127.0.0.1:{server.server_port}/upload/session/{sid}"
             self.send_response(200)
@@ -336,6 +337,7 @@ class LoopbackDriveHandler(http.server.BaseHTTPRequestHandler):
                         "md5Checksum": md5_hash,
                         "sha256": sha256_hash,
                         "parents": [folder_id],
+                        "appProperties": dict(session.get("appProperties") or {}),
                     }
                     server.committed_checkpoints[fid] = file_meta
                     server.committed_bytes[fid] = full_buf
@@ -406,7 +408,11 @@ class LoopbackDriveHandler(http.server.BaseHTTPRequestHandler):
                 if "application/vnd.google-apps.folder" in q_raw:
                     matching = [f for f in server.folders.values() if f.get("name") == target_name]
                 else:
-                    matching = [f for f in server.committed_checkpoints.values() if f.get("name") == target_name]
+                    matching = [
+                        {**f, "appProperties": f.get("appProperties", {})}
+                        for f in server.committed_checkpoints.values()
+                        if f.get("name") == target_name
+                    ]
 
             resp_body = json.dumps({"files": matching}).encode("utf-8")
             self.send_response(200)
@@ -415,6 +421,34 @@ class LoopbackDriveHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(resp_body)
             return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PATCH(self) -> None:
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b""
+        server: LoopbackDriveServer = self.server
+        m_fid = re.search(r"/drive/v3/files/([^/?]+)", self.path)
+        fid = m_fid.group(1) if m_fid else ""
+
+        with server.lock:
+            if fid in server.committed_checkpoints:
+                patch_meta = json.loads(body.decode("utf-8")) if body else {}
+                patch_props = patch_meta.get("appProperties") or {}
+                target_props = server.committed_checkpoints[fid].setdefault("appProperties", {})
+                for k, v in patch_props.items():
+                    if v is None:
+                        target_props.pop(k, None)
+                    else:
+                        target_props[k] = v
+                resp_body = json.dumps(server.committed_checkpoints[fid]).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.end_headers()
+                self.wfile.write(resp_body)
+                return
 
         self.send_response(404)
         self.end_headers()
@@ -2101,6 +2135,15 @@ class TestCrossProcessDrivePublication(unittest.TestCase):
 
         with self.drive_server.lock:
             committed_fids = set(self.drive_server.committed_checkpoints.keys())
+            # Verify that all 5 committed checkpoint files have appProperties recorded on the loopback server!
+            self.assertEqual(len(self.drive_server.committed_checkpoints), 5)
+            for fid_ck, meta_ck in self.drive_server.committed_checkpoints.items():
+                self.assertIn("appProperties", meta_ck, f"File {fid_ck} missing appProperties on loopback server")
+                self.assertIsInstance(meta_ck["appProperties"], dict)
+                self.assertTrue(
+                    bool(meta_ck["appProperties"]),
+                    f"File {fid_ck} appProperties empty: {meta_ck}",
+                )
 
         for art_id, art in manifest.artifacts.items():
             fid = art.get("remote_file_id")
@@ -2119,6 +2162,8 @@ class TestCrossProcessDrivePublication(unittest.TestCase):
         # 5. Zero orphaned .tmp files
         tmp_files = list(self.workspace_dir.glob("**/*.tmp*"))
         self.assertEqual(len(tmp_files), 0, f"Orphaned .tmp files found: {tmp_files}")
+
+    test_five_checkpoint_revisions_preserved_across_drive_manifest_api_and_dom = test_two_os_processes_five_revisions_publication_and_idempotency
 
 
 if __name__ == "__main__":
