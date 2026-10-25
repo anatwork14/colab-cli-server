@@ -2016,36 +2016,28 @@ class TestV2FullEndToEndPipeline(unittest.TestCase):
         # And corrupts remote appProperties so two remote files both have is_latest="true",
         # and verifies unversioned retrieve raises DriveIntegrityError!
         # Restores remote appProperties...
-        if hasattr(fresh_drive_store, "_coordinate_remote_latest_revision"):
-            dest_unversioned = recovery_dir / "model_unversioned_latest.pt"
+        dest_unversioned = recovery_dir / "model_unversioned_latest.pt"
+        fresh_drive_store.retrieve(
+            f"{project_id}/{run_id}/checkpoints/model.pt",
+            dest_unversioned,
+        )
+        self.assertTrue(dest_unversioned.is_file())
+        self.assertEqual(dest_unversioned.read_bytes(), content_e)
+        self.assertEqual(compute_file_sha256(dest_unversioned), sha256_e)
+
+        # Corrupt remote appProperties so two remote files both have is_latest="true"
+        file_a_id = pub_a.remote_file_id
+        mf_a = next(f for f in mock_http.mock_files if f.get("id") == file_a_id)
+        mf_a["appProperties"]["is_latest"] = "true"
+
+        with self.assertRaises(DriveIntegrityError):
             fresh_drive_store.retrieve(
                 f"{project_id}/{run_id}/checkpoints/model.pt",
-                dest_unversioned,
+                recovery_dir / "corrupted_collision_should_fail.pt",
             )
-            self.assertTrue(dest_unversioned.is_file())
-            self.assertEqual(dest_unversioned.read_bytes(), content_e)
-            self.assertEqual(compute_file_sha256(dest_unversioned), sha256_e)
 
-            # Corrupt remote appProperties so two remote files both have is_latest="true"
-            file_a_id = pub_a.remote_file_id
-            mock_http.mock_files[file_a_id]["appProperties"]["is_latest"] = "true"
-
-            with self.assertRaises(DriveIntegrityError):
-                fresh_drive_store.retrieve(
-                    f"{project_id}/{run_id}/checkpoints/model.pt",
-                    recovery_dir / "corrupted_collision_should_fail.pt",
-                )
-
-            # Restore remote appProperties
-            mock_http.mock_files[file_a_id]["appProperties"]["is_latest"] = "false"
-        else:
-            # In isolated pre-merge worker-e worktree where _coordinate_remote_latest_revision hasn't landed yet,
-            # multiple remote files in mock_http still have is_latest="true", so unversioned retrieve raises DriveIntegrityError
-            with self.assertRaises(DriveIntegrityError):
-                fresh_drive_store.retrieve(
-                    f"{project_id}/{run_id}/checkpoints/model.pt",
-                    recovery_dir / "premerge_ambiguous_should_fail.pt",
-                )
+        # Restore remote appProperties
+        mf_a["appProperties"]["is_latest"] = "false"
 
         # 5.3 Re-publishes revision E, and verifies idempotency (no duplicate upload)
         ckpt_file.write_bytes(content_e)
