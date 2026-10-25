@@ -79,7 +79,7 @@ python3 -m colab_adapter.cli usage
 python3 -m colab_adapter.cli sessions
 ```
 
-Record the output verbatim (CU balance, **`Active assignments: N` (the baseline; expected 0)**, and the list of existing sessions). The owner keeps the Colab web UI's runtime list open during the whole test so a stray runtime can be stopped by hand. Note any managed `live-smoke` session that already exists. Do not touch any session in this step.
+Record the output verbatim (CU balance, **`Active assignments: N` (the baseline; expected 0)**, and the list of existing sessions). The owner keeps the Colab web UI's runtime list open during the whole test so a stray runtime can be stopped by hand. **Hard rule: do not continue unless `Active assignments` is exactly 0 and `sessions` lists no runtime at all (no named session, no `[?]` line, no unmanaged runtime).** The failed-allocation proof is only sound against a clean account: with any other runtime present, an uncertain `up` failure cannot be told apart from a concurrent change. If the baseline is not clean, stop and ask the owner to stop those runtimes (the plan never touches them). Note any managed `live-smoke` session that already exists. Do not touch any session in this step.
 
 ### G3: approval and the single allocation
 
@@ -220,7 +220,8 @@ Any single failed check means the plan has not passed. Record the failure as a f
 Abort the plan, run teardown (section 6), and stop further steps when any of these happens:
 
 - `project up` yields more than one session, or a session that was not created by G3c.
-- `project up` fails after consuming the approval (do not request a second approval on your own; report to the owner).
+- `project up` fails after consuming the approval (do not request a second approval on your own; report to the owner). **Treat any nonzero exit of `project up` as a possible orphan runtime, not only exit 6** (an unexpected error that escapes before the record is settled exits 1 without the warning text): check `usage` Active assignments against the G2 baseline and the Colab UI before anything else.
+- The G2 baseline is not clean (`Active assignments` above 0, or any listed runtime).
 - G3d shows the lease guard is not alive.
 - `project up` is run again, or any step would allocate a second accelerator, or an approval is requested or used for a second allocation without a fresh owner instruction.
 - G4's `EXIT_CODE` is not 0 (2 means CUDA is missing), the `EXIT_CODE` line is missing, or the `GPU_PROBE_OK` marker is missing. (The adapter's own exit code is not the command's exit code.)

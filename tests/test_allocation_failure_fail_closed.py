@@ -321,8 +321,10 @@ class TestInterruptsAndCommitFailure(FailClosedFixture):
                 return real_commit(session)
 
             with mock.patch.object(mgr, "_commit_session", side_effect=flaky):
-                with self.assertRaises(OSError):
+                with self.assertRaises(AllocationError) as ctx:
                     mgr.up(self.spec, lease_seconds=900.0, approval_id=approval)
+            self.assertIn("POSSIBLE ORPHAN", str(ctx.exception))
+            self.assertTrue(ctx.exception.orphan_possible)
             rec = self.only_record()
             self.assertEqual(rec["state"], NR)
             self.assertTrue(rec["metadata"]["orphan_possible"])

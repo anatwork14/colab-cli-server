@@ -624,6 +624,11 @@ class ProjectSessionManager:
                 self._flag_orphan_risk(
                     session, f"READY could not be recorded ({type(exc).__name__}); a runtime was allocated"
                 )
+                if isinstance(exc, Exception):
+                    # Surface as an uncertain allocation (CLI exit 6 with the orphan warning), not a generic error.
+                    raise self._allocation_error(
+                        session_id, gpu, f"the READY state could not be recorded ({type(exc).__name__})", False
+                    ) from exc
                 raise
             if not committed:
                 raise self._allocation_error(
@@ -903,7 +908,8 @@ class ProjectSessionManager:
         if proven_empty:
             return (
                 f"Failed to allocate session '{session_id}' with accelerator '{gpu}': {err_msg} "
-                "(verified: no assignment remains)."
+                "(two consecutive server-side readings matched the pre-allocation baseline; this lowers the risk of an "
+                "orphan but is not an absolute guarantee, so still confirm `colab usage` and the Colab web UI)."
             )
         return (
             f"Allocation of session '{session_id}' ({gpu}) failed or is uncertain: {err_msg}. "
