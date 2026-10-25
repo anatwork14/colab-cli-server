@@ -144,8 +144,29 @@ The monitor server and web dashboard adhere to defense-in-depth principles:
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
   Referrer-Policy: no-referrer
-  Content-Security-Policy: default-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-<NONCE>'; style-src 'self' 'nonce-<NONCE>'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; img-src 'self' data:; connect-src 'self'
   ```
+
+### Dashboard XSS & CSP Security Architecture
+The monitoring UI renders potentially untrusted strings generated during remote training runs (arbitrary experiment names, log lines, traceback details, error messages, and artifact filenames). To guarantee complete immunity against Stored Cross-Site Scripting (XSS):
+1. **Zero Inline Event Handlers**:
+   - Zero inline event handler attributes (`onclick`, `oninput`, `onchange`, `onsubmit`, `onerror`, `onload`) exist anywhere in the served HTML or dynamic templates.
+   - All user interactions and event dispatchers are registered unobtrusively in JavaScript via `.addEventListener()`.
+2. **Safe Dynamic DOM Node Construction**:
+   - Zero unsafe `innerHTML` string interpolation is used for untrusted run/log/artifact/session data.
+   - Dynamic table rows, log consoles, KPI value blocks, and error callouts are constructed exclusively via `document.createElement()` and populated using `.textContent` or `document.createTextNode()`.
+3. **Per-Response Cryptographic CSP Nonces**:
+   - Every response dynamically generates a high-entropy CSP nonce (`secrets.token_urlsafe(16)`).
+   - Scripts and styles are permitted only if tagged with the matching cryptographic nonce (`<script nonce="...">`, `<style nonce="...">`).
+   - The permissive `'unsafe-inline'` keyword is completely removed from both `script-src` and `style-src` directives.
+   - Restrictive directives enforce strict boundaries: `object-src 'none'`, `base-uri 'none'`, and `frame-ancestors 'none'`.
+   - Asset routes `/monitor.js` and `/monitor.css` serve external static JavaScript and CSS resources.
+
+### Cross-Process Artifact Publication Atomicity Context
+When researchers inspect artifact publication progress via the dashboard (`/api/v1/runs/<run_id>/drive` or `/api/v1/runs/<run_id>/artifacts`):
+- The dashboard queries `PublicationManifest` and `TransferJournal` protected by OS-level `fcntl.flock` locks.
+- Status displays accurately reflect the single-host cross-process guarantees: per-artifact locks (`.transfer_locks/<id>.lock`), durable `TransferRecord` leases (`owner_pid`, `lease_token`, `lease_expires_at`, `fencing_epoch`), and dead-PID reclamation.
+- Artifact revision safety is guaranteed: identical files deduplicate across processes to a single Drive object, while modified content at the same filename publishes a new verified remote revision rather than displaying corrupt or stale SHA-256 hashes.
 
 ---
 
@@ -224,21 +245,58 @@ server {
 
 ---
 
-## 7. Verification & Offline Testing
+## 7. Verification Scope, PR Stack Status & Operational Rollback
 
-The dashboard UI and integration test suite run completely offline without cloud credentials or GPU allocation:
+### Three-Tier Verification Scope
 
-```bash
-# Run the complete test suite
-python3 -m unittest discover tests -v
+To validate dashboard functionality and security without premature assumptions of live cloud connectivity, verification is partitioned into three distinct tiers:
 
-# Run the dedicated dashboard UI integration test suite
-python3 -m unittest tests/test_dashboard_ui_integration.py -v
-```
+1. **Tier 1 — Offline Unit, Integration & Adversarial Fault-Injection Suite (Verified in CI & Locally)**:
+   - 219 offline tests passing across the test suite (`test_dashboard_ui_integration.py`, `test_monitor_backend.py`, `test_adversarial_security_and_fault_injection.py`, `test_project_e2e.py`).
+   - Validates HTML5/CSS3/SVG structure, viewport responsiveness, strict `sessionStorage` token management, total rejection of URL parameter tokens (`?token=...`), authenticated REST/SSE endpoints, and error-handling paths without live cloud VM or Google Drive credentials.
+2. **Tier 2 — Local Headless Browser DOM & XSS Verification (Playwright / Chromium)**:
+   - Executes automated browser tests using headless Chromium against a live loopback `MonitorServer` (`http://127.0.0.1:<PORT>`).
+   - Injects adversarial script payloads (`<script>alert(1)</script>`, `<img src=x onerror=...>`) into telemetry event streams and confirms zero script execution via strict CSP nonces and `.textContent` DOM population.
+   - Asserts visual rendering of KPI cards, SVG charts, mobile responsiveness breakpoints, and modal dialogs.
+3. **Tier 3 — Owner-Gated Live Environment Checks (Pending Final Owner Signoff)**:
+   - Verification requiring privileged external resources:
+     - Real Google OAuth credentials and live Google Drive API uploads.
+     - Actual Google Colab GPU runtime allocation consuming compute units.
+     - Production reverse-proxy deployment with valid external TLS certificates and trusted-proxy identity injection.
+   - Staged exclusively for production deployment after explicit owner authorization; never invoked during offline CI runs.
 
-All 9 integration tests verify:
-- HTML5/CSS3/SVG structure, responsiveness, and viewport configuration.
-- Strict token handling via `sessionStorage` and absence of URL parameter token extraction.
-- Presence of all required KPI cards, session tables, training tables, charts, and artifact views.
-- Full-stack REST/CSV conformance against `MonitorServer`, `AccountUsageCollector`, `ManagedSessionRegistry`, `TelemetryEmitter`, and `PublicationManifest`.
-- Honest reporting contracts (`No historical compute samples observed yet` and `GPU utilization: not measured`).
+### PR Review Stack Status
+
+The monitoring dashboard and associated V2 platform capabilities are staged across a reconciled review stack:
+- **PR #3**: Initial Project Workspace Architecture Proposal.
+- **PRs #13–#20**: Milestone M1–M8 implementations (including M8 dashboard backend and UI components).
+- **PR #22**: Multi-worker integration, comprehensive test expansion, and documentation reconciliation.
+
+> [!IMPORTANT]
+> PRs #3, #13–#20, and #22 form a reconciled review stack and **remain unmerged into `main`** pending final owner approval and completion of Tier 3 live environment checks.
+
+### Operational Rollback Instructions
+
+In the event of an operational issue or security regression in production or staging:
+
+1. **Terminate Active Daemon Processes**:
+   ```bash
+   # Stop the monitoring server daemon
+   kill $(pgrep -f "colab_adapter.monitor") 2>/dev/null || true
+   # Stop the workspace broker daemon
+   kill $(pgrep -f "colab_adapter.broker") 2>/dev/null || true
+   ```
+2. **Clean Stale Transfer Locks**:
+   ```bash
+   # Remove persistent OS-level lock files
+   rm -rf ./artifacts/.transfer_locks/*.lock
+   ```
+3. **Revert Git Working Tree**:
+   ```bash
+   # Revert to stable main branch or pre-V2 release tag
+   git checkout main
+   # Or create a rollback commit reverting the PR merge
+   git revert -m 1 <MERGE_COMMIT_SHA>
+   ```
+4. **Session Isolation**:
+   Because `MonitorServer` is strictly read-only and unmanaged sessions are safeguarded by `ManagedSessionRegistry`, stopping the dashboard has zero impact on active Colab runtimes.
