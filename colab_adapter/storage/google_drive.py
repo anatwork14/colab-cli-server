@@ -1737,6 +1737,28 @@ class GoogleDriveArtifactStore:
                 except OSError:
                     pass
 
+    def _conflicting_latest_requires_reconcile(
+        self, files: List[Dict[str, Any]], my_remote_id: str, my_sha256: str
+    ) -> bool:
+        """Return True if other files also claim latest AND it is safe to reconcile.
+
+        Reconciliation (demote others, keep this one) is only safe when every conflicting
+        'latest' file already names THIS revision as its immediate successor (i.e. an interrupted
+        demotion of an older revision). Any other contradiction (e.g. a newer unrelated head)
+        cannot be resolved from remote metadata alone: fail closed, never silently pick a head.
+        """
+        conflicts = [
+            f for f in files
+            if f.get("id") != my_remote_id and (f.get("appProperties") or {}).get("is_latest") == "true"
+        ]
+        for f in conflicts:
+            if successor_sha256(f.get("appProperties")) != my_sha256.lower():
+                raise DriveIntegrityError(
+                    "Contradictory remote latest markers: another revision claims latest and does not "
+                    "name this revision as its successor; refusing to choose a latest revision."
+                )
+        return bool(conflicts)
+
     def publish(
         self,
         source: Union[str, Path],
@@ -1875,9 +1897,8 @@ class GoogleDriveArtifactStore:
                     elif state == STATE_LATEST:
                         # Reconcile if another remote file is also marked latest (inconsistent remote state)
                         other_files = self._list_files_in_folder(src.name, target_folder_id)
-                        has_conflicting_latest = any(
-                            f.get("id") != record.remote_file_id and (f.get("appProperties") or {}).get("is_latest") == "true"
-                            for f in other_files
+                        has_conflicting_latest = self._conflicting_latest_requires_reconcile(
+                            other_files, record.remote_file_id, local_sha256
                         )
                         if has_conflicting_latest:
                             self._coordinate_remote_latest_revision(
@@ -2039,9 +2060,8 @@ class GoogleDriveArtifactStore:
                     elif state == STATE_LATEST:
                         # Reconcile if another remote file is also marked latest (inconsistent remote state)
                         other_files = self._list_files_in_folder(src.name, target_folder_id)
-                        has_conflicting_latest = any(
-                            f.get("id") != remote_id and (f.get("appProperties") or {}).get("is_latest") == "true"
-                            for f in other_files
+                        has_conflicting_latest = self._conflicting_latest_requires_reconcile(
+                            other_files, remote_id, local_sha256
                         )
                         if has_conflicting_latest:
                             self._coordinate_remote_latest_revision(
