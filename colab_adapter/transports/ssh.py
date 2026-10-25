@@ -122,3 +122,6 @@ class SshProxyTransport(BaseTransport):
             return True
         except Exception:
             return False
+
+
+GuardedSshTransport = SshProxyTransport

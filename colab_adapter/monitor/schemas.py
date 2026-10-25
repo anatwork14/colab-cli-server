@@ -66,9 +66,33 @@ class RunSummary:
     latest_step: Optional[int] = None
     latest_metrics: Dict[str, Any] = field(default_factory=dict)
     checkpoint_count: int = 0
+    latest_checkpoint_name: Optional[str] = None
+    latest_checkpoint_sha256: Optional[str] = None
+    drive_publication_status: str = "PENDING"
+    drive_file_id: Optional[str] = None
+    source_snapshot_available: bool = False
+    is_runtime_active: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class ArtifactDetail:
+    artifact_id: str
+    name: str
+    artifact_type: str
+    size_bytes: int
+    sha256: str
+    storage_provider: str
+    drive_publication_status: str
+    remote_file_id: Optional[str] = None
+    verified_at: Optional[str] = None
+    error_message: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
 
 
 @dataclass

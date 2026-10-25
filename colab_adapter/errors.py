@@ -79,6 +79,11 @@ class AutoAllocationBlockedError(ColabV2Error):
     pass
 
 
+class SshAutoAllocationRiskError(AutoAllocationBlockedError):
+    """Raised specifically when an SSH operation risks auto-allocating a Colab VM (e.g. TOCTOU session disappearance)."""
+    pass
+
+
 class ManifestValidationError(ColabV2Error, InvalidJobSpecError):
     """Raised when project manifest fails schema, path traversal, or safety checks."""
     pass
@@ -148,4 +153,65 @@ class LeaseExpiredError(ProjectSessionError):
 class InvalidStateTransitionError(ProjectSessionError):
     """Raised when an illegal state machine transition is attempted."""
     pass
+
+
+class StorageError(ColabV2Error):
+    """Base error for artifact storage operations."""
+    pass
+
+
+class ArtifactNotFoundError(StorageError, ArtifactMissingError):
+    """Requested artifact was not found in local or remote store."""
+    pass
+
+
+class DriveAuthenticationError(StorageError):
+    """Raised when Google Drive credentials are missing, expired, or invalid."""
+    pass
+
+
+class DriveQuotaExceededError(StorageError):
+    """Raised when Google Drive storage quota or rate limit is exceeded."""
+    pass
+
+
+class DriveTransferError(StorageError):
+    """Raised when resumable upload or download fails after retries."""
+    pass
+
+
+class DriveIntegrityError(StorageError, ArtifactValidationError):
+    """Raised when remote Google Drive artifact checksum or size does not match verified local artifact."""
+    pass
+
+
+class BrokerError(ColabV2Error):
+    """Base error for Workspace Broker operations."""
+    pass
+
+
+class BrokerAuthenticationError(BrokerError):
+    """Raised when a client fails authentication with the Workspace Broker."""
+    pass
+
+
+class CheckpointPolicyError(ColabV2Error):
+    """Raised when checkpoint policy validation fails."""
+    pass
+
+
+class JournalError(StorageError):
+    """Base error for persistent transfer journal operations."""
+    pass
+
+
+class JournalCorruptionError(JournalError):
+    """Raised when transfer journal JSON is corrupted and cannot be recovered from backup."""
+    pass
+
+
+class JournalLockError(JournalError):
+    """Raised when transfer journal lock cannot be safely acquired."""
+    pass
+
 

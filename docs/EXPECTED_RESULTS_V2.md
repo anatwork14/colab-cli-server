@@ -98,3 +98,32 @@ For each claim, add a result row to progress.md:
 | TBD | TBD | L2 remote T4 multi-module training | Live/approval pending | Verified artifacts, 0 orphan | TBD | NOT_RUN | explicit approval required |
 
 **Do not set PASS from intended behavior.** Release G7 requires test evidence, reviewed limitations, and maintainer signoff.
+
+---
+
+## 9. Google Drive & Cross-Device Workspaces Acceptance Scorecard (Gate G-Drive)
+
+| ID | Description | Target Value | Measured Result | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **Q32** | Resumable chunked upload protocol | 1 MiB chunks; Range query resume on reconnect | 100% verified via MockDriveHttpClient | PASS |
+| **Q33** | Drive quota / rate limit handling | HTTP 403 quotaExceeded raises DriveQuotaExceededError | Confirmed in `test_google_drive_store.py` | PASS |
+| **Q34** | Automatic token refresh on 401 | Refreshes expired token and retries request | Confirmed in `test_google_drive_store.py` | PASS |
+| **Q35** | Integrity verification | Local SHA256 canonical + remote MD5/size check | Confirmed in `test_google_drive_store.py` | PASS |
+| **Q36** | Deterministic source snapshot | Bit-reproducible tar.gz (identical hash on repeat) | Confirmed in `test_reproducibility.py` | PASS |
+| **Q37** | Secret filtering in snapshot | 0 `.env`, `*.key`, `*.pem`, `id_rsa`, `.git` leaked | Confirmed in `test_reproducibility.py` | PASS |
+| **Q38** | Asynchronous worker recovery | Recovers pending tasks from journal across restart | Confirmed in `test_upload_worker.py` | PASS |
+| **Q39** | Multi-client read-only attach | 2 independent clients view same run; 0 VM allocation | Confirmed in `test_workspace_broker.py` | PASS |
+| **Q40** | Expired runtime discovery | Historical runs and Drive links discoverable after VM stop | Confirmed in `test_drive_and_broker_e2e.py` | PASS |
+| **Q41** | Trusted-proxy spoofing & peer IP check | Requires `trusted_proxy_secret`, peer IP whitelist, and HMAC/secret header | Confirmed in `test_monitor_backend.py` & `test_adversarial_security_and_fault_injection.py` | PASS |
+| **Q42** | Real TLS socket wrapping | Wraps socket with `ssl.SSLContext` (`TLSv1_2`+) and validates cert/key files | Confirmed in `test_monitor_backend.py` & `test_adversarial_security_and_fault_injection.py` | PASS |
+| **Q43** | Byte-accurate HTTP 308 Range validation | Partial Range, missing Range, and malformed/impossible Range handled without skipping bytes | Confirmed in `test_google_drive_store.py` & `test_adversarial_security_and_fault_injection.py` | PASS |
+| **Q44** | Same-name/same-size MD5 collision & readback | Rejects stale files with mismatched MD5; verifies content via `alt=media` readback if MD5 omitted | Confirmed in `test_google_drive_store.py` & `test_adversarial_security_and_fault_injection.py` | PASS |
+| **Q45** | Seeded secret non-disclosure audit | 0 seeded tokens/secrets/session URLs leaked across tracker, journal, collector, artifacts, or API | Confirmed in `test_adversarial_security_and_fault_injection.py` | PASS |
+| **Q46** | 13-stage end-to-end V2 + Drive pipeline | Full offline pipeline from manifest/plan through sync, telemetry, Drive publish, teardown & attach | Confirmed in `test_project_e2e.py` | PASS |
+| **Q47** | Stored DOM XSS & inline handler elimination | 0 `.innerHTML` assignments, 0 inline handlers (`onclick`, `oninput`, `onchange`), safe `textContent` DOM nodes | Confirmed in `test_dashboard_ui_integration.py` & `test_browser_xss_and_cross_process_qa.py` | PASS |
+| **Q48** | Per-response cryptographic CSP nonce | `script-src 'self' 'nonce-...'` without `'unsafe-inline'`; blocks un-nonced script in headless Chromium | Confirmed in `test_monitor_backend.py` & `test_browser_xss_and_cross_process_qa.py` | PASS |
+| **Q49** | Cross-process Drive publication atomicity | 2 simultaneous OS processes (`subprocess.Popen`) initiate exactly 1 Drive upload session and 1 remote object | Confirmed in `test_upload_worker.py`, `test_google_drive_store.py` & `test_browser_xss_and_cross_process_qa.py` | PASS |
+| **Q50** | Immutable checkpoint revision history (`PublicationManifest` v2) | Republishing `model.pt` with new SHA256 preserves both `@sha256_<A>` and `@sha256_<B>` revisions and retrieves either by exact revision ID or latest logical path | Confirmed in `test_storage_abstraction.py`, `test_google_drive_store.py`, `test_upload_worker.py` & `test_project_e2e.py` | PASS |
+| **Q51** | Automatic v1 -> v2 manifest schema migration | Legacy `manifest_version: 1` unversioned entries upgrade to canonical `@sha256_<digest>` keys with `latest_by_path` and explicit `migration_notes` | Confirmed in `test_storage_abstraction.py` | PASS |
+| **Q52** | Reproducible headless Chromium browser security in CI | Dedicated `browser-security` CI job executes real headless Chromium with `COLAB_REQUIRE_BROWSER_TESTS=1` (failing if browser unavailable) and verifies 0 XSS & multi-revision DOM rendering | Confirmed in `.github/workflows/ci.yml` & `test_browser_xss_and_cross_process_qa.py` | PASS |
+

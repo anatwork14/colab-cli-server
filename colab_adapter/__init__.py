@@ -29,6 +29,7 @@ from .errors import (
     UpstreamCliError,
     UpstreamCliNotFoundError,
     AutoAllocationBlockedError,
+    SshAutoAllocationRiskError,
     ManifestValidationError,
     WorkspaceSyncError,
     ArtifactValidationError,
@@ -52,9 +53,11 @@ from .capability import (
     CapabilityProbe,
     CliCapabilities,
     SshSafetyGuard,
+    probe_cli_capabilities,
 )
 from .transports import (
     BaseTransport,
+    GuardedSshTransport,
     OfficialCliTransport,
     SshProxyTransport,
 )
@@ -76,14 +79,37 @@ from .telemetry import (
 )
 from .project_manifest import (
     ProjectSpec,
+    create_execution_plan,
     discover_project_files,
     init_project,
     load_manifest,
+    load_project_manifest,
     plan_project,
     validate_manifest,
 )
+from .storage import (
+    ArtifactStore,
+    ArtifactType,
+    GoogleDriveArtifactStore,
+    LocalArtifactStore,
+    PublicationManifest,
+    StoredArtifact,
+    TransferJournal,
+    TransferRecord,
+    TransferStatus,
+    ArtifactUploadWorker,
+)
+from .broker import WorkspaceBroker
+from .checkpoint_policy import CheckpointPolicyConfig, CheckpointPolicyManager
+from .reproducibility import (
+    RunManifest,
+    create_deterministic_source_snapshot,
+    get_environment_info,
+    get_git_provenance,
+)
 
 __all__ = [
+
     "ColabGPUProvider",
     "JobSpec",
     "PreparedJob",
@@ -113,6 +139,7 @@ __all__ = [
     "UpstreamCliError",
     "UpstreamCliNotFoundError",
     "AutoAllocationBlockedError",
+    "SshAutoAllocationRiskError",
     "ManifestValidationError",
     "WorkspaceSyncError",
     "ArtifactValidationError",
@@ -126,19 +153,23 @@ __all__ = [
     "LeaseExpiredError",
     "InvalidStateTransitionError",
     "CapabilityProbe",
+    "probe_cli_capabilities",
     "CliCapabilities",
     "SshSafetyGuard",
     "BaseTransport",
     "OfficialCliTransport",
     "SshProxyTransport",
+    "GuardedSshTransport",
     "SyncDelta",
     "WorkspaceSyncEngine",
     "compute_sync_delta",
     # V2 Project Manifest
     "ProjectSpec",
     "load_manifest",
+    "load_project_manifest",
     "validate_manifest",
     "plan_project",
+    "create_execution_plan",
     "init_project",
     "discover_project_files",
     # V2 Project Sessions (M5)
@@ -154,4 +185,23 @@ __all__ = [
     "TelemetryEvent",
     "plan_resume_from_checkpoint",
     "record_interrupted_run",
+    # V2 Drive Workspaces & Storage (Issue #21)
+    "ArtifactStore",
+    "ArtifactType",
+    "StoredArtifact",
+    "LocalArtifactStore",
+    "GoogleDriveArtifactStore",
+    "PublicationManifest",
+    "TransferJournal",
+    "TransferRecord",
+    "TransferStatus",
+    "ArtifactUploadWorker",
+    "WorkspaceBroker",
+    "CheckpointPolicyConfig",
+    "CheckpointPolicyManager",
+    "RunManifest",
+    "create_deterministic_source_snapshot",
+    "get_git_provenance",
+    "get_environment_info",
 ]
+

@@ -157,8 +157,8 @@ The V2 implementation extends the original one-shot adapter into a comprehensive
 - **Declarative Project Manifests (`colab_project.json`):** Declare source patterns, entrypoints, target accelerators, and artifact rules with offline validation and path escape rejection.
 - **Content-Addressed Incremental Sync:** Two-phase workspace synchronization transfers only modified files via streaming chunked SHA-256 diffing, with atomic commit and opt-in remote file deletion.
 - **Collision-Resistant Session Lifecycle:** Project runtime leases (`colab-v2-<name>-<uuid>`) prevent collisions, enforce state machine transitions, lock against concurrent allocations, and fail-closed on unmanaged user sessions.
-- **Multi-Tier Checkpoint & Artifact Recovery:** Staged atomic download with integrity checksums, ZIP header verification, and safe PyTorch `weights_only=True` inspection.
-- **Private Cross-Device Training & Compute Monitor:** Read-only HTTP/SSE dashboard displaying compute unit balance, burn rates, top-up detection, unattributed spend alerts, and run loss/step charts.
+- **Multi-Tier Checkpoint & Immutable Revision Recovery:** Staged atomic download with integrity checksums, ZIP header verification, safe PyTorch `weights_only=True` inspection, and immutable `@sha256_<digest>` revision history (`PublicationManifest` v2) preserving both latest and historical checkpoints across local and Google Drive storage.
+- **Private Cross-Device Training & Compute Monitor:** Read-only HTTP/SSE dashboard displaying compute unit balance, burn rates, top-up detection, unattributed spend alerts, run loss/step charts, and checkpoint revision history (`LATEST` vs `HISTORICAL`), hardened with per-response cryptographic CSP nonces and verified in headless Chromium CI.
 
 ### Project Workspace CLI Commands
 
@@ -196,11 +196,13 @@ All commands support `--json` for machine-readable output by autonomous agents a
 ### Training & Compute Monitor CLI Commands
 
 ```bash
-# Capture an immediate read-only account usage and session snapshot
-colab-adapter monitor snapshot
+# Start local authenticated monitoring server with web dashboard (loopback default)
+colab-adapter monitor --host 127.0.0.1 --port 8080 --auth-token <SECRET_TOKEN>
 
-# Start local authenticated monitoring server with web dashboard
-colab-adapter monitor server --host 127.0.0.1 --port 8765 --token <SECRET_TOKEN>
+# Start monitoring server with TLS encryption or behind a verified identity proxy
+colab-adapter monitor --host 0.0.0.0 --port 8443 --allow-external \
+  --auth-token <SECRET_TOKEN> --require-tls \
+  --tls-certfile /path/to/cert.pem --tls-keyfile /path/to/key.pem
 ```
 
 **Security & Account Protection:**
@@ -210,8 +212,12 @@ colab-adapter monitor server --host 127.0.0.1 --port 8765 --token <SECRET_TOKEN>
 
 **Documentation:**
 - [Progress ledger](progress.md) — Completed milestones, evidence, and change logs
-- [Milestones](milestones.md) — M0–M8 release gates and evidence requirements
+- [Milestones](milestones.md) — M0–M8 and G-Drive release gates and evidence requirements
+- [Google Drive Artifacts Guide](docs/GOOGLE_DRIVE_ARTIFACTS.md) — Resumable upload, verification, and private storage hierarchy
+- [Cross-Device Workspaces Guide](docs/CROSS_DEVICE_WORKSPACES.md) — Multi-client read-only attach via Workspace Broker
+- [Artifact Recovery & Reproducibility](docs/ARTIFACT_RECOVERY.md) — Bit-reproducible code snapshots and disaster recovery
 - [V2 features](docs/FEATURES_V2.md) — Detailed feature specification
 - [V2 architecture](docs/ARCHITECTURE_V2.md) — Security contracts and threat model
 - [Expected results](docs/EXPECTED_RESULTS_V2.md) — Measurable acceptance criteria
 - [Cross-device Monitor Guide](docs/MONITORING_DASHBOARD_V2.md) — Dashboard architecture and API specification
+

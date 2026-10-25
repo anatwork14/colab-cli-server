@@ -152,6 +152,11 @@ def build_parser() -> argparse.ArgumentParser:
     mon_parser.add_argument("--port", type=int, default=8080, help="Listen port (default: 8080).")
     mon_parser.add_argument("--auth-token", default=None, help="Authentication bearer token.")
     mon_parser.add_argument("--allow-external", action="store_true", help="Allow binding to non-loopback interface.")
+    mon_parser.add_argument("--trusted-proxy", action="store_true", help="Accept identity headers from a verified reverse proxy.")
+    mon_parser.add_argument("--trusted-proxy-secret", default=None, help="Shared secret for verifying reverse-proxy headers.")
+    mon_parser.add_argument("--require-tls", action="store_true", help="Enforce TLS encryption on the monitor socket.")
+    mon_parser.add_argument("--tls-certfile", default=None, help="Path to TLS certificate PEM file.")
+    mon_parser.add_argument("--tls-keyfile", default=None, help="Path to TLS private key PEM file.")
 
     return parser
 
@@ -301,16 +306,25 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "monitor":
         token = args.auth_token or os.environ.get("COLAB_MONITOR_TOKEN")
-        print(f"Starting Colab Training & Compute Monitor on http://{args.host}:{args.port}")
+        proxy_secret = args.trusted_proxy_secret or os.environ.get("COLAB_TRUSTED_PROXY_SECRET")
+        scheme = "https" if (args.require_tls or args.tls_certfile) else "http"
+        print(f"Starting Colab Training & Compute Monitor on {scheme}://{args.host}:{args.port}")
         if token:
             print(f"Authentication active. Token: {token[:4]}****")
+        elif args.trusted_proxy:
+            print("Trusted reverse-proxy authentication active.")
         else:
-            print("WARNING: Authentication disabled. Monitor is accessible to all local callers.")
+            print("WARNING: Authentication disabled. Monitor is accessible to local loopback callers only.")
         server = start_monitor_server(
             host=args.host,
             port=args.port,
             auth_token=token,
             allow_external=args.allow_external,
+            trusted_proxy=args.trusted_proxy,
+            trusted_proxy_secret=proxy_secret,
+            require_tls=args.require_tls,
+            tls_certfile=args.tls_certfile,
+            tls_keyfile=args.tls_keyfile,
         )
         try:
             server.serve_forever()

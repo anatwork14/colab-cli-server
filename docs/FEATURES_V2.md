@@ -139,3 +139,17 @@ The new M8 module is a **private Ubuntu-hosted web dashboard**, never a Colab VM
 - Google Colab runtime restrictions: https://research.google.com/colaboratory/faq.html
 
 **Important:** The sources prove *upstream documented capabilities*, not that SSH works on the user's particular paid Colab account/runtime. M3 tests that separately after human authorization.
+
+---
+
+## 9. Google Drive Durable Artifacts & Cross-Device Workspaces (Issue #21)
+
+### Features
+
+- **Provider-Independent Storage Abstraction (`ArtifactStore`)**: Standardized interface implemented by `LocalArtifactStore` and `GoogleDriveArtifactStore` with immutable `StoredArtifact` records and publication manifests.
+- **Resumable Chunked Drive Uploader**: Implements official Google Drive v3 resumable upload protocol in 1 MiB chunks. Supports Range query resume (`Range: bytes */total`), exponential backoff on HTTP 429/500/502/503, Drive quota handling (403), and token expiration refresh (401).
+- **Asynchronous Background Upload Worker**: `ArtifactUploadWorker` decouples training execution from cloud upload latency, bounds concurrency, and recovers pending or interrupted transfers from a persistent disk journal across restarts.
+- **Deterministic Bit-Reproducible Code Snapshots**: Generates `source_snapshot.tar.gz` with normalized tarinfo/gzip timestamps (mtime=0, uid=0) and SHA256 digests. Strictly filters secrets (`.env`, `*.key`, `*.pem`, `id_rsa`), git internals (`.git/`), and bytecode caches (`__pycache__`).
+- **Cross-Device Session Broker**: Ubuntu-hosted `WorkspaceBroker` allowing authorized laptops, workstations, or mobile clients to attach to runs in strictly READ-ONLY mode. Guarantees 0 Colab VM allocations on attach, audits client access, and inspects expired/terminated runs via durable artifacts.
+- **Automatic Checkpoint Policy**: Configurable minimum interval throttling, keep_last local cleanup, strict preservation of at least 1 verified local checkpoint, and zero remote deletion.
+

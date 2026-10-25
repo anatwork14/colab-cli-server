@@ -6,9 +6,9 @@
 
 - **V1: MERGED / verified on GitHub.** PR #2 squash-merged into main at commit 2bfd2194ad8259d785ca59935579eab6bdad052c. Human operator reported server synchronization and 43/43 offline tests on Python 3.8 and 3.12, OAuth diagnostics and no active sessions. The maintainer has not independently inspected the user's running server in this planning PR.
 - **V1 live evidence:** earlier explicitly approved Colab T4 one-shot and stateful E2E executions proved basic remote CUDA execution, input upload, artifact download, checksum/ZIP checks and teardown. These tests predate V2 and do **not** validate SSH, directory sync or new development workflows.
-- **Dashboard M8: PLANNED, not built.** The monitor will run on the Ubuntu host and use read-only official CLI account usage snapshots plus emitted run telemetry. Credentials never go to browser; HTTPS/VPN access must be separately configured.
-- **V2 planning: IN PROGRESS in plan/v2-project-workspaces.** The V2 requirements, architecture, milestones and expected-results gates are being drafted. **No V2 implementation, live SSH test, GPU rental or cost measurement is claimed.**
-- **Account safety:** NO cloud allocations, SSH auto-provision, Drive mount, paid API, GPU spend or unattended deployment authorized by these planning files.
+- **Dashboard M8: COMPLETE (Offline, local headless Chromium & GitHub Actions `browser-security` CI verified).** Full-stack monitor backend (`colab_adapter/monitor/server.py`, `collector.py`, `schemas.py`) and responsive embedded SPA (`colab_adapter/monitor/ui.py`) are implemented and verified offline and in headless Chromium (`playwright-core` with `COLAB_REQUIRE_BROWSER_TESTS=1`) with strict Bearer/trusted-proxy authentication, per-response cryptographic CSP nonces (`script-src 'self' 'nonce-...'` without `'unsafe-inline'`), zero unsafe `innerHTML` or inline event handlers, checkpoint revision history (`LATEST` / `HISTORICAL`), TLS enforcement, and deep secret redaction.
+- **V2 implementation: COMPLETE across M1–M8 and V2-Drive (`feat/v2-drive-workspaces`).** All V2 milestones (M1–M8) and Cross-Device Workspaces & Google Drive Durable Storage (Issue #21, PR #22) are implemented and verified (**266/266 tests passing on Python 3.12; 265/266 passed + 1 Python>=3.10 AST check skipped on Python 3.8**). Note: PRs #3, #13–#20, and #22 form a reconciled review stack on GitHub and remain **unmerged into `main`** pending owner review. **No live V2 SSH test, GPU rental, or live Google Drive API call has been executed.**
+- **Account safety:** NO cloud allocations, SSH auto-provision, Drive mount, paid API, GPU spend or unattended deployment authorized or executed during V2 development and testing.
 
 ## Baseline inventory (evidence from main)
 
@@ -36,15 +36,104 @@
 | M5 | Attach/update/execute/stop lifecycle | COMPLETE | Issue #9, colab_adapter/project_sessions.py, tests/test_project_sessions.py; 85/85 tests pass |
 | M6 | Artifact/cache/resume and observability | COMPLETE | Issue #10, colab_adapter/artifacts.py, colab_adapter/telemetry.py; 95/95 tests pass |
 | M7 | Integration, end-to-end signoff and docs | COMPLETE | Issue #11, colab_adapter/cli.py, tests/test_project_e2e.py; 111/111 tests pass |
-| M8 | Secure browser training & compute monitor | COMPLETE | Issue #12, colab_adapter/monitor/, tests/test_monitor_backend.py; 105/105 tests pass |
+| M8 | Secure browser training & compute monitor | COMPLETE | Issue #12, colab_adapter/monitor/, tests/test_monitor_backend.py, tests/test_dashboard_ui_integration.py, tests/test_browser_xss_and_cross_process_qa.py; 266/266 suite pass |
+| V2-Drive | Cross-Device Workspaces & Google Drive Artifacts | COMPLETE | Issue #21, PR #22, colab_adapter/storage/, broker, reproducibility; 266/266 tests pass on Python 3.12 (265/266 + 1 skip on Python 3.8) |
 | M9 | Cross-provider abstraction (optional) | DEFERRED | Only after Colab V2 is independently usable |
+
 
 ## How an implementer updates this file
 
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-25 — Review `5640967243` Resolution: Immutable Checkpoint Revision History, Manifest v2 Migration, Reproducible Headless Chromium CI & 19-Step E2E Verification (branch `feat/v2-drive-workspaces`):**
+  - **P2 Immutable Checkpoint Revision History & Canonical Identity Contract (`colab_adapter/storage/base.py`, `manifest.py`, `local.py`, `google_drive.py`, `worker.py`, `transfer.py`)**:
+    - Defined frozen `ArtifactRevisionIdentity` and canonical revision IDs `{project_id}/{run_id}/{logical_path}@sha256_{full_sha256}` alongside helper functions `format_revision_artifact_id`, `format_logical_artifact_id`, `parse_artifact_id`, and `format_transfer_id`.
+    - Upgraded `PublicationManifest` to `manifest_version = 2` with `latest_by_path` and `migration_notes`. Publishing multiple revisions of the same filename (`checkpoints/model.pt`) preserves all historical revisions under distinct `@sha256_<digest>` keys, demotes prior revisions (`is_latest=False`), updates `latest_by_path` to the newest revision (`is_latest=True`), and rejects conflicting bytes/SHA256 for the same immutable revision ID with `ArtifactValidationError`.
+    - Implemented automatic v1 -> v2 manifest schema migration in `PublicationManifest.from_dict()` / `load()`, upgrading legacy unversioned keys to `@sha256_<digest>` keys while recording explicit provenance notes in `migration_notes`.
+    - Updated `LocalArtifactStore`, `GoogleDriveArtifactStore`, and `ArtifactUploadWorker` to stage source files into immutable content-addressed snapshots before upload/commit (protecting against in-flight source file mutation when a training loop overwrites `model.pt`), verify remote deduplication via `alt=media` byte readback when not already associated with a verified SHA256, and support both exact historical revision retrieval (`@sha256_<digest>`) and latest unversioned retrieval (`proj/run/checkpoints/model.pt`).
+  - **Dashboard Checkpoint Revision History (`colab_adapter/monitor/server.py`, `colab_adapter/monitor/ui.py`)**:
+    - Updated `/api/v1/runs`, `/api/v1/runs/<id>/artifacts`, and `renderArtifacts()` to expose logical filename, immutable revision ID (`sha256_<prefix>`), step (`unavailable` when not recorded—never fabricated), size, verification status, remote availability, timestamp, and `LATEST` vs `HISTORICAL` badges using strictly safe DOM APIs (`createElement`, `textContent`, `replaceChildren`; zero `.innerHTML`, zero inline handlers) and added a stale-selection guard in `selectRun()`.
+  - **Reproducible Real-Browser Security CI & 19-Step E2E Verification (`.github/workflows/ci.yml`, `tests/test_browser_xss_and_cross_process_qa.py`, `tests/test_project_e2e.py`)**:
+    - Split browser security tests into `TestPortableStructuralDashboardSecurity` (runs across all Python matrix versions) and `TestMandatoryHeadlessBrowserSecurity` (enforces real headless Chromium execution and fails hard if Chromium is unavailable when `COLAB_REQUIRE_BROWSER_TESTS=1`).
+    - Added dedicated `browser-security` job in `.github/workflows/ci.yml` installing pinned `playwright-core@1.51.0` + Chromium on `ubuntu-latest` and running `COLAB_REQUIRE_BROWSER_TESTS=1 python -m unittest tests/test_browser_xss_and_cross_process_qa.py -v`.
+    - Expanded `tests/test_project_e2e.py` with the full 19-step research lifecycle (`test_full_19_step_research_lifecycle`) verifying multi-revision `model.pt` publication, VM termination, dashboard inspection of historical and latest revisions, dual retrieval of both `Revision A` and `Revision B` on Device B, and negative security controls.
+    - Full test suite: **266/266 tests passing on Python 3.12** (`Ran 266 tests in 46.596s: OK`) and **265/266 passed + 1 skipped on Python 3.8** (`Ran 266 tests in 44.793s: OK (skipped=1)`).
+    - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive API calls made).
+    - **PR STACK STATUS**: PRs #3, #13–#20, and #22 remain a reconciled review stack on GitHub and are **not yet merged into `main`**.
+    - **STATUS: READY_FOR_INDEPENDENT_REVIEW.**
+- **2026-10-25 — Review `5640707483` Resolution: Stored DOM XSS Elimination, Strict Nonce CSP, Cross-Process Publication Atomicity & Real Browser/Multi-Process QA (branch `feat/v2-drive-workspaces`):**
+  - **P0 Stored DOM XSS Elimination & Strict Cryptographic Nonce CSP (`colab_adapter/monitor/ui.py`, `colab_adapter/monitor/server.py`)**:
+    - Removed 100% of `.innerHTML` assignments and 100% of inline event handler attributes (`onclick=`, `oninput=`, `onchange=`, `onerror=`, `onload=`) across `colab_adapter/monitor/ui.py` and `colab_adapter/monitor/server.py`.
+    - Refactored `renderRunsTable`, `renderArtifacts`, `renderSessionsTable`, `renderLogs`, `showAuthBanner`, `showHealthWarning`, `createSha256Badge`, `renderComputeChart`, and `renderMetricsChart` to construct DOM and SVG nodes exclusively via `document.createElement`, `document.createElementNS`, `.textContent`, `.replaceChildren()`, and `.addEventListener()`.
+    - Hardened `selectRun(runId)` with `encodeURIComponent(String(runId))` on all run detail endpoints and added `formatNumber(val, decimals)` (`Number.isFinite`) validation before all `.toFixed()` calls.
+    - Upgraded `MonitorServer` to generate a fresh cryptographic nonce (`secrets.token_urlsafe(18)`) per HTML response and emit `Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-<NONCE>'; style-src 'self' 'nonce-<NONCE>'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`, completely removing `'unsafe-inline'`. Added static `/monitor.js` and `/monitor.css` asset routes.
+  - **P1 Cross-Process Artifact Publication Atomicity & Durable Lease Fencing (`colab_adapter/storage/transfer.py`, `colab_adapter/storage/worker.py`, `colab_adapter/storage/google_drive.py`)**:
+    - Extended `TransferRecord` with `owner_pid`, `lease_token`, `lease_expires_at`, and `fencing_epoch`.
+    - Implemented re-entrant per-thread and cross-process exclusive `fcntl.flock` locks (`TransferJournal.acquire_named_lock` and `acquire_artifact_lock` on `.transfer_locks/<safe_id>.lock` with `0700` dir and `0600` file permissions) plus durable lease claiming (`claim_transfer_lease` / `release_transfer_lease`) with automatic dead-PID lease reclamation via `_is_pid_alive(pid)` (`os.kill(pid, 0)`).
+    - Wrapped `GoogleDriveArtifactStore.publish()` and `PublicationManifest` updates in cross-process locks (`artifact-<id>` and `manifest-<project>-<run>`), performing post-lock journal reload and remote folder deduplication so concurrent processes publishing the same artifact execute at most 1 upload session and receive the same verified `StoredArtifact`, while modified content at the same filename publishes a distinct content-addressed revision (`<base_id>-<sha256[:12]>`).
+  - **Real Headless Browser DOM XSS & Two-OS-Process Concurrency QA (`tests/test_browser_xss_and_cross_process_qa.py`)**:
+    - Verified in real headless Chromium (`Google Chrome for Testing 145.0.7632.6` + `playwright-core`) against a live loopback `MonitorServer` seeded with `<img src=x onerror=...>`, `</td><script>...`, `');window.__xss=true;//`, and `"><svg onload=...>` across runs, sessions, logs, errors, and Drive artifacts: `window.__xss === undefined`, 0 page errors, 0 CSP violations during normal operation, active CSP blocking of un-nonced inline `<script>` injection, and safe plain-text rendering.
+    - Verified with two simultaneous OS processes (`subprocess.Popen`) synchronized via filesystem barrier against a loopback HTTP Drive v3 server (`LoopbackDriveServer`): `session_counter == 1`, `len(committed_checkpoints) == 1`, identical `remote_file_id` and `sha256`, and mid-upload process crash (`os._exit(99)` at 256 KiB) followed by second-process HTTP 308 resume from byte offset `262144`.
+    - Full test suite: **240/240 tests passing on Python 3.12** and **239/240 passed + 1 skipped on Python 3.8** (0 failures, 0 errors).
+    - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive API calls made).
+    - **PR STACK STATUS**: PRs #3, #13–#20, and #22 remain a reconciled review stack on GitHub and are **not yet merged into `main`**.
+    - **STATUS: READY_FOR_INDEPENDENT_REVIEW.**
+- **2026-10-25 — V2 Complete Integration, Full-Stack UI, Drive Protocol Hardening & Adversarial QA (branch `feat/v2-drive-workspaces`):**
+  - **P0 Trusted-Proxy Authentication & Real TLS Socket Enforcement (`colab_adapter/monitor/server.py`, `colab_adapter/broker.py`)**:
+    - Resolved trusted-proxy header spoofing: enabling `trusted_proxy=True` now strictly requires a non-empty `trusted_proxy_secret` (raising `ValueError` / `BrokerAuthenticationError` if omitted), validates client peer IP against `trusted_proxy_ips` (default loopback `127.0.0.1`, `::1`), validates `X-Remote-User` / `X-Forwarded-User` against `^[a-zA-Z0-9_.@-]{1,128}$`, and verifies `X-Proxy-Secret` via `hmac.compare_digest` or `X-Proxy-Signature` via HMAC-SHA256.
+    - Enforced real TLS socket encryption: when `require_tls=True` (or `allow_external=True` on a non-loopback host without `trusted_proxy`), `MonitorServer` validates `tls_certfile` and `tls_keyfile` and wraps `self.socket` using `ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)` with `TLSVersion.TLSv1_2` minimum.
+  - **P1 Byte-Accurate Google Drive Resumable Upload & Authoritative Verification (`colab_adapter/storage/google_drive.py`)**:
+    - Eliminated unacknowledged byte skipping when HTTP 308 omits `Range`: strictly validates `Range` header via `^bytes=0-(\d+)$` and boundary checks (`0 < confirmed_next <= start_byte + chunk_len <= total_size`). When `Range` is absent on 308, reconciles progress via `_query_upload_progress` and retries unacknowledged bytes instead of advancing offset.
+    - Hardened `_query_upload_progress` to raise `DriveAuthenticationError` on 401 (after optional token refresh), `DriveQuotaExceededError` on 403 quota errors, `DriveTransferError` on 429/5xx after bounded exponential backoff, and return `-1` sentinel on 404/410 session expiry.
+    - Prevented same-name/same-size file collisions by matching both `expected_size` and `expected_md5` in `_find_file_in_folder` and resetting stale journal entries when local file size or SHA256 changes.
+    - Added `alt=media` streaming content readback verification fallback in `publish()` when Drive metadata omits `md5Checksum`, raising `DriveIntegrityError` if readback fails or SHA256/size mismatches.
+    - Added `_sanitize_drive_error` to scrub Bearer tokens, resumable session URLs (`session_id=`, `upload_id=`), and OAuth secrets across all Drive exceptions and journal error records.
+  - **P1 Storage Reliability, Worker Deduplication & Secret Redaction (`colab_adapter/storage/transfer.py`, `worker.py`, `tracker.py`, `collector.py`, `artifacts.py`)**:
+    - Updated `TransferRecord.to_dict(safe=True)` to deeply scrub `last_error` (`sanitize_text`) and `metadata` (`sanitize_data`) in addition to redacting `resumable_session_url`.
+    - Added in-flight/queued deduplication in `ArtifactUploadWorker.enqueue()` and pre-upload re-verification when local checkpoints are overwritten with new weights.
+    - Applied `sanitize_text` / `sanitize_data` across `AccountUsageCollector`, `ArtifactManager`, and `TelemetryEmitter`.
+  - **Full-Stack Monitoring Dashboard UI (`colab_adapter/monitor/ui.py`)**:
+    - Implemented complete responsive SPA dashboard in `colab_adapter/monitor/ui.py` with `sessionStorage` Bearer auth, Blob CSV export, Compute Units Balance & History SVG chart, Active Managed Sessions table, filterable Training Runs table, and Run Inspector (SVG Loss/Eval metrics chart, honest GPU utilization indicator, log viewer, and SHA256 Google Drive Artifacts table).
+  - **M1–M8 Platform Integration & 13-Stage End-to-End Pipeline (`colab_adapter/capability.py`, `tests/test_project_e2e.py`, `tests/test_adversarial_security_and_fault_injection.py`)**:
+    - Enforced `CliCapabilities` tuple immutability, `SshSafetyGuard.prepare_isolated_ssh_config` (`0700` dir, `0600` `sessions.json`), and pre-invocation TOCTOU verification raising `SshAutoAllocationRiskError`.
+    - Added 13-stage end-to-end integration test (`test_complete_v2_pipeline_with_drive_and_cross_device_monitor`) and 20-test adversarial security & byte-accurate fault-injection suite (`tests/test_adversarial_security_and_fault_injection.py`).
+    - Full offline test suite: **218/218 tests passing on Python 3.12** (0 failures, 0 errors, 0 skipped) and **217/218 passed + 1 skipped on Python 3.8** (0 failures, 0 errors).
+    - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive API calls made).
+    - **STATUS: READY_FOR_INDEPENDENT_REVIEW.**
+- **2026-10-24 — V2 Security Hardening & Resumable Recovery COMPLETE (branch `feat/v2-drive-workspaces`):**
+  - **P0 Authentication & Remote Access Security**:
+    - Completely removed browser authentication through `?token=` query parameters across all endpoints (`/api/v1/summary`, `/api/v1/runs`, `/api/v1/events/stream`, `/api/v1/export/compute.csv`).
+    - Updated embedded dashboard UI to manage bearer token via `sessionStorage` (cleared on tab close, never leaked into URLs, server logs, or referrer headers).
+    - Removed `Access-Control-Allow-Origin: *`. Enforced strict same-origin by default, optional explicit origin whitelist, and defense-in-depth security headers (`Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`).
+    - Enforced secure remote binding: external binding (`allow_external=True`) over unencrypted HTTP without trusted identity proxy is rejected with `ValueError`.
+    - Added protected `tokens_file` support to `WorkspaceBroker` with `0600` mode permissions and `0700` parent directory, ensuring authorization survives server restarts.
+  - **P1 Google Drive Resumable Uploads & Authoritative Verification**:
+    - Strict `Range` header parsing on HTTP 308 responses (`bytes=0-N` correctly updates offset to `N+1`; never assumes whole chunk was committed).
+    - Reconciled committed byte offset via status query after ambiguous network errors before resuming.
+    - Handled session expiration (`HTTP 404/410`) by clearing session URL and querying target folder to prevent duplicate file objects before re-initiating.
+    - Authoritative integrity verification: eliminated local size substitution `remote_size = int(drive_file_meta.get("size", size_bytes))`. Queries remote metadata if missing; raises `DriveIntegrityError` if remote size cannot be verified.
+    - Implemented bounded-memory streaming download in `retrieve()` using 64 KiB chunks into a private temporary file (`0600`), incremental SHA256/MD5 hashing, `fsync`, atomic rename, and automatic cleanup on error.
+  - **P1 Persistent Transfer Journal & In-Process Retry Scheduler**:
+    - Restricted `TransferJournal` directories to `0700` and files/locks to `0600`.
+    - Implemented atomic writes with `fsync` and parent directory sync.
+    - Replaced silent dictionary resets on corrupted JSON with `.corrupt.<timestamp>` copy preservation and recovery from `.bak` or explicit `JournalCorruptionError`.
+    - Implemented in-process exponential backoff retry scheduler in `ArtifactUploadWorker` allowing `RETRY_PENDING` tasks to retry without worker restart.
+    - Added pre-publication validation of local source file existence and SHA256 checksum.
+  - **P1 Reproducibility Code Snapshots**:
+    - Strictly excluded symlinked files and directories by default.
+    - Validated canonical resolved paths strictly within project root.
+    - Prevented self-referential inclusion of the destination archive itself.
+    - Normalized tar entry paths with no leading `/` and no `..` traversal components.
+  - **Comprehensive Regression Suite**:
+    - Created/expanded `tests/test_v2_security_and_resumable_recovery.py` with 12 focused regression tests covering all P0 and P1 review findings.
+    - Full test suite: **154 tests passing** in `11.7s` (100% pass, 0 failures, 1 skipped).
+    - Syntax and CLI planning checks (`compileall`, `bash -n`, `colab_server.py plan`) pass cleanly (code 0).
+    - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive API calls made).
+    - **STATUS: READY FOR INDEPENDENT SECURITY & CODE REVIEW.**
+
 - **2026-10-24 — Milestone M7 / Gate G7 COMPLETE (branch `feat/v2-m7-integration`):**
+
   - Integrated complete project CLI subcommands in `colab_adapter/cli.py`: `init`, `validate`, `plan`, `up`, `sync`, `exec`, `status`, `stop`, `reconcile`.
   - Added monitoring CLI subcommands: `snapshot`, `server`.
   - Full `--json` output flags across all commands for automation and agent parsing (Q16).

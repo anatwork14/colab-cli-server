@@ -1,6 +1,6 @@
 # Colab CLI Server V2 — Milestones & Release Gates
 
-> Status as of 2026-10-24: M0 COMPLETE; M1–M8 NOT_STARTED; M9 DEFERRED. Scope is interactive human-approved research workflows, NOT an unrestricted autonomous cloud provisioning platform. No deadline or engineering estimate is promised.
+> Status as of 2026-10-25: M0–M8 & V2-Drive COMPLETE (Offline, local headless Chromium & GitHub Actions `browser-security` CI verified; 266/266 tests passing on Python 3.12, 265/266 + 1 skip on Python 3.8); M9 DEFERRED. PRs #3, #13–#20, and #22 form a reconciled review stack and remain unmerged into `main` pending owner approval. Scope is interactive human-approved research workflows, NOT an unrestricted autonomous cloud provisioning platform. No deadline or engineering estimate is promised.
 
 ## Definition of Done (applies to every milestone)
 
@@ -115,6 +115,36 @@
 **Status: DEFERRED.**
 - Consider Vkong/dedicated rental provider implementation only when provider APIs, permissions and cost semantics are separately investigated. Do not fake an interchangeable provider API. Not required for Colab V2.
 
+## V2 Extension (Issue #21) — Cross-Device Workspaces & Google Drive Artifacts (Gate G-Drive)
+**Status: COMPLETE (Offline verified; branch `feat/v2-drive-workspaces`). Dependencies: M5, M6, M7, M8.**
+- Implemented provider-independent storage abstraction (`ArtifactStore`, `StoredArtifact`, `LocalArtifactStore`, `PublicationManifest`, `TransferJournal`, `TransferRecord`) in `colab_adapter/storage/`.
+- Implemented official Google Drive API v3 resumable chunked uploader (`GoogleDriveArtifactStore`) with:
+  - Range status query resume (`Range: bytes */total`) for interrupted transfers.
+  - Bounded exponential backoff with jitter on HTTP 429/500/502/503.
+  - Typed error handling for quota exceeded (HTTP 403) and token expiration (HTTP 401 automatic refresh).
+  - Multi-tier integrity verification (local SHA256 canonical, remote size and `md5Checksum` check).
+  - Protected local credential storage with strict `0600` permissions.
+- Connected M6 `ArtifactManager` with asynchronous background `ArtifactUploadWorker` with bounded concurrency and persistent journal recovery across restarts.
+- Implemented deterministic bit-reproducible code snapshots (`create_deterministic_source_snapshot`) with normalized mtime=0 and strict secret filtering (`.env`, `*.pem`, `id_rsa`, `__pycache__`, `.git`).
+- Implemented Ubuntu-hosted `WorkspaceBroker` for multi-device read-only session inspection with constant-time token verification, audit logging, expired session historical inspection, and zero cloud VM allocation.
+- Extended M8 monitoring server (`/api/v1/runs/<id>/artifacts`, `/drive`, `/manifest`) and embedded responsive SPA dashboard for Google Drive artifact tracking and checkpoint continuity.
+- Implemented `CheckpointPolicyManager` with minimum interval throttling, keep_last local cleanup, strict preservation of at least 1 verified local checkpoint, and zero remote deletion.
+- Completed comprehensive security hardening & resumable recovery:
+  - Eliminated browser query-token authentication across all API endpoints.
+  - Eliminated wildcard CORS; enforced strict same-origin and defense-in-depth HTTP headers.
+  - Enforced secure ingress on external bindings; rejected unencrypted public access.
+  - Supported protected `tokens_file` with `0600` permissions surviving server restarts.
+  - Hardened resumable upload Range 308 parsing and status reconciliation after ambiguous network errors.
+  - Authoritative remote metadata verification (never substituting local expected size).
+  - Implemented bounded-memory streaming download for multi-GB checkpoints.
+  - Added atomic TransferJournal writes (`0600` files, `0700` dirs, fsync) and safe corruption recovery.
+  - Implemented in-process background retry scheduler for transient failures without worker restart.
+  - Hardened reproducible source snapshots against symlinks and self-referential output archives.
+- Added comprehensive offline and local browser test suites in `tests/test_storage_abstraction.py`, `tests/test_google_drive_store.py`, `tests/test_reproducibility.py`, `tests/test_checkpoint_policy.py`, `tests/test_upload_worker.py`, `tests/test_workspace_broker.py`, `tests/test_drive_and_broker_e2e.py`, `tests/test_v2_security_and_resumable_recovery.py`, `tests/test_dashboard_ui_integration.py`, `tests/test_adversarial_security_and_fault_injection.py`, and `tests/test_browser_xss_and_cross_process_qa.py`.
+- **Full test suite: 266/266 tests passing on Python 3.12 (265/266 passed + 1 skipped on Python 3.8; 0 failures, 0 errors).**
+- **Gate G-Drive Satisfied:** 0 runtime spend, 0 cloud VMs allocated, 100% offline mocked + immutable checkpoint revision history (`PublicationManifest` v2) + reproducible headless Chromium browser (`COLAB_REQUIRE_BROWSER_TESTS=1`) + two-OS-process concurrency verification. Live Drive validation pending user approval.
+
+
 ## Development sequence and parallelism
 
 - First merge M1; then M2 manifest and M3 transports may proceed on non-overlapping branches.
@@ -136,5 +166,7 @@
 | G6 | Artifact provenance, explicit resume, telemetry | PASSED |
 | G7 | Offline suite, owner-approved live evidence, docs | PASSED |
 | G8 | Account ledger, emitted training events, private cross-device read-only UI, zero-alloc safety | PASSED |
+| G-Drive | Google Drive resumable upload, persistent recovery, multi-device broker attach, zero-alloc safety | PASSED (Offline) |
+
 
 See docs/EXPECTED_RESULTS_V2.md for numeric acceptance measurements and definitions.

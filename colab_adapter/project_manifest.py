@@ -300,7 +300,11 @@ def discover_project_files(spec: ProjectSpec) -> List[Tuple[str, int, str]]:
             file_rel = f"{rel_dir}/{fname}" if rel_dir else fname
             full_path = current_path / fname
 
-            # 1. Symlink escape check
+            # 1. Check exclusions first (excluded files/symlinks do not trigger errors)
+            if is_path_excluded(file_rel, spec.exclude):
+                continue
+
+            # 2. Symlink escape check for included files
             if full_path.is_symlink():
                 target = full_path.resolve()
                 try:
@@ -317,13 +321,11 @@ def discover_project_files(spec: ProjectSpec) -> List[Tuple[str, int, str]]:
                     # Dangling symlink
                     continue
 
-            # 2. Check regular file
+            # 3. Check regular file
             if not full_path.is_file():
                 continue
 
-            # 3. Check exclusions and inclusions
-            if is_path_excluded(file_rel, spec.exclude):
-                continue
+            # 4. Check inclusions
             if not is_path_included(file_rel, spec.include):
                 continue
 
@@ -357,6 +359,9 @@ def plan_project(spec: ProjectSpec) -> Dict[str, Any]:
     validate_manifest(spec)
     files = discover_project_files(spec)
     total_bytes = sum(f[1] for f in files)
+    manifest_digest = hashlib.sha256(
+        json.dumps([(f[0], f[1], f[2]) for f in files], sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
     return {
         "schema_version": spec.schema_version,
@@ -373,7 +378,9 @@ def plan_project(spec: ProjectSpec) -> Dict[str, Any]:
         "artifacts_local_dir": str(spec.artifacts_local_dir),
         "delete_remote": spec.delete_remote,
         "files_count": len(files),
+        "total_files": len(files),
         "total_bytes": total_bytes,
+        "manifest_digest": manifest_digest,
         "files": [
             {"path": f[0], "size": f[1], "sha256": f[2]}
             for f in files
@@ -422,3 +429,7 @@ def init_project(target_dir: Union[str, Path], name: Optional[str] = None) -> Pa
 
     manifest_file.write_text(json.dumps(template, indent=2), encoding="utf-8")
     return manifest_file
+
+
+load_project_manifest = load_manifest
+create_execution_plan = plan_project
