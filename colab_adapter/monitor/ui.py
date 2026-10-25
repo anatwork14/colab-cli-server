@@ -12,9 +12,16 @@ Provides:
 """
 from __future__ import annotations
 
+import html
+import re
 from typing import Optional
 
-__all__ = ["DASHBOARD_HTML", "render_dashboard_html"]
+__all__ = [
+    "DASHBOARD_HTML",
+    "render_dashboard_html",
+    "get_dashboard_css",
+    "get_dashboard_js",
+]
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -22,8 +29,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Colab Monitor — V2 Remote GPU Workspaces</title>
-  <style>
+  <title>Colab Experiment &amp; Compute Monitor</title>
+  <style nonce="__CSP_NONCE__">
     :root {
       --bg: #0d1117;
       --card-bg: #161b22;
@@ -412,7 +419,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     /* Code & Tag styles */
     .mono { font-family: var(--font-mono); }
-    .sha-tag {
+    .sha-tag, .sha-badge {
       font-family: var(--font-mono);
       font-size: 0.78rem;
       background: rgba(255, 255, 255, 0.05);
@@ -422,7 +429,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       cursor: pointer;
       user-select: all;
     }
-    .sha-tag:hover {
+    .sha-tag:hover, .sha-badge:hover {
       border-color: var(--accent);
       color: var(--text-bright);
     }
@@ -497,8 +504,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="header-actions">
         <span id="health-badge" class="badge badge-info">INITIALIZING</span>
         <span id="header-meta" class="header-meta">Checking health...</span>
-        <button id="btn-export-csv" class="btn btn-secondary" onclick="exportComputeCsv()" title="Export compute usage snapshots to CSV">Export Compute CSV</button>
-        <button id="btn-auth" class="btn btn-primary" onclick="promptAuthToken()" title="Set or manage Bearer token">Auth / Token</button>
+        <button id="btn-refresh" class="btn btn-secondary btn-sm" title="Refresh all telemetry data">Refresh Now</button>
+        <button id="btn-export-csv" class="btn btn-secondary" title="Export compute usage snapshots to CSV">Export Compute CSV</button>
+        <button id="btn-set-token" data-testid="btn-auth" class="btn btn-primary" title="Set or manage Bearer token">Auth / Token</button>
       </div>
     </header>
 
@@ -599,11 +607,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="filter-bar">
         <div class="filter-group">
           <label for="filter-project">Project:</label>
-          <input type="text" id="filter-project" placeholder="Filter by project ID..." oninput="applyFilters()" />
+          <input type="text" id="filter-project" placeholder="Filter by project ID..." />
         </div>
         <div class="filter-group">
           <label for="filter-status">Status:</label>
-          <select id="filter-status" onchange="applyFilters()">
+          <select id="filter-status">
             <option value="">All Statuses</option>
             <option value="RUNNING">RUNNING</option>
             <option value="COMPLETED">COMPLETED</option>
@@ -612,7 +620,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </select>
         </div>
         <div class="filter-actions">
-          <button class="btn btn-sm btn-secondary" onclick="refreshAll()">Refresh Now</button>
+          <button id="btn-refresh-filter" class="btn btn-sm btn-secondary" title="Refresh telemetry data">Refresh Now</button>
         </div>
       </div>
 
@@ -746,24 +754,81 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </footer>
   </div>
 
-  <script>
+  <script nonce="__CSP_NONCE__">
     // State management
     let token = sessionStorage.getItem('colab_monitor_token') || '';
     let selectedRunId = null;
     let cachedRuns = [];
 
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+
     function getHeaders() {
       return token ? { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' } : { 'Accept': 'application/json' };
     }
 
+    function formatNumber(val, decimals, fallback = '-') {
+      if (val === null || val === undefined || val === '') return fallback;
+      const n = Number(val);
+      return Number.isFinite(n) ? n.toFixed(decimals) : fallback;
+    }
+
+    function formatBytes(bytes) {
+      if (bytes == null || bytes === '') return '-';
+      const n = Number(bytes);
+      if (!Number.isFinite(n)) return '-';
+      if (n === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      const i = Math.floor(Math.log(n) / Math.log(k));
+      const safeI = Math.min(Math.max(0, i), sizes.length - 1);
+      const val = n / Math.pow(k, safeI);
+      return (Number.isFinite(val) ? val.toFixed(2) : '-') + ' ' + sizes[safeI];
+    }
+
+    function createSha256Badge(hash) {
+      if (!hash) {
+        const span = document.createElement('span');
+        span.textContent = '-';
+        return span;
+      }
+      const strHash = String(hash);
+      const short = strHash.length > 12 ? strHash.slice(0, 8) + '...' + strHash.slice(-4) : strHash;
+      const span = document.createElement('span');
+      span.className = 'sha-badge';
+      span.title = `Click to copy SHA-256: ${strHash}`;
+      span.textContent = `${short} 📋`;
+      span.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(strHash);
+        }
+      });
+      return span;
+    }
+
+    function renderSha256(hash) {
+      return createSha256Badge(hash);
+    }
+
+    function createSvgElement(tag, attrs = {}, text = null) {
+      const el = document.createElementNS(SVG_NS, tag);
+      for (const [k, v] of Object.entries(attrs)) {
+        el.setAttribute(k, String(v));
+      }
+      if (text !== null) {
+        el.textContent = String(text);
+      }
+      return el;
+    }
+
     function updateAuthButtonState() {
-      const btn = document.getElementById('btn-auth');
+      const btn = document.getElementById('btn-set-token') || document.getElementById('btn-auth');
       if (!btn) return;
       if (token) {
-        btn.innerText = 'Token: Set';
+        btn.textContent = 'Token: Set';
         btn.className = 'btn btn-success';
       } else {
-        btn.innerText = 'Auth / Token';
+        btn.textContent = 'Auth / Token';
         btn.className = 'btn btn-primary';
       }
     }
@@ -792,26 +857,41 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function showAuthBanner(message) {
       const banner = document.getElementById('auth-banner');
       if (banner) {
-        banner.innerHTML = `
-          <div class="banner-inner">
-            <span><strong>401 Unauthorized:</strong> ${message || 'Valid Bearer token required.'}</span>
-            <button class="btn btn-sm btn-primary" onclick="promptAuthToken()">Set Bearer Token</button>
-          </div>
-        `;
+        const inner = document.createElement('div');
+        inner.className = 'banner-inner';
+
+        const span = document.createElement('span');
+        const strong = document.createElement('strong');
+        strong.textContent = '401 Unauthorized: ';
+        span.appendChild(strong);
+        span.appendChild(document.createTextNode(String(message || 'Valid Bearer token required.')));
+
+        const btn = document.createElement('button');
+        btn.id = 'btn-set-token-banner';
+        btn.className = 'btn btn-sm btn-primary';
+        btn.textContent = 'Set Bearer Token';
+        btn.addEventListener('click', promptAuthToken);
+
+        inner.appendChild(span);
+        inner.appendChild(btn);
+        banner.replaceChildren(inner);
         banner.classList.remove('hidden');
       }
       const badge = document.getElementById('health-badge');
       if (badge) {
-        badge.innerText = 'AUTH REQUIRED';
+        badge.textContent = 'AUTH REQUIRED';
         badge.className = 'badge badge-danger';
       }
       const meta = document.getElementById('header-meta');
-      if (meta) meta.innerText = 'Authentication required';
+      if (meta) meta.textContent = 'Authentication required';
     }
 
     function hideAuthBanner() {
       const banner = document.getElementById('auth-banner');
-      if (banner) banner.classList.add('hidden');
+      if (banner) {
+        banner.replaceChildren();
+        banner.classList.add('hidden');
+      }
     }
 
     function showHealthWarning(status, isStale, backoff, lastCollected) {
@@ -819,14 +899,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!banner) return;
       if (status === 'ERROR' || status === 'DEGRADED' || isStale) {
         const reason = status === 'ERROR' ? 'Collector error detected' : (isStale ? 'Data is STALE' : 'Collector DEGRADED');
-        banner.innerHTML = `
-          <div class="banner-inner">
-            <span><strong>Collector Alert [${reason}]:</strong> Backoff level: ${backoff || 0}. Last collected: ${lastCollected || 'Never'}.</span>
-            <button class="btn btn-sm btn-secondary" onclick="refreshAll()">Retry Now</button>
-          </div>
-        `;
+        const inner = document.createElement('div');
+        inner.className = 'banner-inner';
+
+        const span = document.createElement('span');
+        const strong = document.createElement('strong');
+        strong.textContent = `Collector Alert [${reason}]: `;
+        span.appendChild(strong);
+        span.appendChild(document.createTextNode(`Backoff level: ${backoff || 0}. Last collected: ${lastCollected || 'Never'}.`));
+
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-sm btn-secondary';
+        btn.textContent = 'Retry Now';
+        btn.addEventListener('click', refreshAll);
+
+        inner.appendChild(span);
+        inner.appendChild(btn);
+        banner.replaceChildren(inner);
         banner.classList.remove('hidden');
       } else {
+        banner.replaceChildren();
         banner.classList.add('hidden');
       }
     }
@@ -857,33 +949,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    function formatBytes(bytes) {
-      if (bytes == null || isNaN(bytes)) return '-';
-      if (bytes === 0) return '0 B';
-      const k = 1024;
-      const sizes = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-      const i = Math.floor(Math.log(bytes) / Math.log(k));
-      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-    }
-
-    function renderSha256(hash) {
-      if (!hash) return '-';
-      const short = hash.length > 12 ? hash.slice(0, 8) + '...' + hash.slice(-4) : hash;
-      return `<span class="sha-tag" title="Click to copy SHA-256: ${hash}" onclick="navigator.clipboard.writeText('${hash}')">${short} 📋</span>`;
-    }
-
     function renderComputeChart(samples) {
       const container = document.getElementById('compute-chart-container');
       if (!container) return;
 
+      container.replaceChildren();
+
+      const emptyDiv = () => {
+        const d = document.createElement('div');
+        d.className = 'chart-empty';
+        d.textContent = 'No historical compute samples observed yet';
+        return d;
+      };
+
       if (!samples || samples.length === 0) {
-        container.innerHTML = '<div class="chart-empty">No historical compute samples observed yet</div>';
+        container.appendChild(emptyDiv());
         return;
       }
 
       const valid = samples.filter(s => s && s.balance_cu != null);
       if (valid.length === 0) {
-        container.innerHTML = '<div class="chart-empty">No historical compute samples observed yet</div>';
+        container.appendChild(emptyDiv());
         return;
       }
 
@@ -896,8 +982,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const plotW = width - padLeft - padRight;
       const plotH = height - padTop - padBottom;
 
-      const balances = valid.map(s => s.balance_cu);
-      const rates = valid.map(s => (s.rate_cu_per_hour != null ? s.rate_cu_per_hour : 0));
+      const balances = valid.map(s => Number(s.balance_cu)).filter(n => Number.isFinite(n));
+      const rates = valid.map(s => (s.rate_cu_per_hour != null ? Number(s.rate_cu_per_hour) : 0)).filter(n => Number.isFinite(n));
+
+      if (balances.length === 0) {
+        container.appendChild(emptyDiv());
+        return;
+      }
 
       let minB = Math.min(...balances);
       let maxB = Math.max(...balances);
@@ -905,7 +996,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       minB = Math.max(0, minB - 1);
       maxB = maxB + 1;
 
-      let maxR = Math.max(...rates, 1.0);
+      let maxR = rates.length > 0 ? Math.max(...rates, 1.0) : 1.0;
 
       const n = valid.length;
       const pointsB = [];
@@ -913,45 +1004,89 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       for (let i = 0; i < n; i++) {
         const x = padLeft + (n > 1 ? (i / (n - 1)) * plotW : plotW / 2);
-        const yB = padTop + plotH - ((valid[i].balance_cu - minB) / (maxB - minB)) * plotH;
-        pointsB.push(`${x.toFixed(1)},${yB.toFixed(1)}`);
+        const bVal = Number(valid[i].balance_cu);
+        const yB = padTop + plotH - ((bVal - minB) / (maxB - minB)) * plotH;
+        pointsB.push(`${formatNumber(x, 1)},${formatNumber(yB, 1)}`);
 
-        const r = valid[i].rate_cu_per_hour != null ? valid[i].rate_cu_per_hour : 0;
+        const r = valid[i].rate_cu_per_hour != null ? Number(valid[i].rate_cu_per_hour) : 0;
         const yR = padTop + plotH - (r / maxR) * plotH;
-        pointsR.push(`${x.toFixed(1)},${yR.toFixed(1)}`);
+        pointsR.push(`${formatNumber(x, 1)},${formatNumber(yR, 1)}`);
       }
 
-      const polylineB = `<polyline fill="none" stroke="#58a6ff" stroke-width="2.5" points="${pointsB.join(' ')}" />`;
-      const polylineR = `<polyline fill="none" stroke="#3fb950" stroke-width="1.8" stroke-dasharray="4,4" points="${pointsR.join(' ')}" />`;
+      const svg = createSvgElement('svg', {
+        viewBox: `0 0 ${width} ${height}`,
+        class: 'chart-svg',
+        preserveAspectRatio: 'xMidYMid meet'
+      });
 
-      const tStart = valid[0].observed_at ? valid[0].observed_at.slice(11, 19) : 'start';
-      const tEnd = valid[n - 1].observed_at ? valid[n - 1].observed_at.slice(11, 19) : 'now';
+      svg.appendChild(createSvgElement('line', {
+        x1: padLeft, y1: padTop, x2: padLeft, y2: padTop + plotH,
+        stroke: '#30363d', 'stroke-width': '1'
+      }));
+      svg.appendChild(createSvgElement('line', {
+        x1: padLeft, y1: padTop + plotH, x2: padLeft + plotW, y2: padTop + plotH,
+        stroke: '#30363d', 'stroke-width': '1'
+      }));
+      svg.appendChild(createSvgElement('line', {
+        x1: padLeft, y1: padTop, x2: padLeft + plotW, y2: padTop,
+        stroke: '#21262d', 'stroke-width': '1', 'stroke-dasharray': '2,2'
+      }));
 
-      container.innerHTML = `
-        <svg viewBox="0 0 ${width} ${height}" class="chart-svg" preserveAspectRatio="xMidYMid meet">
-          <line x1="${padLeft}" y1="${padTop}" x2="${padLeft}" y2="${padTop + plotH}" stroke="#30363d" stroke-width="1" />
-          <line x1="${padLeft}" y1="${padTop + plotH}" x2="${padLeft + plotW}" y2="${padTop + plotH}" stroke="#30363d" stroke-width="1" />
-          <line x1="${padLeft}" y1="${padTop}" x2="${padLeft + plotW}" y2="${padTop}" stroke="#21262d" stroke-width="1" stroke-dasharray="2,2" />
-          <text x="${padLeft - 8}" y="${padTop + 10}" fill="#8b949e" font-size="11" text-anchor="end">${maxB.toFixed(1)} CU</text>
-          <text x="${padLeft - 8}" y="${padTop + plotH}" fill="#8b949e" font-size="11" text-anchor="end">${minB.toFixed(1)} CU</text>
-          <text x="${padLeft}" y="${height - 12}" fill="#8b949e" font-size="11" text-anchor="start">${tStart}</text>
-          <text x="${width - padRight}" y="${height - 12}" fill="#8b949e" font-size="11" text-anchor="end">${tEnd}</text>
-          <g transform="translate(${padLeft + 10}, 16)">
-            <line x1="0" y1="0" x2="20" y2="0" stroke="#58a6ff" stroke-width="2.5" />
-            <text x="25" y="4" fill="#c9d1d9" font-size="11">Balance CU</text>
-            <line x1="120" y1="0" x2="140" y2="0" stroke="#3fb950" stroke-width="1.8" stroke-dasharray="4,4" />
-            <text x="145" y="4" fill="#c9d1d9" font-size="11">Rate CU/hr (max ${maxR.toFixed(1)})</text>
-          </g>
-          ${polylineB}
-          ${polylineR}
-        </svg>
-      `;
+      svg.appendChild(createSvgElement('text', {
+        x: padLeft - 8, y: padTop + 10, fill: '#8b949e', 'font-size': '11', 'text-anchor': 'end'
+      }, `${formatNumber(maxB, 1)} CU`));
+      svg.appendChild(createSvgElement('text', {
+        x: padLeft - 8, y: padTop + plotH, fill: '#8b949e', 'font-size': '11', 'text-anchor': 'end'
+      }, `${formatNumber(minB, 1)} CU`));
+
+      const tStart = valid[0].observed_at ? String(valid[0].observed_at).slice(11, 19) : 'start';
+      const tEnd = valid[n - 1].observed_at ? String(valid[n - 1].observed_at).slice(11, 19) : 'now';
+
+      svg.appendChild(createSvgElement('text', {
+        x: padLeft, y: height - 12, fill: '#8b949e', 'font-size': '11', 'text-anchor': 'start'
+      }, tStart));
+      svg.appendChild(createSvgElement('text', {
+        x: width - padRight, y: height - 12, fill: '#8b949e', 'font-size': '11', 'text-anchor': 'end'
+      }, tEnd));
+
+      const g = createSvgElement('g', { transform: `translate(${padLeft + 10}, 16)` });
+      g.appendChild(createSvgElement('line', {
+        x1: '0', y1: '0', x2: '20', y2: '0', stroke: '#58a6ff', 'stroke-width': '2.5'
+      }));
+      g.appendChild(createSvgElement('text', {
+        x: '25', y: '4', fill: '#c9d1d9', 'font-size': '11'
+      }, 'Balance CU'));
+      g.appendChild(createSvgElement('line', {
+        x1: '120', y1: '0', x2: '140', y2: '0', stroke: '#3fb950', 'stroke-width': '1.8', 'stroke-dasharray': '4,4'
+      }));
+      g.appendChild(createSvgElement('text', {
+        x: '145', y: '4', fill: '#c9d1d9', 'font-size': '11'
+      }, `Rate CU/hr (max ${formatNumber(maxR, 1)})`));
+      svg.appendChild(g);
+
+      svg.appendChild(createSvgElement('polyline', {
+        fill: 'none', stroke: '#58a6ff', 'stroke-width': '2.5', points: pointsB.join(' ')
+      }));
+      svg.appendChild(createSvgElement('polyline', {
+        fill: 'none', stroke: '#3fb950', 'stroke-width': '1.8', 'stroke-dasharray': '4,4', points: pointsR.join(' ')
+      }));
+
+      container.appendChild(svg);
     }
 
     function renderMetricsChart(metricsList) {
       const container = document.getElementById('run-metrics-chart-container');
       const gpuBadge = document.getElementById('gpu-util-badge');
       if (!container) return;
+
+      container.replaceChildren();
+
+      const emptyDiv = (text) => {
+        const d = document.createElement('div');
+        d.className = 'chart-empty';
+        d.textContent = text;
+        return d;
+      };
 
       // Extract GPU utilization strictly when present
       let measuredGpu = null;
@@ -972,15 +1107,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (gpuBadge) {
         if (measuredGpu != null) {
           gpuBadge.className = 'badge badge-info';
-          gpuBadge.innerText = `GPU Utilization: ${measuredGpu}`;
+          gpuBadge.textContent = `GPU Utilization: ${measuredGpu}`;
         } else {
           gpuBadge.className = 'badge badge-neutral';
-          gpuBadge.innerText = 'GPU utilization: not measured';
+          gpuBadge.textContent = 'GPU utilization: not measured';
         }
       }
 
       if (!metricsList || metricsList.length === 0) {
-        container.innerHTML = '<div class="chart-empty">No metrics recorded for this run</div>';
+        container.appendChild(emptyDiv('No metrics recorded for this run'));
         return;
       }
 
@@ -991,13 +1126,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const pt = metricsList[i];
         const step = pt.step != null ? pt.step : (pt.epoch != null ? pt.epoch : i);
         const m = pt.metrics || {};
-        if (m.loss != null) lossPoints.push({ step, val: m.loss });
-        if (m.val_loss != null) valPoints.push({ step, val: m.val_loss });
-        else if (m.eval_loss != null) valPoints.push({ step, val: m.eval_loss });
+        if (m.loss != null && Number.isFinite(Number(m.loss))) {
+          lossPoints.push({ step, val: Number(m.loss) });
+        }
+        if (m.val_loss != null && Number.isFinite(Number(m.val_loss))) {
+          valPoints.push({ step, val: Number(m.val_loss) });
+        } else if (m.eval_loss != null && Number.isFinite(Number(m.eval_loss))) {
+          valPoints.push({ step, val: Number(m.eval_loss) });
+        }
       }
 
       if (lossPoints.length === 0 && valPoints.length === 0) {
-        container.innerHTML = '<div class="chart-empty">No loss or evaluation metrics recorded for this run</div>';
+        container.appendChild(emptyDiv('No loss or evaluation metrics recorded for this run'));
         return;
       }
 
@@ -1019,32 +1159,65 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const totalCount = Math.max(lossPoints.length, valPoints.length);
 
       function makePolyline(pts, color) {
-        if (pts.length === 0) return '';
+        if (pts.length === 0) return null;
         const coords = pts.map((p, idx) => {
           const x = padLeft + (totalCount > 1 ? (idx / (totalCount - 1)) * plotW : plotW / 2);
           const y = padTop + plotH - ((p.val - minV) / (maxV - minV)) * plotH;
-          return `${x.toFixed(1)},${y.toFixed(1)}`;
+          return `${formatNumber(x, 1)},${formatNumber(y, 1)}`;
         });
-        return `<polyline fill="none" stroke="${color}" stroke-width="2" points="${coords.join(' ')}" />`;
+        return createSvgElement('polyline', {
+          fill: 'none', stroke: color, 'stroke-width': '2', points: coords.join(' ')
+        });
       }
 
-      const lineLoss = makePolyline(lossPoints, '#58a6ff');
-      const lineVal = makePolyline(valPoints, '#d29922');
+      const svg = createSvgElement('svg', {
+        viewBox: `0 0 ${width} ${height}`,
+        class: 'chart-svg',
+        preserveAspectRatio: 'xMidYMid meet'
+      });
 
-      container.innerHTML = `
-        <svg viewBox="0 0 ${width} ${height}" class="chart-svg" preserveAspectRatio="xMidYMid meet">
-          <line x1="${padLeft}" y1="${padTop}" x2="${padLeft}" y2="${padTop + plotH}" stroke="#30363d" stroke-width="1" />
-          <line x1="${padLeft}" y1="${padTop + plotH}" x2="${padLeft + plotW}" y2="${padTop + plotH}" stroke="#30363d" stroke-width="1" />
-          <text x="${padLeft - 8}" y="${padTop + 10}" fill="#8b949e" font-size="11" text-anchor="end">${maxV.toFixed(2)}</text>
-          <text x="${padLeft - 8}" y="${padTop + plotH}" fill="#8b949e" font-size="11" text-anchor="end">${minV.toFixed(2)}</text>
-          <g transform="translate(${padLeft + 10}, 16)">
-            ${lossPoints.length > 0 ? '<line x1="0" y1="0" x2="16" y2="0" stroke="#58a6ff" stroke-width="2" /><text x="22" y="4" fill="#c9d1d9" font-size="11">Loss</text>' : ''}
-            ${valPoints.length > 0 ? `<line x1="${lossPoints.length > 0 ? 80 : 0}" y1="0" x2="${lossPoints.length > 0 ? 96 : 16}" y2="0" stroke="#d29922" stroke-width="2" /><text x="${lossPoints.length > 0 ? 102 : 22}" y="4" fill="#c9d1d9" font-size="11">Val / Eval Loss</text>` : ''}
-          </g>
-          ${lineLoss}
-          ${lineVal}
-        </svg>
-      `;
+      svg.appendChild(createSvgElement('line', {
+        x1: padLeft, y1: padTop, x2: padLeft, y2: padTop + plotH,
+        stroke: '#30363d', 'stroke-width': '1'
+      }));
+      svg.appendChild(createSvgElement('line', {
+        x1: padLeft, y1: padTop + plotH, x2: padLeft + plotW, y2: padTop + plotH,
+        stroke: '#30363d', 'stroke-width': '1'
+      }));
+
+      svg.appendChild(createSvgElement('text', {
+        x: padLeft - 8, y: padTop + 10, fill: '#8b949e', 'font-size': '11', 'text-anchor': 'end'
+      }, formatNumber(maxV, 2)));
+      svg.appendChild(createSvgElement('text', {
+        x: padLeft - 8, y: padTop + plotH, fill: '#8b949e', 'font-size': '11', 'text-anchor': 'end'
+      }, formatNumber(minV, 2)));
+
+      const g = createSvgElement('g', { transform: `translate(${padLeft + 10}, 16)` });
+      if (lossPoints.length > 0) {
+        g.appendChild(createSvgElement('line', {
+          x1: '0', y1: '0', x2: '16', y2: '0', stroke: '#58a6ff', 'stroke-width': '2'
+        }));
+        g.appendChild(createSvgElement('text', {
+          x: '22', y: '4', fill: '#c9d1d9', 'font-size': '11'
+        }, 'Loss'));
+      }
+      if (valPoints.length > 0) {
+        const offX = lossPoints.length > 0 ? 80 : 0;
+        g.appendChild(createSvgElement('line', {
+          x1: offX, y1: '0', x2: offX + 16, y2: '0', stroke: '#d29922', 'stroke-width': '2'
+        }));
+        g.appendChild(createSvgElement('text', {
+          x: offX + 22, y: '4', fill: '#c9d1d9', 'font-size': '11'
+        }, 'Val / Eval Loss'));
+      }
+      svg.appendChild(g);
+
+      const lineLoss = makePolyline(lossPoints, '#58a6ff');
+      if (lineLoss) svg.appendChild(lineLoss);
+      const lineVal = makePolyline(valPoints, '#d29922');
+      if (lineVal) svg.appendChild(lineVal);
+
+      container.appendChild(svg);
     }
 
     function renderLogs(logsList, errorEvents) {
@@ -1054,20 +1227,41 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       if (errorBanner) {
         if (errorEvents && errorEvents.length > 0) {
-          const msgs = errorEvents.map(e => e.details?.message || e.details?.error || JSON.stringify(e.details || {})).join('<br>');
-          errorBanner.innerHTML = `<strong>Runtime Errors Detected:</strong><br>${msgs}`;
+          const headerDiv = document.createElement('div');
+          const strong = document.createElement('strong');
+          strong.textContent = 'Runtime Errors Detected:';
+          headerDiv.appendChild(strong);
+
+          const items = [headerDiv];
+          for (const e of errorEvents) {
+            const itemDiv = document.createElement('div');
+            const msg = e?.details?.message || e?.details?.error || (typeof e?.details === 'object' ? JSON.stringify(e.details) : String(e?.details || ''));
+            itemDiv.textContent = msg;
+            items.push(itemDiv);
+          }
+          errorBanner.replaceChildren(...items);
           errorBanner.classList.remove('hidden');
         } else {
+          errorBanner.replaceChildren();
           errorBanner.classList.add('hidden');
         }
       }
 
       if (!logsList || logsList.length === 0) {
-        consoleEl.innerHTML = '<span style="color: var(--text-dim); font-style: italic;">No logs available for this run</span>';
+        const emptySpan = document.createElement('span');
+        emptySpan.style.color = 'var(--text-dim)';
+        emptySpan.style.fontStyle = 'italic';
+        emptySpan.textContent = 'No logs available for this run';
+        consoleEl.replaceChildren(emptySpan);
         return;
       }
 
-      consoleEl.innerText = logsList.join('\n');
+      consoleEl.replaceChildren();
+      for (const line of logsList) {
+        const lineDiv = document.createElement('div');
+        lineDiv.textContent = String(line);
+        consoleEl.appendChild(lineDiv);
+      }
       consoleEl.scrollTop = consoleEl.scrollHeight;
     }
 
@@ -1077,40 +1271,78 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!tbody) return;
 
       if (driveBadge) {
-        const driveStatus = driveInfo?.drive_publication_status || (artifactsList.some(a => a.storage_provider === 'google_drive' || a.remote_file_id) ? 'PUBLISHED' : (artifactsList.length ? 'PENDING' : 'DISABLED'));
-        driveBadge.innerText = `Drive: ${driveStatus}`;
+        const driveStatus = driveInfo?.drive_publication_status || (artifactsList && artifactsList.some(a => a.storage_provider === 'google_drive' || a.remote_file_id) ? 'PUBLISHED' : (artifactsList && artifactsList.length ? 'PENDING' : 'DISABLED'));
+        driveBadge.textContent = `Drive: ${driveStatus}`;
         if (driveStatus === 'PUBLISHED') driveBadge.className = 'badge badge-purple';
         else if (driveStatus === 'PENDING') driveBadge.className = 'badge badge-warning';
         else driveBadge.className = 'badge badge-neutral';
       }
 
+      tbody.replaceChildren();
+
       if (!artifactsList || artifactsList.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" class="table-empty">No artifacts recorded for this run</td></tr>';
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 7;
+        td.className = 'table-empty';
+        td.textContent = 'No artifacts recorded for this run';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
         return;
       }
 
-      tbody.innerHTML = artifactsList.map(a => {
-        const isDrive = a.storage_provider === 'google_drive' || !!a.remote_file_id;
-        const provBadge = isDrive ? '<span class="badge badge-purple">google_drive</span>' : '<span class="badge badge-neutral">local</span>';
-        const vDate = a.verified_at ? a.verified_at.slice(0, 19).replace('T', ' ') : '-';
-        return `
-          <tr>
-            <td class="mono"><strong>${a.artifact_id || '-'}</strong></td>
-            <td><span class="badge badge-info">${a.artifact_type || 'artifact'}</span></td>
-            <td>${formatBytes(a.size_bytes)}</td>
-            <td>${renderSha256(a.sha256)}</td>
-            <td>${provBadge}</td>
-            <td class="mono">${a.remote_file_id || '-'}</td>
-            <td class="mono">${vDate}</td>
-          </tr>
-        `;
-      }).join('');
+      for (const a of artifactsList) {
+        const tr = document.createElement('tr');
+
+        const tdId = document.createElement('td');
+        tdId.className = 'mono';
+        const strongId = document.createElement('strong');
+        strongId.textContent = a.artifact_id || '-';
+        tdId.appendChild(strongId);
+        tr.appendChild(tdId);
+
+        const tdType = document.createElement('td');
+        const typeBadge = document.createElement('span');
+        typeBadge.className = 'badge badge-info';
+        typeBadge.textContent = a.artifact_type || 'artifact';
+        tdType.appendChild(typeBadge);
+        tr.appendChild(tdType);
+
+        const tdSize = document.createElement('td');
+        tdSize.textContent = formatBytes(a.size_bytes);
+        tr.appendChild(tdSize);
+
+        const tdSha = document.createElement('td');
+        tdSha.appendChild(createSha256Badge(a.sha256));
+        tr.appendChild(tdSha);
+
+        const tdProv = document.createElement('td');
+        const provBadge = document.createElement('span');
+        const isDrive = a.storage_provider === 'google_drive' || Boolean(a.remote_file_id);
+        provBadge.className = isDrive ? 'badge badge-purple' : 'badge badge-neutral';
+        provBadge.textContent = isDrive ? 'google_drive' : 'local';
+        tdProv.appendChild(provBadge);
+        tr.appendChild(tdProv);
+
+        const tdRemote = document.createElement('td');
+        tdRemote.className = 'mono';
+        tdRemote.textContent = a.remote_file_id || '-';
+        tr.appendChild(tdRemote);
+
+        const tdVerified = document.createElement('td');
+        tdVerified.className = 'mono';
+        tdVerified.textContent = a.verified_at ? String(a.verified_at).slice(0, 19).replace('T', ' ') : '-';
+        tr.appendChild(tdVerified);
+
+        tbody.appendChild(tr);
+      }
     }
 
     async function selectRun(runId) {
-      selectedRunId = runId;
+      const safeRunId = String(runId || '');
+      selectedRunId = safeRunId;
       document.querySelectorAll('#runs-tbody tr').forEach(row => {
-        row.classList.toggle('selected', row.getAttribute('data-run-id') === runId);
+        row.classList.toggle('selected', (row.dataset.runId || row.getAttribute('data-run-id')) === safeRunId);
       });
 
       const placeholder = document.getElementById('inspector-placeholder');
@@ -1119,41 +1351,48 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       if (placeholder) placeholder.classList.add('hidden');
       if (content) content.classList.remove('hidden');
-      if (subtitle) subtitle.innerText = `Inspecting run: ${runId}`;
+      if (subtitle) subtitle.textContent = `Inspecting run: ${safeRunId}`;
 
       // Update meta bar from cached run info
-      const run = cachedRuns.find(r => r.run_id === runId) || {};
-      document.getElementById('insp-run-id').innerText = runId;
-      document.getElementById('insp-project-id').innerText = run.project_id || '-';
+      const run = cachedRuns.find(r => String(r.run_id) === safeRunId) || {};
+      const elRunId = document.getElementById('insp-run-id');
+      if (elRunId) elRunId.textContent = safeRunId;
+      const elProjId = document.getElementById('insp-project-id');
+      if (elProjId) elProjId.textContent = run.project_id || '-';
 
       const statusBadge = document.getElementById('insp-status');
       if (statusBadge) {
-        const s = run.status || 'UNKNOWN';
-        statusBadge.innerText = s;
+        const s = String(run.status || 'UNKNOWN');
+        const cleanStatus = s.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+        statusBadge.textContent = s;
         if (s === 'COMPLETED') statusBadge.className = 'badge badge-success';
         else if (s === 'RUNNING') statusBadge.className = 'badge badge-info';
         else if (s === 'FAILED') statusBadge.className = 'badge badge-danger';
-        else statusBadge.className = 'badge badge-warning';
+        else if (s === 'TERMINATED') statusBadge.className = 'badge badge-warning';
+        else statusBadge.className = `badge badge-${cleanStatus}`;
       }
 
       const rtBadge = document.getElementById('insp-runtime-status');
       if (rtBadge) {
-        const active = !!run.is_runtime_active;
-        rtBadge.innerText = active ? 'ACTIVE' : 'TERMINATED / DURABLE';
+        const active = Boolean(run.is_runtime_active);
+        rtBadge.textContent = active ? 'ACTIVE' : 'TERMINATED / DURABLE';
         rtBadge.className = active ? 'badge badge-success' : 'badge badge-neutral';
       }
 
-      document.getElementById('insp-started-at').innerText = run.start_time ? run.start_time.slice(0, 19).replace('T', ' ') : '-';
-      document.getElementById('insp-completed-at').innerText = run.completion_time ? run.completion_time.slice(0, 19).replace('T', ' ') : '-';
+      const elStarted = document.getElementById('insp-started-at');
+      if (elStarted) elStarted.textContent = run.start_time ? String(run.start_time).slice(0, 19).replace('T', ' ') : '-';
+      const elCompleted = document.getElementById('insp-completed-at');
+      if (elCompleted) elCompleted.textContent = run.completion_time ? String(run.completion_time).slice(0, 19).replace('T', ' ') : '-';
 
-      // Fetch detail endpoints
+      // Fetch detail endpoints with URL-encoded runId
+      const encodedId = encodeURIComponent(safeRunId);
       try {
         const [detailRes, metricsRes, logsRes, driveRes, artifactsRes] = await Promise.all([
-          fetch(`/api/v1/runs/${runId}`, { headers: getHeaders() }),
-          fetch(`/api/v1/runs/${runId}/metrics`, { headers: getHeaders() }),
-          fetch(`/api/v1/runs/${runId}/logs`, { headers: getHeaders() }),
-          fetch(`/api/v1/runs/${runId}/drive`, { headers: getHeaders() }),
-          fetch(`/api/v1/runs/${runId}/artifacts`, { headers: getHeaders() }),
+          fetch(`/api/v1/runs/${encodedId}`, { headers: getHeaders() }),
+          fetch(`/api/v1/runs/${encodedId}/metrics`, { headers: getHeaders() }),
+          fetch(`/api/v1/runs/${encodedId}/logs`, { headers: getHeaders() }),
+          fetch(`/api/v1/runs/${encodedId}/drive`, { headers: getHeaders() }),
+          fetch(`/api/v1/runs/${encodedId}/artifacts`, { headers: getHeaders() }),
         ]);
 
         if (detailRes.status === 401) { showAuthBanner(); return; }
@@ -1191,86 +1430,191 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const tbody = document.getElementById('runs-tbody');
       if (!tbody) return;
 
+      tbody.replaceChildren();
+
       if (!runs || runs.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="9" class="table-empty">No training runs found matching filter</td></tr>';
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 9;
+        td.className = 'table-empty';
+        td.textContent = 'No training runs found matching filter';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
         return;
       }
 
-      tbody.innerHTML = runs.map(r => {
-        const isSelected = r.run_id === selectedRunId ? 'selected' : '';
-        const s = r.status || 'UNKNOWN';
+      for (const r of runs) {
+        const tr = document.createElement('tr');
+        const runIdStr = String(r.run_id || '');
+        tr.dataset.runId = runIdStr;
+        tr.className = 'clickable' + (runIdStr === selectedRunId ? ' selected' : '');
+        tr.addEventListener('click', () => selectRun(runIdStr));
+
+        const tdRunId = document.createElement('td');
+        tdRunId.className = 'mono';
+        const strongRunId = document.createElement('strong');
+        strongRunId.textContent = runIdStr;
+        tdRunId.appendChild(strongRunId);
+        tr.appendChild(tdRunId);
+
+        const tdProj = document.createElement('td');
+        tdProj.className = 'mono';
+        tdProj.textContent = r.project_id || '-';
+        tr.appendChild(tdProj);
+
+        const tdStatus = document.createElement('td');
+        const statusBadge = document.createElement('span');
+        const s = String(r.status || 'UNKNOWN');
+        const cleanStatus = s.toLowerCase().replace(/[^a-z0-9_-]/g, '');
         let statusClass = 'badge-neutral';
         if (s === 'COMPLETED') statusClass = 'badge-success';
         else if (s === 'RUNNING') statusClass = 'badge-info';
         else if (s === 'FAILED') statusClass = 'badge-danger';
         else if (s === 'TERMINATED') statusClass = 'badge-warning';
+        else statusClass = `badge-${cleanStatus}`;
+        statusBadge.className = `badge ${statusClass}`;
+        statusBadge.textContent = s;
+        tdStatus.appendChild(statusBadge);
+        tr.appendChild(tdStatus);
 
-        const rtText = r.is_runtime_active ? 'ACTIVE' : 'TERMINATED / DURABLE';
-        const rtClass = r.is_runtime_active ? 'badge-success' : 'badge-neutral';
+        const tdRt = document.createElement('td');
+        const rtBadge = document.createElement('span');
+        const active = Boolean(r.is_runtime_active);
+        rtBadge.className = active ? 'badge badge-success' : 'badge badge-neutral';
+        rtBadge.textContent = active ? 'ACTIVE' : 'TERMINATED / DURABLE';
+        tdRt.appendChild(rtBadge);
+        tr.appendChild(tdRt);
 
-        const epStep = (r.latest_epoch != null ? `ep ${r.latest_epoch}` : '') +
+        const tdEp = document.createElement('td');
+        tdEp.className = 'mono';
+        const epStr = (r.latest_epoch != null ? `ep ${r.latest_epoch}` : '') +
           (r.latest_step != null ? ` / step ${r.latest_step}` : (r.latest_epoch != null ? '' : '-'));
+        tdEp.textContent = epStr;
+        tr.appendChild(tdEp);
 
+        const tdMetrics = document.createElement('td');
+        tdMetrics.className = 'mono';
+        tdMetrics.style.fontSize = '0.78rem';
         const m = r.latest_metrics || {};
         const metricParts = [];
-        if (m.loss != null) metricParts.push(`loss: ${m.loss.toFixed(3)}`);
-        if (m.val_loss != null) metricParts.push(`val: ${m.val_loss.toFixed(3)}`);
-        else if (m.eval_loss != null) metricParts.push(`eval: ${m.eval_loss.toFixed(3)}`);
-        if (m.accuracy != null) metricParts.push(`acc: ${(m.accuracy * 100).toFixed(1)}%`);
+        if (m.loss != null) metricParts.push(`loss: ${formatNumber(m.loss, 3)}`);
+        if (m.val_loss != null) metricParts.push(`val: ${formatNumber(m.val_loss, 3)}`);
+        else if (m.eval_loss != null) metricParts.push(`eval: ${formatNumber(m.eval_loss, 3)}`);
+        if (m.accuracy != null) {
+          const accNum = Number(m.accuracy);
+          metricParts.push(`acc: ${Number.isFinite(accNum) ? (accNum * 100).toFixed(1) : '-'}%`);
+        }
         if (m.gpu_util_pct != null) metricParts.push(`gpu: ${m.gpu_util_pct}%`);
-        const metricsStr = metricParts.length > 0 ? metricParts.join(', ') : '-';
+        tdMetrics.textContent = metricParts.length > 0 ? metricParts.join(', ') : '-';
+        tr.appendChild(tdMetrics);
 
+        const tdChk = document.createElement('td');
         const chkCount = r.checkpoint_count || 0;
-        const chkStr = chkCount > 0 ? `${chkCount}` + (r.latest_checkpoint_name ? ` (${r.latest_checkpoint_name})` : '') : '0';
+        const chkStr = chkCount > 0 ? String(chkCount) + (r.latest_checkpoint_name ? ` (${r.latest_checkpoint_name})` : '') : '0';
+        tdChk.appendChild(document.createTextNode(chkStr));
+        if (r.latest_checkpoint_sha256) {
+          tdChk.appendChild(document.createTextNode(' '));
+          tdChk.appendChild(createSha256Badge(r.latest_checkpoint_sha256));
+        }
+        tr.appendChild(tdChk);
 
-        const dStatus = r.drive_publication_status || 'PENDING';
+        const tdDrive = document.createElement('td');
+        const driveBadge = document.createElement('span');
+        const dStatus = String(r.drive_publication_status || 'PENDING');
+        const cleanDrive = dStatus.toLowerCase().replace(/[^a-z0-9_-]/g, '');
         let driveClass = 'badge-neutral';
         if (dStatus === 'PUBLISHED') driveClass = 'badge-purple';
         else if (dStatus === 'PENDING') driveClass = 'badge-warning';
+        else driveClass = `badge-${cleanDrive}`;
+        driveBadge.className = `badge ${driveClass}`;
+        driveBadge.textContent = dStatus;
+        tdDrive.appendChild(driveBadge);
+        tr.appendChild(tdDrive);
 
-        const srcBadge = r.source_snapshot_available
-          ? '<span class="badge badge-success">Available</span>'
-          : '<span class="text-dim">-</span>';
+        const tdSrc = document.createElement('td');
+        if (r.source_snapshot_available) {
+          const srcBadge = document.createElement('span');
+          srcBadge.className = 'badge badge-success';
+          srcBadge.textContent = 'Available';
+          tdSrc.appendChild(srcBadge);
+        } else {
+          const dimSpan = document.createElement('span');
+          dimSpan.className = 'text-dim';
+          dimSpan.textContent = '-';
+          tdSrc.appendChild(dimSpan);
+        }
+        tr.appendChild(tdSrc);
 
-        return `
-          <tr class="clickable ${isSelected}" data-run-id="${r.run_id}" onclick="selectRun('${r.run_id}')">
-            <td class="mono"><strong>${r.run_id}</strong></td>
-            <td class="mono">${r.project_id || '-'}</td>
-            <td><span class="badge ${statusClass}">${s}</span></td>
-            <td><span class="badge ${rtClass}">${rtText}</span></td>
-            <td class="mono">${epStep}</td>
-            <td class="mono" style="font-size: 0.78rem;">${metricsStr}</td>
-            <td>${chkStr}</td>
-            <td><span class="badge ${driveClass}">${dStatus}</span></td>
-            <td>${srcBadge}</td>
-          </tr>
-        `;
-      }).join('');
+        tbody.appendChild(tr);
+      }
     }
 
     function renderSessionsTable(sessions) {
       const tbody = document.getElementById('sessions-tbody');
       if (!tbody) return;
 
+      tbody.replaceChildren();
+
       if (!sessions || sessions.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" class="table-empty">No active managed Colab sessions</td></tr>';
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 6;
+        td.className = 'table-empty';
+        td.textContent = 'No active managed Colab sessions';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
         return;
       }
 
-      tbody.innerHTML = sessions.map(s => {
-        const stateClass = s.state === 'READY' || s.state === 'RUNNING' || s.state === 'ACTIVE' ? 'badge-success' : 'badge-warning';
-        const exp = s.expires_at ? s.expires_at.slice(0, 19).replace('T', ' ') : '-';
-        return `
-          <tr>
-            <td class="mono"><strong>${s.session_id}</strong></td>
-            <td class="mono">${s.project_name || 'unknown'}</td>
-            <td><span class="badge badge-info">${s.accelerator || 'T4'}</span></td>
-            <td><span class="badge ${stateClass}">${s.state || 'UNKNOWN'}</span></td>
-            <td class="mono">${exp}</td>
-            <td><span class="badge badge-managed">Managed</span></td>
-          </tr>
-        `;
-      }).join('');
+      for (const s of sessions) {
+        const tr = document.createElement('tr');
+
+        const tdId = document.createElement('td');
+        tdId.className = 'mono';
+        const strongId = document.createElement('strong');
+        strongId.textContent = s.session_id || '-';
+        tdId.appendChild(strongId);
+        tr.appendChild(tdId);
+
+        const tdProj = document.createElement('td');
+        tdProj.className = 'mono';
+        tdProj.textContent = s.project_name || 'unknown';
+        tr.appendChild(tdProj);
+
+        const tdAcc = document.createElement('td');
+        const accBadge = document.createElement('span');
+        accBadge.className = 'badge badge-info';
+        accBadge.textContent = s.accelerator || 'T4';
+        tdAcc.appendChild(accBadge);
+        tr.appendChild(tdAcc);
+
+        const tdState = document.createElement('td');
+        const stateBadge = document.createElement('span');
+        const st = String(s.state || 'UNKNOWN');
+        const cleanState = st.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+        let stateClass = 'badge-neutral';
+        if (st === 'READY' || st === 'RUNNING' || st === 'ACTIVE') stateClass = 'badge-success';
+        else if (st === 'TERMINATED' || st === 'FAILED') stateClass = 'badge-danger';
+        else stateClass = 'badge-warning';
+        stateBadge.className = `badge ${stateClass}`;
+        stateBadge.textContent = st;
+        tdState.appendChild(stateBadge);
+        tr.appendChild(tdState);
+
+        const tdExp = document.createElement('td');
+        tdExp.className = 'mono';
+        tdExp.textContent = s.expires_at ? String(s.expires_at).slice(0, 19).replace('T', ' ') : '-';
+        tr.appendChild(tdExp);
+
+        const tdVer = document.createElement('td');
+        const verBadge = document.createElement('span');
+        verBadge.className = 'badge badge-managed';
+        verBadge.textContent = 'Managed';
+        tdVer.appendChild(verBadge);
+        tr.appendChild(tdVer);
+
+        tbody.appendChild(tr);
+      }
     }
 
     async function refreshAll() {
@@ -1296,26 +1640,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const h = await healthRes.json();
           const badge = document.getElementById('health-badge');
           if (badge) {
-            badge.innerText = h.status || 'HEALTHY';
+            badge.textContent = h.status || 'HEALTHY';
             if (h.status === 'HEALTHY' && !h.is_stale) badge.className = 'badge badge-success';
             else if (h.status === 'ERROR') badge.className = 'badge badge-danger';
             else badge.className = 'badge badge-warning';
           }
           const meta = document.getElementById('header-meta');
           if (meta) {
-            const uptime = h.uptime_seconds ? `${Math.floor(h.uptime_seconds / 60)}m` : '0m';
-            meta.innerText = `Uptime: ${uptime} • Samples: ${h.sample_count || 0}`;
+            const uptime = h.uptime_seconds != null ? `${Math.floor(Number(h.uptime_seconds) / 60)}m` : '0m';
+            meta.textContent = `Uptime: ${uptime} • Samples: ${h.sample_count || 0}`;
           }
 
           const valCollector = document.getElementById('val-collector-health');
           if (valCollector) {
-            valCollector.innerText = h.status || 'HEALTHY';
+            valCollector.textContent = h.status || 'HEALTHY';
             valCollector.style.color = h.status === 'HEALTHY' ? 'var(--green)' : (h.status === 'ERROR' ? 'var(--red)' : 'var(--yellow)');
           }
           const metaCollector = document.getElementById('meta-collector-health');
           if (metaCollector) {
-            const last = h.last_collected_at ? h.last_collected_at.slice(11, 19) : 'None';
-            metaCollector.innerText = `Last: ${last} • Backoff: ${h.collector_backoff_level || 0}`;
+            const last = h.last_collected_at ? String(h.last_collected_at).slice(11, 19) : 'None';
+            metaCollector.textContent = `Last: ${last} • Backoff: ${h.collector_backoff_level || 0}`;
           }
 
           showHealthWarning(h.status, h.is_stale, h.collector_backoff_level, h.last_collected_at);
@@ -1326,26 +1670,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const s = await summaryRes.json();
           const valCu = document.getElementById('val-cu');
           if (valCu) {
-            valCu.innerText = s.current_balance_cu != null ? `${s.current_balance_cu.toFixed(2)} CU` : 'Unavailable';
+            const cuNum = Number(s.current_balance_cu);
+            valCu.textContent = (s.current_balance_cu != null && Number.isFinite(cuNum))
+              ? `${formatNumber(cuNum, 2)} CU`
+              : 'Unavailable';
           }
           const metaCu = document.getElementById('meta-cu');
           if (metaCu) {
-            metaCu.innerText = s.is_stale ? 'Warning: Stale snapshot' : 'Official balance';
+            metaCu.textContent = s.is_stale ? 'Warning: Stale snapshot' : 'Official balance';
           }
 
           const valRate = document.getElementById('val-rate');
           if (valRate) {
-            valRate.innerText = s.current_rate_cu_per_hour != null ? `${s.current_rate_cu_per_hour.toFixed(2)} CU/hr` : '0.00 CU/hr';
+            const rateNum = Number(s.current_rate_cu_per_hour);
+            valRate.textContent = (s.current_rate_cu_per_hour != null && Number.isFinite(rateNum))
+              ? `${formatNumber(rateNum, 2)} CU/hr`
+              : '0.00 CU/hr';
           }
 
           const valAssign = document.getElementById('val-assignments');
           if (valAssign) {
-            valAssign.innerText = s.active_assignments != null ? s.active_assignments : '0';
+            valAssign.textContent = s.active_assignments != null ? String(s.active_assignments) : '0';
           }
 
           const valRuns = document.getElementById('val-runs');
           if (valRuns) {
-            valRuns.innerText = `${s.managed_running_runs || 0} / ${s.total_runs || 0}`;
+            valRuns.textContent = `${s.managed_running_runs || 0} / ${s.total_runs || 0}`;
           }
         }
 
@@ -1375,6 +1725,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    function initEventListeners() {
+      const btnExport = document.getElementById('btn-export-csv');
+      if (btnExport) btnExport.addEventListener('click', exportComputeCsv);
+
+      const btnSetToken = document.getElementById('btn-set-token');
+      if (btnSetToken) btnSetToken.addEventListener('click', promptAuthToken);
+
+      const btnAuth = document.getElementById('btn-auth');
+      if (btnAuth && btnAuth !== btnSetToken) btnAuth.addEventListener('click', promptAuthToken);
+
+      const btnRefresh = document.getElementById('btn-refresh');
+      if (btnRefresh) btnRefresh.addEventListener('click', refreshAll);
+
+      const btnRefreshFilter = document.getElementById('btn-refresh-filter');
+      if (btnRefreshFilter) btnRefreshFilter.addEventListener('click', refreshAll);
+
+      const filterProj = document.getElementById('filter-project');
+      if (filterProj) filterProj.addEventListener('input', applyFilters);
+
+      const filterStatus = document.getElementById('filter-status');
+      if (filterStatus) filterStatus.addEventListener('change', applyFilters);
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initEventListeners);
+    } else {
+      initEventListeners();
+    }
+
     // Auto-refresh cadence (10s)
     refreshAll();
     setInterval(refreshAll, 10000);
@@ -1384,11 +1763,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 """
 
 
-def render_dashboard_html(title: Optional[str] = None) -> str:
+def render_dashboard_html(
+    title: str = "Colab Experiment & Compute Monitor",
+    csp_nonce: str = "",
+) -> str:
     """Render the embedded Colab Monitor dashboard HTML document."""
+    rendered = DASHBOARD_HTML
     if title:
-        return DASHBOARD_HTML.replace(
-            "<title>Colab Monitor — V2 Remote GPU Workspaces</title>",
-            f"<title>{title}</title>",
+        rendered = re.sub(
+            r"<title>.*?</title>",
+            f"<title>{html.escape(title)}</title>",
+            rendered,
+            count=1,
         )
-    return DASHBOARD_HTML
+    if csp_nonce:
+        escaped_nonce = html.escape(csp_nonce, quote=True)
+        rendered = rendered.replace('nonce="__CSP_NONCE__"', f'nonce="{escaped_nonce}"')
+    else:
+        rendered = rendered.replace(' nonce="__CSP_NONCE__"', "")
+    return rendered
+
+
+def get_dashboard_css() -> str:
+    """Extract embedded CSS stylesheet from DASHBOARD_HTML."""
+    match = re.search(r"<style[^>]*>(.*?)</style>", DASHBOARD_HTML, re.DOTALL)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def get_dashboard_js() -> str:
+    """Extract embedded JavaScript client code from DASHBOARD_HTML."""
+    match = re.search(r"<script[^>]*>(.*?)</script>", DASHBOARD_HTML, re.DOTALL)
+    if not match:
+        return ""
+    return match.group(1).strip()

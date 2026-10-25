@@ -48,7 +48,12 @@ from pathlib import Path
 from colab_adapter.monitor.collector import AccountSample, AccountUsageCollector
 from colab_adapter.monitor.schemas import _iso_now
 from colab_adapter.monitor.server import MonitorServer, start_monitor_server
-from colab_adapter.monitor.ui import DASHBOARD_HTML, render_dashboard_html
+from colab_adapter.monitor.ui import (
+    DASHBOARD_HTML,
+    get_dashboard_css,
+    get_dashboard_js,
+    render_dashboard_html,
+)
 from colab_adapter.provider import ManagedSessionRegistry
 from colab_adapter.storage.base import StoredArtifact
 from colab_adapter.storage.manifest import PublicationManifest
@@ -85,11 +90,14 @@ class TestDashboardUIIntegration(unittest.TestCase):
         default_html = render_dashboard_html()
         self.assertIsInstance(default_html, str)
         self.assertIn("<!DOCTYPE html>", default_html)
-        self.assertIn("<title>Colab Monitor — V2 Remote GPU Workspaces</title>", default_html)
+        self.assertIn("<title>Colab Experiment &amp; Compute Monitor</title>", default_html)
 
         custom_html = render_dashboard_html(title="Custom Title - My Research Lab")
         self.assertIn("<title>Custom Title - My Research Lab</title>", custom_html)
-        self.assertNotIn("<title>Colab Monitor — V2 Remote GPU Workspaces</title>", custom_html)
+        self.assertNotIn("<title>Colab Experiment &amp; Compute Monitor</title>", custom_html)
+
+        v2_html = render_dashboard_html(title="Colab Monitor — V2 Remote GPU Workspaces")
+        self.assertIn("<title>Colab Monitor — V2 Remote GPU Workspaces</title>", v2_html)
 
     def test_responsive_layout_and_media_queries(self):
         """Verify responsive viewport meta tag and @media (max-width: 768px) styling."""
@@ -110,16 +118,114 @@ class TestDashboardUIIntegration(unittest.TestCase):
         self.assertNotIn("location.search", html)
         self.assertNotIn("window.location.search", html)
 
-        # Interactive Auth button and prompt
-        self.assertIn('id="btn-auth"', html)
+        # Interactive Auth button and prompt with explicit IDs
+        self.assertTrue('id="btn-set-token"' in html or 'id="btn-auth"' in html)
+        self.assertIn('id="btn-set-token"', html)
         self.assertIn("Auth / Token", html)
         self.assertIn("promptAuthToken", html)
 
-        # CSV export must use fetch with Bearer headers and Blob download, never navigating with token
+        # Header buttons with explicit IDs
+        self.assertIn('id="btn-refresh"', html)
         self.assertIn('id="btn-export-csv"', html)
         self.assertIn("Export Compute CSV", html)
         self.assertIn("exportComputeCsv", html)
         self.assertIn("window.URL.createObjectURL(blob)", html)
+
+    def test_zero_inline_event_handlers(self):
+        """Verify DASHBOARD_HTML and rendered HTML contain zero inline event handler attributes."""
+        raw_html = DASHBOARD_HTML
+        rendered_html = render_dashboard_html(csp_nonce="test-nonce-123")
+
+        inline_handler_pattern = re.compile(r"\bon[a-zA-Z]+\s*=", re.IGNORECASE)
+
+        raw_handlers = inline_handler_pattern.findall(raw_html)
+        self.assertEqual(
+            raw_handlers,
+            [],
+            f"DASHBOARD_HTML must not contain inline event handlers: {raw_handlers}",
+        )
+
+        rendered_handlers = inline_handler_pattern.findall(rendered_html)
+        self.assertEqual(
+            rendered_handlers,
+            [],
+            f"render_dashboard_html() must not contain inline event handlers: {rendered_handlers}",
+        )
+
+        for handler in ("onclick=", "oninput=", "onchange=", "onerror=", "onload="):
+            self.assertNotIn(handler, raw_html)
+            self.assertNotIn(handler, rendered_html)
+
+    def test_zero_inner_html_assignments(self):
+        """Verify DASHBOARD_HTML and rendered HTML contain zero .innerHTML assignments or usages."""
+        raw_html = DASHBOARD_HTML
+        rendered_html = render_dashboard_html()
+
+        self.assertNotIn(".innerHTML", raw_html)
+        self.assertNotIn(".innerHTML", rendered_html)
+        self.assertNotIn("innerHTML", get_dashboard_js())
+
+    def test_csp_nonce_injection_and_external_asset_helpers(self):
+        """Verify csp_nonce injection into style and script tags and CSS/JS asset extraction."""
+        # Nonce injection test
+        nonce_val = "abc123xyz"
+        rendered_with_nonce = render_dashboard_html(csp_nonce=nonce_val)
+        self.assertIn(f'<style nonce="{nonce_val}">', rendered_with_nonce)
+        self.assertIn(f'<script nonce="{nonce_val}">', rendered_with_nonce)
+        self.assertNotIn('nonce="__CSP_NONCE__"', rendered_with_nonce)
+
+        # Nonce-free rendering test (removes nonce attribute cleanly)
+        rendered_no_nonce = render_dashboard_html()
+        self.assertIn("<style>", rendered_no_nonce)
+        self.assertIn("<script>", rendered_no_nonce)
+        self.assertNotIn("nonce=", rendered_no_nonce)
+        self.assertNotIn("__CSP_NONCE__", rendered_no_nonce)
+
+        # Nonce HTML escaping test
+        tricky_nonce = 'nonce"with<quotes>'
+        rendered_tricky = render_dashboard_html(csp_nonce=tricky_nonce)
+        self.assertNotIn('nonce="nonce"with', rendered_tricky)
+        self.assertIn('nonce="nonce&quot;with&lt;quotes&gt;"', rendered_tricky)
+
+        # Asset extraction helpers test
+        css = get_dashboard_css()
+        self.assertIsInstance(css, str)
+        self.assertTrue(len(css) > 500, "get_dashboard_css() returned insufficient CSS")
+        self.assertIn(":root", css)
+        self.assertIn(".container", css)
+        self.assertIn("@media (max-width: 768px)", css)
+        self.assertNotIn("<style", css)
+        self.assertNotIn("</style>", css)
+
+        js = get_dashboard_js()
+        self.assertIsInstance(js, str)
+        self.assertTrue(len(js) > 500, "get_dashboard_js() returned insufficient JS")
+        self.assertIn("function formatNumber", js)
+        self.assertIn("function selectRun", js)
+        self.assertIn("function initEventListeners", js)
+        self.assertNotIn("<script", js)
+        self.assertNotIn("</script>", js)
+
+    def test_safe_numeric_formatting_and_url_encoding(self):
+        """Verify URL encoding for run IDs and safe numeric formatting guarding toFixed."""
+        js = get_dashboard_js()
+
+        # Run detail endpoints must encode run ID
+        self.assertIn("encodeURIComponent", js)
+        self.assertIn("const encodedId = encodeURIComponent(safeRunId);", js)
+        self.assertIn("/api/v1/runs/${encodedId}", js)
+        self.assertIn("/api/v1/runs/${encodedId}/metrics", js)
+        self.assertIn("/api/v1/runs/${encodedId}/logs", js)
+        self.assertIn("/api/v1/runs/${encodedId}/drive", js)
+        self.assertIn("/api/v1/runs/${encodedId}/artifacts", js)
+
+        # Safe numeric formatting helper formatNumber guarding Number.isFinite
+        self.assertIn("function formatNumber(val, decimals, fallback = '-')", js)
+        self.assertIn("Number.isFinite(n) ? n.toFixed(decimals) : fallback", js)
+        self.assertIn("formatNumber", js)
+
+        # Status class sanitization regex
+        self.assertIn(".toLowerCase().replace(/[^a-z0-9_-]/g, '')", js)
 
     def test_required_dashboard_sections_presence(self):
         """Verify all 8 required monitoring sections and KPI cards exist in DASHBOARD_HTML."""
