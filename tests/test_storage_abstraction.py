@@ -32,6 +32,13 @@ from colab_adapter.storage import (
     compute_file_md5,
     compute_file_sha256,
 )
+from colab_adapter.storage.base import (
+    ArtifactRevisionIdentity,
+    format_logical_artifact_id,
+    format_revision_artifact_id,
+    format_transfer_id,
+    parse_artifact_id,
+)
 
 
 class TestStorageAbstraction(unittest.TestCase):
@@ -474,6 +481,352 @@ class TestStorageAbstraction(unittest.TestCase):
         self.assertIsNotNone(sample2.error_message)
         self.assertNotIn("my_secret_proxy_val", sample2.error_message)
         self.assertIn("[REDACTED_SECRET]", sample2.error_message)
+
+    def test_artifact_revision_identity_and_helper_functions(self):
+        """Test ArtifactRevisionIdentity, format_revision_artifact_id, parse_artifact_id, and format_transfer_id."""
+        # 1. format_logical_artifact_id
+        self.assertEqual(
+            format_logical_artifact_id("mnist", "run_1", "checkpoints/model.pt"),
+            "mnist/run_1/checkpoints/model.pt",
+        )
+        self.assertEqual(
+            format_logical_artifact_id("mnist", "run_1", "/checkpoints/model.pt"),
+            "mnist/run_1/checkpoints/model.pt",
+        )
+        self.assertEqual(
+            format_logical_artifact_id("mnist", "run_1", "mnist/run_1/checkpoints/model.pt"),
+            "mnist/run_1/checkpoints/model.pt",
+        )
+        self.assertEqual(
+            format_logical_artifact_id("mnist", "run_1", "checkpoints/model.pt@sha256_deadbeef"),
+            "mnist/run_1/checkpoints/model.pt",
+        )
+
+        # 2. format_revision_artifact_id
+        self.assertEqual(
+            format_revision_artifact_id("mnist", "run_1", "checkpoints/model.pt", "ABCDEF1234567890"),
+            "mnist/run_1/checkpoints/model.pt@sha256_abcdef1234567890",
+        )
+        self.assertEqual(
+            format_revision_artifact_id("mnist", "run_1", "/checkpoints/model.pt@sha256_oldhash", " 112233AABB "),
+            "mnist/run_1/checkpoints/model.pt@sha256_112233aabb",
+        )
+        self.assertEqual(
+            format_revision_artifact_id("mnist", "run_1", "mnist/run_1/checkpoints/model.pt", "112233AABB"),
+            "mnist/run_1/checkpoints/model.pt@sha256_112233aabb",
+        )
+
+        # 3. parse_artifact_id
+        # Versioned full path
+        p, r, lp, sha = parse_artifact_id("mnist/run_1/checkpoints/model.pt@sha256_abcdef1234")
+        self.assertEqual(p, "mnist")
+        self.assertEqual(r, "run_1")
+        self.assertEqual(lp, "checkpoints/model.pt")
+        self.assertEqual(sha, "abcdef1234")
+
+        # Unversioned full path
+        p, r, lp, sha = parse_artifact_id("mnist/run_1/checkpoints/model.pt")
+        self.assertEqual(p, "mnist")
+        self.assertEqual(r, "run_1")
+        self.assertEqual(lp, "checkpoints/model.pt")
+        self.assertIsNone(sha)
+
+        # Single or 2-segment path (fewer than 3 segments)
+        p, r, lp, sha = parse_artifact_id("checkpoints/model.pt@sha256_abcdef1234")
+        self.assertEqual(p, "")
+        self.assertEqual(r, "")
+        self.assertEqual(lp, "checkpoints/model.pt")
+        self.assertEqual(sha, "abcdef1234")
+
+        p, r, lp, sha = parse_artifact_id("model.pt")
+        self.assertEqual(p, "")
+        self.assertEqual(r, "")
+        self.assertEqual(lp, "model.pt")
+        self.assertIsNone(sha)
+
+        # 4. format_transfer_id
+        t_id = format_transfer_id("google_drive", "proj_1", "run_1", "checkpoints/model.pt", "0123456789abcdef9999")
+        self.assertEqual(t_id, "google_drive-proj_1-run_1-checkpoints_model.pt-0123456789abcdef")
+
+        # 5. ArtifactRevisionIdentity dataclass
+        ident = ArtifactRevisionIdentity(
+            project_id="proj_x",
+            run_id="run_y",
+            logical_path="checkpoints/weights.pt",
+            sha256="CAFE1234BEEF5678",
+        )
+        self.assertEqual(ident.logical_id, "proj_x/run_y/checkpoints/weights.pt")
+        self.assertEqual(ident.revision_id, "sha256_cafe1234beef5678")
+        self.assertEqual(ident.artifact_id, "proj_x/run_y/checkpoints/weights.pt@sha256_cafe1234beef5678")
+
+    def test_publish_and_retrieve_multiple_revisions_immutable_history(self):
+        """Publish two revisions of checkpoints/model.pt (Revision A & Revision B) to LocalArtifactStore.
+
+        Verifies:
+        - Both revisions exist in PublicationManifest and list_artifacts() / list_revisions('checkpoints/model.pt').
+        - Revision A has is_latest=False and Revision B has is_latest=True.
+        - Retrieving by rev_a.artifact_id returns exact Revision A bytes and SHA256.
+        - Retrieving by rev_b.artifact_id returns exact Revision B bytes and SHA256.
+        - Retrieving by unversioned 'proj_1/run_1/checkpoints/model.pt' returns Revision B (latest) bytes.
+        - Disk files for earlier revisions are never clobbered or destroyed.
+        """
+        # 1. Publish Revision A
+        src_a = Path(self.test_dir) / "source_v1" / "model.pt"
+        src_a.parent.mkdir(parents=True, exist_ok=True)
+        payload_a = b"PYTORCH_CHECKPOINT_REVISION_A_EPOCH_10"
+        src_a.write_bytes(payload_a)
+
+        rev_a = self.store.publish(
+            source=src_a,
+            project_id="proj_1",
+            run_id="run_1",
+            artifact_type=ArtifactType.CHECKPOINT.value,
+            metadata={"epoch": 10, "val_loss": 0.45},
+        )
+        self.assertTrue(rev_a.is_latest)
+        self.assertEqual(rev_a.logical_path, "checkpoints/model.pt")
+        sha_a = compute_file_sha256(src_a)
+        self.assertEqual(rev_a.sha256, sha_a)
+        self.assertEqual(rev_a.artifact_id, f"proj_1/run_1/checkpoints/model.pt@sha256_{sha_a}")
+
+        # 2. Publish Revision B (different content to same logical checkpoint target)
+        src_b = Path(self.test_dir) / "source_v2" / "model.pt"
+        src_b.parent.mkdir(parents=True, exist_ok=True)
+        payload_b = b"PYTORCH_CHECKPOINT_REVISION_B_EPOCH_20_UPDATED_LARGER_WEIGHTS"
+        src_b.write_bytes(payload_b)
+
+        rev_b = self.store.publish(
+            source=src_b,
+            project_id="proj_1",
+            run_id="run_1",
+            artifact_type=ArtifactType.CHECKPOINT.value,
+            metadata={"epoch": 20, "val_loss": 0.22},
+        )
+        self.assertTrue(rev_b.is_latest)
+        self.assertEqual(rev_b.logical_path, "checkpoints/model.pt")
+        sha_b = compute_file_sha256(src_b)
+        self.assertEqual(rev_b.sha256, sha_b)
+        self.assertEqual(rev_b.artifact_id, f"proj_1/run_1/checkpoints/model.pt@sha256_{sha_b}")
+        self.assertNotEqual(rev_a.artifact_id, rev_b.artifact_id)
+
+        # 3. Check PublicationManifest state
+        manifest_path = self.artifacts_dir / "projects" / "proj_1" / "runs" / "run_1" / "manifest.json"
+        manifest = PublicationManifest.load(manifest_path)
+        self.assertEqual(manifest.manifest_version, 2)
+
+        # Both revisions exist in manifest
+        all_artifacts = manifest.list_artifacts(include_history=True)
+        self.assertEqual(len(all_artifacts), 2)
+
+        # List revisions for "checkpoints/model.pt"
+        revisions = manifest.list_revisions("checkpoints/model.pt")
+        self.assertEqual(len(revisions), 2)
+        self.assertEqual(revisions[0].artifact_id, rev_a.artifact_id)
+        self.assertEqual(revisions[1].artifact_id, rev_b.artifact_id)
+
+        # Revision A has is_latest=False and Revision B has is_latest=True
+        entry_a = manifest.get_artifact(rev_a.artifact_id)
+        entry_b = manifest.get_artifact(rev_b.artifact_id)
+        self.assertIsNotNone(entry_a)
+        self.assertIsNotNone(entry_b)
+        self.assertFalse(entry_a.is_latest)
+        self.assertTrue(entry_b.is_latest)
+        self.assertEqual(manifest.latest_by_path.get("checkpoints/model.pt"), rev_b.artifact_id)
+
+        # list_artifacts(include_history=False) returns only Revision B
+        latest_only = manifest.list_artifacts(include_history=False)
+        self.assertEqual(len(latest_only), 1)
+        self.assertEqual(latest_only[0].artifact_id, rev_b.artifact_id)
+
+        # 4. Verify physical immutability: both files exist on disk and were NOT overwritten
+        self.assertTrue(Path(entry_a.path).exists(), "Revision A disk file was clobbered!")
+        self.assertTrue(Path(entry_b.path).exists(), "Revision B disk file does not exist!")
+        self.assertNotEqual(entry_a.path, entry_b.path)
+        self.assertEqual(Path(entry_a.path).read_bytes(), payload_a)
+        self.assertEqual(Path(entry_b.path).read_bytes(), payload_b)
+
+        # Unversioned disk path points to latest Revision B
+        unversioned_disk = self.artifacts_dir / "projects" / "proj_1" / "runs" / "run_1" / "checkpoints" / "model.pt"
+        self.assertTrue(unversioned_disk.exists())
+        self.assertEqual(unversioned_disk.read_bytes(), payload_b)
+
+        # 5. Retrieve by rev_a.artifact_id returns exact Revision A bytes and SHA256
+        dest_a = Path(self.test_dir) / "retrieved_v1.pt"
+        out_a = self.store.retrieve(rev_a.artifact_id, dest_a)
+        self.assertTrue(out_a.exists())
+        self.assertEqual(out_a.read_bytes(), payload_a)
+        self.assertEqual(compute_file_sha256(out_a), sha_a)
+
+        # 6. Retrieve by rev_b.artifact_id returns exact Revision B bytes and SHA256
+        dest_b = Path(self.test_dir) / "retrieved_v2.pt"
+        out_b = self.store.retrieve(rev_b.artifact_id, dest_b)
+        self.assertTrue(out_b.exists())
+        self.assertEqual(out_b.read_bytes(), payload_b)
+        self.assertEqual(compute_file_sha256(out_b), sha_b)
+
+        # 7. Retrieve by unversioned "proj_1/run_1/checkpoints/model.pt" returns Revision B (latest) bytes
+        dest_latest = Path(self.test_dir) / "retrieved_latest.pt"
+        out_latest = self.store.retrieve("proj_1/run_1/checkpoints/model.pt", dest_latest)
+        self.assertTrue(out_latest.exists())
+        self.assertEqual(out_latest.read_bytes(), payload_b)
+        self.assertEqual(compute_file_sha256(out_latest), sha_b)
+
+        # 8. Store get_metadata and exists for both versioned and unversioned
+        self.assertTrue(self.store.exists(rev_a.artifact_id))
+        self.assertTrue(self.store.exists(rev_b.artifact_id))
+        self.assertTrue(self.store.exists("proj_1/run_1/checkpoints/model.pt"))
+        meta_unversioned = self.store.get_metadata("proj_1/run_1/checkpoints/model.pt")
+        self.assertEqual(meta_unversioned.artifact_id, rev_b.artifact_id)
+
+    def test_conflicting_content_for_immutable_revision_id_raises(self):
+        """Conflicting content (size or sha256 mismatch) for the same revision ID raises ArtifactValidationError."""
+        manifest = PublicationManifest(project_id="test_proj", run_id="test_run")
+        sha_const = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        valid_rev_id = f"test_proj/test_run/checkpoints/model.pt@sha256_{sha_const}"
+
+        initial = StoredArtifact(
+            artifact_id=valid_rev_id,
+            storage_provider="local",
+            path="/tmp/path_1",
+            size_bytes=1000,
+            sha256=sha_const,
+            project_id="test_proj",
+            run_id="test_run",
+            logical_path="checkpoints/model.pt",
+        )
+        manifest.add_artifact(initial)
+
+        # 1. Attempting to add artifact with same rev_id but different size_bytes must raise ArtifactValidationError
+        conflicting_size = StoredArtifact(
+            artifact_id=valid_rev_id,
+            storage_provider="local",
+            path="/tmp/path_2",
+            size_bytes=2000,
+            sha256=sha_const,
+            project_id="test_proj",
+            run_id="test_run",
+            logical_path="checkpoints/model.pt",
+        )
+        with self.assertRaises(ArtifactValidationError):
+            manifest.add_artifact(conflicting_size)
+
+        # 2. Attempting to add artifact with same rev_id but different sha256 must raise ArtifactValidationError
+        conflicting_sha = StoredArtifact(
+            artifact_id=valid_rev_id,
+            storage_provider="local",
+            path="/tmp/path_3",
+            size_bytes=1000,
+            sha256="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            project_id="test_proj",
+            run_id="test_run",
+            logical_path="checkpoints/model.pt",
+        )
+        with self.assertRaises(ArtifactValidationError):
+            manifest.add_artifact(conflicting_sha)
+
+        # 3. Explicitly versioned artifact_id whose @sha256_ suffix does not match sha256 field raises ArtifactValidationError
+        mismatched_id_and_hash = StoredArtifact(
+            artifact_id="test_proj/test_run/checkpoints/model.pt@sha256_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            storage_provider="local",
+            path="/tmp/path_4",
+            size_bytes=500,
+            sha256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            project_id="test_proj",
+            run_id="test_run",
+        )
+        with self.assertRaises(ArtifactValidationError):
+            manifest.add_artifact(mismatched_id_and_hash)
+
+    def test_automatic_v1_to_v2_manifest_migration(self):
+        """Automatic v1 -> v2 manifest migration upgrades manifest_version, populates latest_by_path, and adds notes."""
+        v1_manifest_data = {
+            "project_id": "legacy_proj",
+            "run_id": "legacy_run",
+            "manifest_version": 1,
+            "created_at": "2026-01-01T10:00:00Z",
+            "updated_at": "2026-01-01T10:05:00Z",
+            "status": "PUBLISHED",
+            "git_commit": "git_commit_hash_12345",
+            "git_branch": "main",
+            "git_dirty": False,
+            "environment": {"python": "3.10"},
+            "artifacts": {
+                "legacy_proj/legacy_run/checkpoints/checkpoint.pt": {
+                    "artifact_id": "legacy_proj/legacy_run/checkpoints/checkpoint.pt",
+                    "storage_provider": "local",
+                    "path": "/storage/projects/legacy_proj/runs/legacy_run/checkpoints/checkpoint.pt",
+                    "size_bytes": 524288,
+                    "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                    "project_id": "legacy_proj",
+                    "run_id": "legacy_run",
+                    "artifact_type": "checkpoint",
+                    "remote_file_id": "drive-file-legacy-999",
+                    "metadata": {"step": 5000},
+                }
+            },
+            "metadata": {"legacy_meta_key": "legacy_val"},
+        }
+
+        m_path = Path(self.test_dir) / "v1_manifest.json"
+        m_path.write_text(json.dumps(v1_manifest_data, indent=2), encoding="utf-8")
+
+        # Load legacy manifest via PublicationManifest.load()
+        loaded = PublicationManifest.load(m_path)
+
+        # 1. Manifest version upgraded to 2
+        self.assertEqual(loaded.manifest_version, 2)
+
+        # 2. Canonical revision ID generated as key in artifacts
+        expected_rev_id = (
+            "legacy_proj/legacy_run/checkpoints/checkpoint.pt@sha256_abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        )
+        self.assertIn(expected_rev_id, loaded.artifacts)
+
+        # 3. latest_by_path populated
+        self.assertEqual(loaded.latest_by_path.get("checkpoints/checkpoint.pt"), expected_rev_id)
+
+        # 4. Migration notes recorded
+        self.assertGreaterEqual(len(loaded.migration_notes), 1)
+        self.assertIn("Migrated v1 unversioned artifact records", loaded.migration_notes[0])
+
+        # 5. Provenance preserved
+        self.assertEqual(loaded.git_commit, "git_commit_hash_12345")
+        self.assertEqual(loaded.environment["python"], "3.10")
+        self.assertEqual(loaded.metadata["legacy_meta_key"], "legacy_val")
+
+        # 6. Lookup by new immutable revision ID
+        by_rev = loaded.get_artifact(expected_rev_id)
+        self.assertIsNotNone(by_rev)
+        self.assertEqual(by_rev.remote_file_id, "drive-file-legacy-999")
+        self.assertEqual(by_rev.metadata["step"], 5000)
+        self.assertEqual(by_rev.logical_path, "checkpoints/checkpoint.pt")
+        self.assertEqual(by_rev.revision_id, "sha256_abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+        self.assertTrue(by_rev.is_latest)
+
+        # 7. Lookup by legacy unversioned full ID
+        by_legacy = loaded.get_artifact("legacy_proj/legacy_run/checkpoints/checkpoint.pt")
+        self.assertIsNotNone(by_legacy)
+        self.assertEqual(by_legacy.artifact_id, expected_rev_id)
+
+        # 8. Lookup by logical path
+        by_logical = loaded.get_artifact("checkpoints/checkpoint.pt")
+        self.assertIsNotNone(by_logical)
+        self.assertEqual(by_logical.artifact_id, expected_rev_id)
+
+        # 9. get_latest_artifact
+        latest = loaded.get_latest_artifact("checkpoints/checkpoint.pt")
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.artifact_id, expected_rev_id)
+
+        # 10. list_revisions and list_artifacts
+        revs = loaded.list_revisions("checkpoints/checkpoint.pt")
+        self.assertEqual(len(revs), 1)
+        self.assertEqual(revs[0].artifact_id, expected_rev_id)
+
+        arts = loaded.list_artifacts()
+        self.assertEqual(len(arts), 1)
+        self.assertEqual(arts[0].artifact_id, expected_rev_id)
+
 
 
 if __name__ == "__main__":
