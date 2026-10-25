@@ -170,22 +170,22 @@ A step-by-step operator guide using real, supported CLI commands (`python3 colab
 3. **Headless OAuth Authentication**: Complete Google account authentication in terminal: `bash scripts/authenticate.sh`.
 4. **Environment & Diagnostic Pre-Flight**: Run zero-allocation health check: `python3 colab_server.py doctor` (or `python3 -m colab_adapter.cli doctor`).
 5. **Compute Units & Session Balance Audit**: Inspect active sessions and compute-unit balance: `python3 colab_server.py usage` and `python3 -m colab_adapter.cli sessions`.
-6. **Project Workspace Initialization**: Initialize a research workspace: `python3 -m colab_adapter.cli project init ./research-project --name research-project`.
+6. **Project Workspace Initialization**: Initialize a research workspace: `python3 -m colab_adapter.cli project init --root ./research-project --name research-project`.
 7. **Source & Dependency Preparation**: Populate local project code (`train.py`, `model.py`, `requirements.txt`). Keep secrets in `.env` (excluded by default).
-8. **Project Manifest Validation**: Validate schema and security rules: `python3 -m colab_adapter.cli project validate ./research-project --json`.
-9. **Zero-Allocation Offline Execution Plan**: Compute file counts and payload bytes: `python3 -m colab_adapter.cli project plan ./research-project --json`.
+8. **Project Manifest Validation**: Validate schema and security rules: `python3 -m colab_adapter.cli project validate --manifest ./research-project/colab-project.json --json`.
+9. **Zero-Allocation Offline Execution Plan**: Compute file counts and payload bytes: `python3 -m colab_adapter.cli project plan --manifest ./research-project/colab-project.json --json`.
 10. **Human-Approval-Gated Session Allocation**:
-    Provision or attach under lock: `python3 -m colab_adapter.cli project up ./research-project --gpu T4 --lease 3600 --approval-token "ALLOCATE T4 $(date +%s)" --json`.
-11. **Initial Workspace Incremental Sync**: Transfer sources to the remote runtime: `python3 -m colab_adapter.cli project sync ./research-project --json`.
-12. **Remote Training Execution**: Run training with live logs: `python3 -m colab_adapter.cli project exec ./research-project -- --epochs 10 --batch-size 32 --json`.
-13. **Incremental Code Hot-Updates**: Update local code and sync only changed files: `python3 -m colab_adapter.cli project sync ./research-project --json`.
+    Provision or attach under lock: `python3 -m colab_adapter.cli project approve-request --manifest ./research-project/colab-project.json --lease-seconds 3600 --json` then `python3 -m colab_adapter.cli project approve <approval-id>          # operator, in their own terminal` then `python3 -m colab_adapter.cli project up --manifest ./research-project/colab-project.json --lease-seconds 3600 --approval-id <approval-id> --json`.
+11. **Initial Workspace Incremental Sync**: Transfer sources to the remote runtime: `python3 -m colab_adapter.cli project sync --manifest ./research-project/colab-project.json --session-id <session-id> --json`.
+12. **Remote Training Execution**: Run training with live logs: `python3 -m colab_adapter.cli project exec "python3 train.py --epochs 10 --batch-size 32" --session-id <session-id> --json`.
+13. **Incremental Code Hot-Updates**: Update local code and sync only changed files: `python3 -m colab_adapter.cli project sync --manifest ./research-project/colab-project.json --session-id <session-id> --json`.
 14. **Cross-Device Monitoring Server Launch**: Start read-only dashboard: `python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080 --auth-token "<SECRET_TOKEN>"`.
 15. **Google Drive Credential Setup (0600 Permissions)**: Configure `~/.config/colab-cli/drive_credentials.json` with permissions `chmod 0600 ~/.config/colab-cli/drive_credentials.json`.
 16. **Multi-Revision Checkpoint Publishing**: Checkpoints (`model.pt`) published at steps 100..500 are stored under canonical `@sha256_<HASH>` identities in `PublicationManifest` v2.
 17. **Historical Revision Recovery**: Retrieve a specific historical checkpoint (Revision A) or the latest checkpoint (Revision E) by canonical revision ID with SHA256 verification.
 18. **Cross-Device Workspace Attachment**: Secondary developer laptops or mobile devices attach to active runs via Workspace Broker with zero additional VM allocations.
-19. **Managed Session Teardown**: Stop the active remote session gracefully: `python3 -m colab_adapter.cli project stop ./research-project --json`.
-20. **Lease Reconciliation & Rollback**: Clean up expired leases: `python3 -m colab_adapter.cli project reconcile --auto-stop --json`. If network fails, roll back to verified local checkpoints.
+19. **Managed Session Teardown**: Stop the active remote session gracefully: `python3 -m colab_adapter.cli project stop --session-id <session-id> --json`.
+20. **Lease Reconciliation & Rollback**: Clean up expired leases: `python3 -m colab_adapter.cli project reconcile --json`. If network fails, roll back to verified local checkpoints.
 
 ### Operational Rollback Instructions
 

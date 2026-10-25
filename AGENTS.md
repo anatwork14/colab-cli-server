@@ -48,11 +48,11 @@ See [agent setup steps](docs/AGENT_SETUP.md) and the [copyable prompt](docs/AGEN
 V2 adds project workspace workflows (`python3 -m colab_adapter.cli project ...`) and compute monitoring (`python3 -m colab_adapter.cli monitor ...`). All autonomous agents operating in this repository or interacting with Colab must adhere to these rules:
 
 1. **Always plan and validate offline first:**
-   Use `python3 -m colab_adapter.cli project validate <dir> --json` and `python3 -m colab_adapter.cli project plan <dir> --json`. These perform dry-run file diffing and schema checks with zero cloud allocation.
+   Use `python3 -m colab_adapter.cli project validate --manifest <file> --json` and `python3 -m colab_adapter.cli project plan --manifest <file> --json`. These perform dry-run file diffing and schema checks with zero cloud allocation.
 2. **Never allocate compute without explicit human approval:**
-   `python3 -m colab_adapter.cli project up` provisions paid Colab compute. Agents running autonomously must obtain explicit operator authorization and verify session ownership before execution.
+   `python3 -m colab_adapter.cli project up --manifest <file> --lease-seconds N --approval-id <id>` provisions paid Colab compute and refuses without a granted, unconsumed approval (exit code 3). Agents may run `project approve-request` (pending only); only the operator runs `project approve <id>` in their own terminal. Never script, pipe or pseudo-terminal the approval phrase. Reusing an exact active session needs no new approval.
 3. **Machine-readable JSON output:**
-   Pass `--json` to all `python3 -m colab_adapter.cli project` subcommands (`plan`, `up`, `sync`, `exec`, `status`, `stop`, `reconcile`) for structured JSON output.
+   Pass `--json` to the `python3 -m colab_adapter.cli project` subcommands (`plan`, `approve-request`, `approve`, `up`, `sync`, `exec`, `status`, `stop`, `reconcile`) for structured JSON output.
 4. **Strict isolation from unmanaged sessions:**
    The adapter strictly manages only sessions prefixed with its managed namespace. Never attempt to attach to, execute on, or terminate external user sessions (Q08 fail-closed invariant).
 5. **Read-only monitoring:**

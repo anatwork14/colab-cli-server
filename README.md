@@ -112,7 +112,7 @@ Start here:
 - [Copy-paste agent setup prompt](docs/AGENT_SETUP_PROMPT.md)
 - [Agent skill](skills/colab-cli-server/SKILL.md)
 
-**The interactive confirmation is a usability safeguard, not a strong security boundary against an agent that controls the same OS account.** If you provide autonomous shell access, enforce approval with an independently protected control plane or separate privileged executor.
+**Approval gate limits (plain language).** The gate stops accidental or agent-initiated Colab allocation through this adapter. Each approval is bound to one exact plan (project, GPU, manifest and workspace contents), a maximum lease, a 15-minute expiry and single use, and it leaves an audit record. It does **not** stop a process that runs as the same OS user: such a process can read the record key, forge or edit records, drive a pseudo-terminal to answer the prompt, run `colab new` directly, or change the code. Direct use of `colab new`, `colab run` and `colab ssh` cannot be gated by this repository. The gate is a safety interlock, not a security boundary. The real boundary is the approver and Colab OAuth in a separate OS account or a protected executor. Until that exists, the operator should run `project up` personally for paid runtimes.
 
 ## Documentation
 
@@ -166,31 +166,33 @@ The V2 implementation extends the original one-shot adapter into a comprehensive
 
 ```bash
 # Initialize a new project directory with template manifest and entrypoint
-python3 -m colab_adapter.cli project init ./my-project --name my-project
+python3 -m colab_adapter.cli project init --root ./my-project --name my-project
 
 # Validate manifest schema, path safety, and file existence
-python3 -m colab_adapter.cli project validate ./my-project --json
+python3 -m colab_adapter.cli project validate --manifest ./my-project/colab-project.json --json
 
 # Compute dry-run file sync diff and session plan without allocating compute
-python3 -m colab_adapter.cli project plan ./my-project --json
+python3 -m colab_adapter.cli project plan --manifest ./my-project/colab-project.json --json
 
 # Provision or attach to a remote project session under cross-process lock
-python3 -m colab_adapter.cli project up ./my-project --gpu T4 --approval-token "ALLOCATE T4 $(date +%s)" --json
+python3 -m colab_adapter.cli project approve-request --manifest ./my-project/colab-project.json --lease-seconds 3600 --json
+python3 -m colab_adapter.cli project approve <approval-id>          # operator, in their own terminal
+python3 -m colab_adapter.cli project up --manifest ./my-project/colab-project.json --lease-seconds 3600 --approval-id <approval-id> --json
 
 # Incrementally sync workspace source tree to the remote session
-python3 -m colab_adapter.cli project sync ./my-project --json
+python3 -m colab_adapter.cli project sync --manifest ./my-project/colab-project.json --session-id <session-id> --json
 
 # Execute project entrypoint with optional runtime arguments
-python3 -m colab_adapter.cli project exec ./my-project -- --epochs 10 --batch-size 32 --json
+python3 -m colab_adapter.cli project exec "python3 train.py --epochs 10 --batch-size 32" --session-id <session-id> --json
 
 # Inspect remote project session status and lease TTL
-python3 -m colab_adapter.cli project status ./my-project --json
+python3 -m colab_adapter.cli project status --session-id <session-id> --json
 
 # Safely terminate project session
-python3 -m colab_adapter.cli project stop ./my-project --json
+python3 -m colab_adapter.cli project stop --session-id <session-id> --json
 
 # Reconcile expired project leases and release resources
-python3 -m colab_adapter.cli project reconcile --auto-stop --json
+python3 -m colab_adapter.cli project reconcile --json
 ```
 
 All commands support `--json` for machine-readable output by autonomous agents and scripts.
@@ -242,40 +244,41 @@ A step-by-step operator guide using strictly real, supported CLI commands (`pyth
 6. **Project Workspace Initialization**:
    Create a structured research project directory with manifest template:
    ```bash
-   python3 -m colab_adapter.cli project init ./research-project --name research-project
+   python3 -m colab_adapter.cli project init --root ./research-project --name research-project
    ```
 7. **Source & Dependency Preparation**:
    Populate local project code (`train.py`, `model.py`, `requirements.txt`). Excluded secrets (e.g. `.env`) remain strictly local.
 8. **Project Manifest Validation**:
    Validate manifest schema, root path containment, and secret exclusion rules:
    ```bash
-   python3 -m colab_adapter.cli project validate ./research-project --json
+   python3 -m colab_adapter.cli project validate --manifest ./research-project/colab-project.json --json
    ```
 9. **Zero-Allocation Offline Execution Plan**:
    Generate deterministic transfer diff, file count, and payload size without cloud allocation:
    ```bash
-   python3 -m colab_adapter.cli project plan ./research-project --json
+   python3 -m colab_adapter.cli project plan --manifest ./research-project/colab-project.json --json
    ```
 10. **Human-Approval-Gated Session Provisioning**:
     Provision or attach to a remote Colab session with an explicit approval token:
     ```bash
-    python3 -m colab_adapter.cli project up ./research-project --gpu T4 --lease 3600 \
-      --approval-token "ALLOCATE T4 $(date +%s)" --json
+    python3 -m colab_adapter.cli project approve-request --manifest ./research-project/colab-project.json --lease-seconds 3600 --json
+python3 -m colab_adapter.cli project approve <approval-id>          # operator, in their own terminal
+python3 -m colab_adapter.cli project up --manifest ./research-project/colab-project.json --lease-seconds 3600 --approval-id <approval-id> --json
     ```
 11. **Initial Workspace Incremental Synchronization**:
     Sync workspace sources to the remote session with streaming SHA256 content indexing:
     ```bash
-    python3 -m colab_adapter.cli project sync ./research-project --json
+    python3 -m colab_adapter.cli project sync --manifest ./research-project/colab-project.json --session-id <session-id> --json
     ```
 12. **Remote Training Execution**:
     Execute the remote training entrypoint with live streaming output:
     ```bash
-    python3 -m colab_adapter.cli project exec ./research-project -- --epochs 10 --batch-size 32 --json
+    python3 -m colab_adapter.cli project exec "python3 train.py --epochs 10 --batch-size 32" --session-id <session-id> --json
     ```
 13. **Incremental Code Synchronization (Hot Updates)**:
     Modify local code and re-synchronize; only modified files transfer:
     ```bash
-    python3 -m colab_adapter.cli project sync ./research-project --json
+    python3 -m colab_adapter.cli project sync --manifest ./research-project/colab-project.json --session-id <session-id> --json
     ```
 14. **Cross-Device Monitoring Dashboard Startup**:
     Launch the read-only web monitoring server with per-response CSP nonces:
@@ -300,12 +303,12 @@ A step-by-step operator guide using strictly real, supported CLI commands (`pyth
 19. **Managed Session Teardown**:
     Safely stop the active project session and release cloud resources:
     ```bash
-    python3 -m colab_adapter.cli project stop ./research-project --json
+    python3 -m colab_adapter.cli project stop --session-id <session-id> --json
     ```
 20. **Lease Reconciliation & Rollback / Troubleshooting**:
     Reconcile expired sessions and release orphan compute:
     ```bash
-    python3 -m colab_adapter.cli project reconcile --auto-stop --json
+    python3 -m colab_adapter.cli project reconcile --json
     ```
     Rollback: If network or recovery fails, inspect `transfer_journal.json`, verify hashes, and fall back to local staged checkpoints.
 

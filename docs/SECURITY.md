@@ -32,6 +32,12 @@ Only install the real `google-colab-cli` from the official package or Google Git
 
 If you discover a vulnerability involving Google's CLI or Colab backend, follow Google's official vulnerability reporting process. For this wrapper, open a private maintainer contact channel first rather than publishing exploit details or tokens in a public issue.
 
+## Allocation approval gate (Issue #25)
+
+Every new managed Colab allocation through `colab_adapter` needs an operator-granted, single-use approval record bound to one exact plan. The approval phrase is read from `/dev/tty` only. A rejected or missing approval makes zero `colab new` calls (exit code 3), and a shared cap allows one active managed session at a time (exit code 4).
+
+**Approval gate limits (plain language).** The gate stops accidental or agent-initiated Colab allocation through this adapter. Each approval is bound to one exact plan (project, GPU, manifest and workspace contents), a maximum lease, a 15-minute expiry and single use, and it leaves an audit record. It does **not** stop a process that runs as the same OS user: such a process can read the record key, forge or edit records, drive a pseudo-terminal to answer the prompt, run `colab new` directly, or change the code. Direct use of `colab new`, `colab run` and `colab ssh` cannot be gated by this repository. The gate is a safety interlock, not a security boundary. The real boundary is the approver and Colab OAuth in a separate OS account or a protected executor. Until that exists, the operator should run `project up` personally for paid runtimes.
+
 ## Storage hardening controls (PR #24, offline)
 
 These controls are implemented in `colab_adapter/storage/` and are verified only by offline tests. They do not replace the approval gates above.

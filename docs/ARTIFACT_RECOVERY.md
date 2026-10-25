@@ -67,7 +67,7 @@ If a Colab runtime terminates unexpectedly or a local host machine crashes:
 ### Step 1: Query Run State
 From any authorized terminal or dashboard client:
 ```bash
-python3 -m colab_adapter.cli project status
+python3 -m colab_adapter.cli project status --session-id <session-id>
 # Or query broker endpoint:
 curl -H "Authorization: Bearer <TOKEN>" http://localhost:8080/api/v1/runs/<run_id>
 ```
@@ -242,22 +242,22 @@ A comprehensive runbook using strictly real, supported CLI commands (`python3 co
 3. **Headless OAuth Configuration**: `bash scripts/authenticate.sh`.
 4. **Diagnostic Pre-Flight**: `python3 colab_server.py doctor` (or `python3 -m colab_adapter.cli doctor`).
 5. **Account & Compute-Unit Audit**: `python3 colab_server.py usage` and `python3 -m colab_adapter.cli sessions`.
-6. **Project Workspace Init**: `python3 -m colab_adapter.cli project init ./research-project --name research-project`.
+6. **Project Workspace Init**: `python3 -m colab_adapter.cli project init --root ./research-project --name research-project`.
 7. **Local Code & Excludes Setup**: Place code in project directory; verify `.env` is excluded in `colab-project.json`.
-8. **Manifest Validation**: `python3 -m colab_adapter.cli project validate ./research-project --json`.
-9. **Offline Execution Plan**: `python3 -m colab_adapter.cli project plan ./research-project --json` (0 cloud allocations).
+8. **Manifest Validation**: `python3 -m colab_adapter.cli project validate --manifest ./research-project/colab-project.json --json`.
+9. **Offline Execution Plan**: `python3 -m colab_adapter.cli project plan --manifest ./research-project/colab-project.json --json` (0 cloud allocations).
 10. **Approval-Gated Session Allocation**:
-    `python3 -m colab_adapter.cli project up ./research-project --gpu T4 --lease 3600 --approval-token "ALLOCATE T4 $(date +%s)" --json`.
-11. **Initial Workspace Sync**: `python3 -m colab_adapter.cli project sync ./research-project --json`.
-12. **Remote Training Execution**: `python3 -m colab_adapter.cli project exec ./research-project -- --epochs 10 --batch-size 32 --json`.
-13. **Incremental Code Hot-Reload**: Modify local source code and run `python3 -m colab_adapter.cli project sync ./research-project --json`.
+    `python3 -m colab_adapter.cli project approve-request --manifest ./research-project/colab-project.json --lease-seconds 3600 --json` then `python3 -m colab_adapter.cli project approve <approval-id>          # operator, in their own terminal` then `python3 -m colab_adapter.cli project up --manifest ./research-project/colab-project.json --lease-seconds 3600 --approval-id <approval-id> --json`.
+11. **Initial Workspace Sync**: `python3 -m colab_adapter.cli project sync --manifest ./research-project/colab-project.json --session-id <session-id> --json`.
+12. **Remote Training Execution**: `python3 -m colab_adapter.cli project exec "python3 train.py --epochs 10 --batch-size 32" --session-id <session-id> --json`.
+13. **Incremental Code Hot-Reload**: Modify local source code and run `python3 -m colab_adapter.cli project sync --manifest ./research-project/colab-project.json --session-id <session-id> --json`.
 14. **Monitoring Dashboard Launch**: `python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080 --auth-token "<SECRET_TOKEN>"`.
 15. **Drive Credential Security (0600)**: Configure `~/.config/colab-cli/drive_credentials.json` with permissions `chmod 0600 ~/.config/colab-cli/drive_credentials.json`.
 16. **Multi-Revision Checkpoint Publishing**: Verify `LocalArtifactStore` and `GoogleDriveArtifactStore` preserve all revisions under immutable `@sha256_<HASH>` identities in `PublicationManifest` v2.
 17. **Historical & Latest Checkpoint Retrieval**: Retrieve latest checkpoint via logical path `research-project/<run_id>/checkpoints/model.pt` or historical revision via canonical `@sha256_<HASH>` identity.
 18. **Cross-Device Recovery Node Attachment**: Attach secondary workstation to inspect artifacts and download checkpoints with zero VM re-allocation.
-19. **Managed Session Stop**: `python3 -m colab_adapter.cli project stop ./research-project --json`.
-20. **Lease Reconciliation & Rollback**: `python3 -m colab_adapter.cli project reconcile --auto-stop --json`. If corruption or network failure occurs, restore from immutable local staging directory (`./artifacts/projects/<project>/runs/<run>/checkpoints/.revisions/<sha16>/model.pt`).
+19. **Managed Session Stop**: `python3 -m colab_adapter.cli project stop --session-id <session-id> --json`.
+20. **Lease Reconciliation & Rollback**: `python3 -m colab_adapter.cli project reconcile --json`. If corruption or network failure occurs, restore from immutable local staging directory (`./artifacts/projects/<project>/runs/<run>/checkpoints/.revisions/<sha16>/model.pt`).
 
 ### Operational Rollback Instructions
 
