@@ -777,6 +777,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <script nonce="__CSP_NONCE__">
     // State management
     let token = sessionStorage.getItem('colab_monitor_token') || '';
+    // Run identity is the composite key {projectId, runId} (C4); run_id alone is ambiguous.
+    let selectedProjectId = null;
     let selectedRunId = null;
     let cachedRuns = [];
 
@@ -1395,11 +1397,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    async function selectRun(runId) {
+    async function selectRun(projectId, runId) {
+      const safeProjectId = String(projectId || '');
       const safeRunId = String(runId || '');
+      selectedProjectId = safeProjectId;
       selectedRunId = safeRunId;
       document.querySelectorAll('#runs-tbody tr').forEach(row => {
-        row.classList.toggle('selected', (row.dataset.runId || row.getAttribute('data-run-id')) === safeRunId);
+        const rowProject = row.dataset.projectId || '';
+        const rowRun = row.dataset.runId || '';
+        row.classList.toggle('selected', rowProject === safeProjectId && rowRun === safeRunId);
       });
 
       const placeholder = document.getElementById('inspector-placeholder');
@@ -1408,14 +1414,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       if (placeholder) placeholder.classList.add('hidden');
       if (content) content.classList.remove('hidden');
-      if (subtitle) subtitle.textContent = `Inspecting run: ${safeRunId}`;
+      if (subtitle) subtitle.textContent = `Inspecting run: ${safeProjectId} / ${safeRunId}`;
 
-      // Update meta bar from cached run info
-      const run = cachedRuns.find(r => String(r.run_id) === safeRunId) || {};
+      // Update meta bar from cached run info (matched on the composite key)
+      const run = cachedRuns.find(r => String(r.project_id) === safeProjectId && String(r.run_id) === safeRunId) || {};
       const elRunId = document.getElementById('insp-run-id');
       if (elRunId) elRunId.textContent = safeRunId;
       const elProjId = document.getElementById('insp-project-id');
-      if (elProjId) elProjId.textContent = run.project_id || '-';
+      if (elProjId) elProjId.textContent = run.project_id || safeProjectId || '-';
 
       const statusBadge = document.getElementById('insp-status');
       if (statusBadge) {
@@ -1441,18 +1447,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const elCompleted = document.getElementById('insp-completed-at');
       if (elCompleted) elCompleted.textContent = run.completion_time ? String(run.completion_time).slice(0, 19).replace('T', ' ') : '-';
 
-      // Fetch detail endpoints with URL-encoded runId
+      // Fetch detail endpoints with URL-encoded runId and projectId selector
       const encodedId = encodeURIComponent(safeRunId);
+      const encodedProject = encodeURIComponent(safeProjectId);
+      const qs = `?project=${encodedProject}`;
+      const isCurrent = () => selectedProjectId === safeProjectId && selectedRunId === safeRunId;
       try {
         const [detailRes, metricsRes, logsRes, driveRes, artifactsRes] = await Promise.all([
-          fetch(`/api/v1/runs/${encodedId}`, { headers: getHeaders() }),
-          fetch(`/api/v1/runs/${encodedId}/metrics`, { headers: getHeaders() }),
-          fetch(`/api/v1/runs/${encodedId}/logs`, { headers: getHeaders() }),
-          fetch(`/api/v1/runs/${encodedId}/drive`, { headers: getHeaders() }),
-          fetch(`/api/v1/runs/${encodedId}/artifacts`, { headers: getHeaders() }),
+          fetch(`/api/v1/runs/${encodedId}${qs}`, { headers: getHeaders() }),
+          fetch(`/api/v1/runs/${encodedId}/metrics${qs}`, { headers: getHeaders() }),
+          fetch(`/api/v1/runs/${encodedId}/logs${qs}`, { headers: getHeaders() }),
+          fetch(`/api/v1/runs/${encodedId}/drive${qs}`, { headers: getHeaders() }),
+          fetch(`/api/v1/runs/${encodedId}/artifacts${qs}`, { headers: getHeaders() }),
         ]);
 
-        if (selectedRunId !== safeRunId) return;
+        if (!isCurrent()) return;
         if (detailRes.status === 401) { showAuthBanner(); return; }
 
         const detail = detailRes.ok ? await detailRes.json() : {};
@@ -1460,7 +1469,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const logs = logsRes.ok ? await logsRes.json() : {};
         const drive = driveRes.ok ? await driveRes.json() : {};
         const artifacts = artifactsRes.ok ? await artifactsRes.json() : {};
-        if (selectedRunId !== safeRunId) return;
+        if (!isCurrent()) return;
 
         renderMetricsChart(Array.isArray(metrics) ? metrics : []);
         const errEvents = (detail.events || []).filter(e => e.event_type === 'error');
@@ -1505,9 +1514,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       for (const r of runs) {
         const tr = document.createElement('tr');
         const runIdStr = String(r.run_id || '');
+        const projectIdStr = String(r.project_id || '');
         tr.dataset.runId = runIdStr;
-        tr.className = 'clickable' + (runIdStr === selectedRunId ? ' selected' : '');
-        tr.addEventListener('click', () => selectRun(runIdStr));
+        tr.dataset.projectId = projectIdStr;
+        const isSelected = projectIdStr === selectedProjectId && runIdStr === selectedRunId;
+        tr.className = 'clickable' + (isSelected ? ' selected' : '');
+        tr.addEventListener('click', () => selectRun(projectIdStr, runIdStr));
 
         const tdRunId = document.createElement('td');
         tdRunId.className = 'mono';
@@ -1774,8 +1786,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (runsRes.ok) {
           cachedRuns = await runsRes.json();
           applyFilters();
-          if (selectedRunId) {
-            selectRun(selectedRunId);
+          if (selectedRunId !== null) {
+            selectRun(selectedProjectId, selectedRunId);
           }
         }
 

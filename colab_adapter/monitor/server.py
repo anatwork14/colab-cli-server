@@ -297,6 +297,40 @@ if _EMBEDDED_HTML_DASHBOARD is None:
 """
 
 
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9_\-\.]{1,128}$")
+
+
+def _is_valid_identifier(value: Optional[str]) -> bool:
+    """Validate a project/run selector: bounded charset, no path traversal."""
+    return bool(value) and bool(_IDENTIFIER_RE.match(value)) and ".." not in value
+
+
+def _event_run_key(ev: Dict[str, Any]) -> Tuple[str, str]:
+    """Canonical RunKey (project_id, run_id) for a telemetry event (C4).
+
+    Legacy events without project_id map to project "" which is not a valid
+    selector, so they never match a named project (D10).
+    """
+    return (str(ev.get("project_id") or ""), str(ev.get("run_id") or ""))
+
+
+def _load_run_manifest(run_dir: Path, project_id: str, run_id: str) -> Optional[Dict[str, Any]]:
+    """Load manifest.json for an exact run directory, rejecting symlinks and id mismatches (D10)."""
+    m_path = run_dir / "manifest.json"
+    if m_path.is_symlink() or not m_path.is_file():
+        return None
+    try:
+        with open(m_path, "r", encoding="utf-8") as mf:
+            data = json.load(mf)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("project_id", project_id) != project_id or data.get("run_id", run_id) != run_id:
+        return None
+    return data
+
+
 def _inject_csp_nonce(html_str: str, csp_nonce: str) -> str:
     """Inject cryptographic CSP nonce into HTML script and style tags."""
     if "__CSP_NONCE__" in html_str:
@@ -593,7 +627,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/health":
             self._handle_health()
         elif path == "/api/v1/summary":
-            self._handle_summary()
+            self._handle_summary(query)
         elif path == "/api/v1/compute/samples":
             self._handle_compute_samples(query)
         elif path == "/api/v1/sessions":
@@ -601,7 +635,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         elif path == "/api/v1/runs":
             self._handle_runs(query)
         elif path.startswith("/api/v1/runs/"):
-            self._handle_run_detail(path)
+            self._handle_run_detail(path, query)
         elif path == "/api/v1/events/stream":
             self._handle_events_stream(query)
         elif path == "/api/v1/export/compute.csv":
@@ -631,14 +665,21 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         )
         self._send_json(health.to_dict())
 
-    def _handle_summary(self) -> None:
+    def _handle_summary(self, query: Optional[Dict[str, List[str]]] = None) -> None:
+        project = (query or {}).get("project", [None])[0]
+        if project is not None and not _is_valid_identifier(project):
+            self._send_json(
+                {"error": "Invalid project", "message": "Project selector contains illegal characters."},
+                status=400,
+            )
+            return
         col = self.server.collector
         latest = col.get_latest_sample()
         all_managed = self.server.registry.get_all_managed()
         running_count = sum(1 for s in all_managed.values() if s.get("state") in ("READY", "RUNNING", "ACTIVE"))
 
-        events = self.server.telemetry.get_events()
-        unique_runs = len({e.get("run_id") for e in events if e.get("run_id")})
+        events = self.server.telemetry.get_events(project_id=project)
+        unique_runs = len({_event_run_key(e) for e in events if e.get("run_id")})
 
         summary = MonitoringSummary(
             current_balance_cu=latest.balance_cu if latest else None,
@@ -675,22 +716,62 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             })
         self._send_json(items)
 
+    # ---- RunKey helpers (C4: RunKey = (project_id, run_id)) -------------
+
+    def _projects_root(self) -> Path:
+        artifacts_root = getattr(self.server, "artifacts_dir", Path("./artifacts").resolve())
+        return Path(artifacts_root) / "projects"
+
+    def _disk_run_dirs(
+        self,
+        project_filter: Optional[str] = None,
+        run_filter: Optional[str] = None,
+    ) -> Dict[Tuple[str, str], Path]:
+        """Map RunKey -> run directory found on disk under projects/<project>/runs/<run>."""
+        found: Dict[Tuple[str, str], Path] = {}
+        proj_base = self._projects_root()
+        if proj_base.is_symlink() or not proj_base.is_dir():
+            return found
+        if project_filter:
+            p_dirs = [proj_base / project_filter]
+        else:
+            p_dirs = sorted(d for d in proj_base.iterdir() if d.is_dir())
+        for p_dir in p_dirs:
+            # Symlinked project dirs could alias another project's runs (D10)
+            if p_dir.is_symlink() or not p_dir.is_dir():
+                continue
+            runs_dir = p_dir / "runs"
+            if runs_dir.is_symlink() or not runs_dir.is_dir():
+                continue
+            for r_dir in runs_dir.iterdir():
+                if r_dir.is_symlink() or not r_dir.is_dir():
+                    continue
+                if run_filter and r_dir.name != run_filter:
+                    continue
+                found[(p_dir.name, r_dir.name)] = r_dir
+        return found
+
     def _handle_runs(self, query: Dict[str, List[str]]) -> None:
         proj_filter = query.get("project", [None])[0]
-        events = self.server.telemetry.get_events()
+        if proj_filter is not None and not _is_valid_identifier(proj_filter):
+            self._send_json(
+                {"error": "Invalid project", "message": "Project selector contains illegal characters."},
+                status=400,
+            )
+            return
+        events = self.server.telemetry.get_events(project_id=proj_filter)
 
-        runs_map: Dict[str, Dict[str, Any]] = {}
+        runs_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for ev in events:
             r_id = ev.get("run_id")
             if not r_id:
                 continue
-            if proj_filter and ev.get("project_id") != proj_filter:
-                continue
+            key = _event_run_key(ev)
 
-            if r_id not in runs_map:
-                runs_map[r_id] = {
+            if key not in runs_map:
+                runs_map[key] = {
                     "run_id": r_id,
-                    "project_id": ev.get("project_id", "default"),
+                    "project_id": key[0],
                     "status": "RUNNING",
                     "start_time": ev.get("emitted_at"),
                     "completion_time": None,
@@ -700,7 +781,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                     "checkpoint_count": 0,
                 }
 
-            run = runs_map[r_id]
+            run = runs_map[key]
             ev_type = ev.get("event_type")
             if ev_type == "run_finished":
                 run["status"] = "COMPLETED"
@@ -719,96 +800,72 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 run["latest_metrics"].update(ev.get("metrics", {}))
 
         # Enrich active runs and discover durable historical runs from disk
-        artifacts_root = getattr(self.server, "artifacts_dir", Path("./artifacts").resolve())
-        proj_base = artifacts_root / "projects"
-        if proj_base.is_dir():
-            target_dirs = [proj_base / proj_filter] if proj_filter else [d for d in proj_base.iterdir() if d.is_dir()]
-            for p_dir in target_dirs:
-                runs_dir = p_dir / "runs"
-                if not runs_dir.is_dir():
-                    continue
-                for r_dir in runs_dir.iterdir():
-                    if not r_dir.is_dir():
-                        continue
-                    r_id = r_dir.name
-                    if r_id not in runs_map:
-                        runs_map[r_id] = {
-                            "run_id": r_id,
-                            "project_id": p_dir.name,
-                            "status": "COMPLETED",
-                            "start_time": None,
-                            "completion_time": None,
-                            "latest_epoch": None,
-                            "latest_step": None,
-                            "latest_metrics": {},
-                            "checkpoint_count": 0,
-                        }
+        for key, r_dir in self._disk_run_dirs(project_filter=proj_filter).items():
+            p_id, r_id = key
+            if key not in runs_map:
+                runs_map[key] = {
+                    "run_id": r_id,
+                    "project_id": p_id,
+                    "status": "COMPLETED",
+                    "start_time": None,
+                    "completion_time": None,
+                    "latest_epoch": None,
+                    "latest_step": None,
+                    "latest_metrics": {},
+                    "checkpoint_count": 0,
+                }
 
-                    # Read manifest if present
-                    m_path = r_dir / "manifest.json"
-                    if m_path.is_file():
-                        try:
-                            with open(m_path, "r", encoding="utf-8") as mf:
-                                m_data = json.load(mf)
-                            run = runs_map[r_id]
-                            if not run.get("start_time"):
-                                run["start_time"] = m_data.get("created_at")
-                            run_arts = self._collect_run_artifacts_and_drive(r_id, manifest_data=m_data, run_dir=r_dir)
-                            chk_arts = [a for a in run_arts if a.get("artifact_type") == "checkpoint" or a.get("category") == "checkpoint"]
-                            if chk_arts:
-                                run["checkpoint_count"] = max(run.get("checkpoint_count", 0), len(chk_arts))
-                                latest_chk = next((a for a in chk_arts if a.get("is_latest")), chk_arts[-1])
-                                run["latest_checkpoint_name"] = Path(latest_chk.get("logical_path") or latest_chk.get("path", "")).name
-                                run["latest_checkpoint_sha256"] = latest_chk.get("sha256")
-                            drive_arts = [a for a in run_arts if a.get("storage_provider") == "google_drive" or a.get("remote_file_id") or a.get("remote_available")]
-                            if drive_arts:
-                                run["drive_publication_status"] = "PUBLISHED"
-                                run["drive_file_id"] = drive_arts[-1].get("remote_file_id")
-                            if any(a.get("artifact_type") == "source_snapshot" for a in run_arts):
-                                run["source_snapshot_available"] = True
-                        except Exception:
-                            pass
+            # Read manifest if present
+            m_data = _load_run_manifest(r_dir, p_id, r_id)
+            if m_data is not None:
+                try:
+                    run = runs_map[key]
+                    if not run.get("start_time"):
+                        run["start_time"] = m_data.get("created_at")
+                    run_arts = self._collect_run_artifacts_and_drive(r_id, manifest_data=m_data, run_dir=r_dir, project_id=p_id)
+                    chk_arts = [a for a in run_arts if a.get("artifact_type") == "checkpoint" or a.get("category") == "checkpoint"]
+                    if chk_arts:
+                        run["checkpoint_count"] = max(run.get("checkpoint_count", 0), len(chk_arts))
+                        latest_chk = next((a for a in chk_arts if a.get("is_latest")), chk_arts[-1])
+                        run["latest_checkpoint_name"] = Path(latest_chk.get("logical_path") or latest_chk.get("path", "")).name
+                        run["latest_checkpoint_sha256"] = latest_chk.get("sha256")
+                    drive_arts = [a for a in run_arts if a.get("storage_provider") == "google_drive" or a.get("remote_file_id") or a.get("remote_available")]
+                    if drive_arts:
+                        run["drive_publication_status"] = "PUBLISHED"
+                        run["drive_file_id"] = drive_arts[-1].get("remote_file_id")
+                    if any(a.get("artifact_type") == "source_snapshot" for a in run_arts):
+                        run["source_snapshot_available"] = True
+                except Exception:
+                    pass
 
         # Check session active status
         all_managed = self.server.registry.get_all_managed()
         active_session_ids = {s_id for s_id, s_info in all_managed.items() if s_info.get("state") in ("READY", "RUNNING", "ACTIVE")}
 
-        for r_id, run in runs_map.items():
-            run["is_runtime_active"] = r_id in active_session_ids
+        ordered_keys = sorted(runs_map)
+        for key in ordered_keys:
+            run = runs_map[key]
+            run["is_runtime_active"] = key[1] in active_session_ids
             if "drive_publication_status" not in run:
                 run["drive_publication_status"] = "PENDING"
             if "source_snapshot_available" not in run:
                 run["source_snapshot_available"] = False
 
-        self._send_json(list(runs_map.values()))
+        self._send_json([runs_map[key] for key in ordered_keys])
 
     def _collect_run_artifacts_and_drive(
         self,
         run_id: str,
         manifest_data: Optional[Dict[str, Any]] = None,
         run_dir: Optional[Path] = None,
+        project_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Collect and normalize run artifacts and historical revisions with drive status."""
-        artifacts_root = getattr(self.server, "artifacts_dir", Path("./artifacts").resolve())
-        if manifest_data is None or run_dir is None:
-            proj_base = artifacts_root / "projects"
-            if proj_base.is_dir():
-                for p_dir in proj_base.iterdir():
-                    candidate_dir = p_dir / "runs" / run_id
-                    candidate_m = candidate_dir / "manifest.json"
-                    if candidate_m.is_file():
-                        if manifest_data is None:
-                            try:
-                                with open(candidate_m, "r", encoding="utf-8") as mf:
-                                    manifest_data = json.load(mf)
-                            except Exception:
-                                pass
-                        if run_dir is None:
-                            run_dir = candidate_dir
-                        break
-                    elif candidate_dir.is_dir() and run_dir is None:
-                        run_dir = candidate_dir
+        """Collect and normalize run artifacts and historical revisions with drive status.
 
+        The caller must pass the exact run directory (projects/<project>/runs/<run>)
+        resolved from a RunKey. No cross-project lookup happens here (C4). Artifact
+        ids are always prefixed with "<project>/<run>/" so they are unique per project.
+        """
         raw_artifacts: Dict[str, Dict[str, Any]] = manifest_data.get("artifacts", {}) if manifest_data else {}
         latest_by_path: Dict[str, Any] = manifest_data.get("latest_by_path", {}) if manifest_data else {}
 
@@ -955,6 +1012,14 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
 
+        # Artifact ids must include the owning project and run (D10)
+        if project_id:
+            id_prefix = f"{project_id}/{run_id}/"
+            for a in parsed_artifacts:
+                aid = str(a.get("artifact_id") or "")
+                if not aid.startswith(id_prefix):
+                    a["artifact_id"] = id_prefix + aid
+
         # Sort the returned artifacts list chronologically
         def _global_sort(a):
             c_at = a.get("created_at") or ""
@@ -965,7 +1030,32 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         parsed_artifacts.sort(key=_global_sort)
         return parsed_artifacts
 
-    def _handle_run_detail(self, path: str) -> None:
+    def _resolve_run_key(
+        self,
+        run_id: str,
+        project: Optional[str],
+    ) -> Tuple[Optional[Tuple[str, str]], Optional[Tuple[int, Dict[str, Any]]]]:
+        """Resolve (project_id, run_id) for a run endpoint.
+
+        Returns (key, None) on success, or (None, (status, body)) for 404/409.
+        Without ``project`` the legacy unqualified URL works only when exactly one
+        project owns ``run_id``.
+        """
+        keys: Set[Tuple[str, str]] = {_event_run_key(ev) for ev in self.server.telemetry.get_events(run_id=run_id)}
+        keys.update(self._disk_run_dirs(project_filter=project, run_filter=run_id).keys())
+        if project is not None:
+            keys = {k for k in keys if k[0] == project}
+        if not keys:
+            body: Dict[str, Any] = {"error": "Run not found", "run_id": run_id}
+            if project is not None:
+                body["project"] = project
+            return None, (404, body)
+        projects = sorted({k[0] for k in keys})
+        if len(projects) > 1:
+            return None, (409, {"error": "ambiguous_run", "run_id": run_id, "projects": projects})
+        return (projects[0], run_id), None
+
+    def _handle_run_detail(self, path: str, query: Dict[str, List[str]]) -> None:
         parts = path.strip("/").split("/")
         # Path format: api/v1/runs/{run_id} or api/v1/runs/{run_id}/{sub_resource}
         if len(parts) < 4:
@@ -978,29 +1068,31 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 status=400,
             )
             return
-        events = self.server.telemetry.get_events(run_id=run_id)
 
+        project = query.get("project", [None])[0]
+        if project is not None and not _is_valid_identifier(project):
+            self._send_json(
+                {"error": "Invalid project", "message": "Project selector contains illegal characters."},
+                status=400,
+            )
+            return
 
-        artifacts_root = getattr(self.server, "artifacts_dir", Path("./artifacts").resolve())
-        manifest_data: Optional[Dict[str, Any]] = None
-        target_run_dir: Optional[Path] = None
-        proj_base = artifacts_root / "projects"
-        if proj_base.is_dir():
-            for p_dir in proj_base.iterdir():
-                candidate_dir = p_dir / "runs" / run_id
-                m_candidate = candidate_dir / "manifest.json"
-                if m_candidate.is_file():
-                    try:
-                        with open(m_candidate, "r", encoding="utf-8") as mf:
-                            manifest_data = json.load(mf)
-                        target_run_dir = candidate_dir
-                        break
-                    except Exception:
-                        pass
-                elif candidate_dir.is_dir() and target_run_dir is None:
-                    target_run_dir = candidate_dir
+        key, failure = self._resolve_run_key(run_id, project)
+        if failure is not None or key is None:
+            status_code, body = failure or (404, {"error": "Run not found", "run_id": run_id})
+            self._send_json(body, status=status_code)
+            return
+        project_id = key[0]
 
-        artifacts_list = self._collect_run_artifacts_and_drive(run_id, manifest_data=manifest_data, run_dir=target_run_dir)
+        events = self.server.telemetry.get_events(run_id=run_id, project_id=project_id)
+        r_dir = self._disk_run_dirs(project_filter=project_id, run_filter=run_id).get(key)
+        manifest_data: Optional[Dict[str, Any]] = (
+            _load_run_manifest(r_dir, project_id, run_id) if r_dir is not None else None
+        )
+
+        artifacts_list = self._collect_run_artifacts_and_drive(
+            run_id, manifest_data=manifest_data, run_dir=r_dir, project_id=project_id
+        )
         drive_artifacts = [a for a in artifacts_list if a.get("storage_provider") == "google_drive" or a.get("remote_file_id") or a.get("remote_available")]
         status_str = "PUBLISHED" if drive_artifacts else ("PENDING" if artifacts_list else "DISABLED")
 
@@ -1010,23 +1102,25 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json({
                 "run_id": run_id,
+                "project_id": project_id,
                 "event_count": len(events),
                 "artifacts_count": len(artifacts_list),
                 "artifacts": artifacts_list,
                 "events": events,
             })
         elif len(parts) == 5 and parts[4] == "artifacts":
-            self._send_json({"run_id": run_id, "artifacts": artifacts_list})
+            self._send_json({"run_id": run_id, "project_id": project_id, "artifacts": artifacts_list})
         elif len(parts) == 5 and parts[4] == "drive":
             self._send_json({
                 "run_id": run_id,
+                "project_id": project_id,
                 "drive_publication_status": status_str,
                 "published_count": len(drive_artifacts),
                 "artifacts": drive_artifacts,
             })
         elif len(parts) == 5 and parts[4] == "manifest":
             if not manifest_data:
-                self._send_json({"error": "Manifest not found for run", "run_id": run_id}, status=404)
+                self._send_json({"error": "Manifest not found for run", "run_id": run_id, "project_id": project_id}, status=404)
                 return
             self._send_json(manifest_data)
         elif len(parts) == 5 and parts[4] == "metrics":
@@ -1046,7 +1140,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             for e in events:
                 if e.get("details", {}).get("log_line"):
                     logs.append(e["details"]["log_line"])
-            self._send_json({"run_id": run_id, "logs": logs})
+            self._send_json({"run_id": run_id, "project_id": project_id, "logs": logs})
         else:
             self._send_json({"error": "Invalid run endpoint"}, status=404)
 
@@ -1054,6 +1148,13 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
     def _handle_events_stream(self, query: Dict[str, List[str]]) -> None:
         """SSE event stream supporting cursor resume (?from_id=...) (Q27)."""
         from_id = query.get("from_id", [None])[0] or self.headers.get("Last-Event-ID")
+        project = query.get("project", [None])[0]
+        if project is not None and not _is_valid_identifier(project):
+            self._send_json(
+                {"error": "Invalid project", "message": "Project selector contains illegal characters."},
+                status=400,
+            )
+            return
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -1062,7 +1163,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self._send_cors_and_security_headers(csp_nonce=None)
         self.end_headers()
 
-        events = self.server.telemetry.get_events()
+        events = self.server.telemetry.get_events(project_id=project)
         # Find index of cursor if provided
         start_idx = 0
         if from_id:
