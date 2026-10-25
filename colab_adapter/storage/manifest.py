@@ -45,6 +45,34 @@ def compute_file_md5(file_path: Union[str, Path], chunk_size: int = 65536) -> st
     return hasher.hexdigest()
 
 
+def _extract_logical_path(
+    art_dict_or_obj: Union[Dict[str, Any], StoredArtifact],
+    project_id: str = "",
+    run_id: str = "",
+) -> str:
+    """Extract and normalize logical path from an artifact dict or StoredArtifact."""
+    if isinstance(art_dict_or_obj, StoredArtifact):
+        lp = art_dict_or_obj.logical_path
+        if not lp:
+            _, _, parsed_lp, _ = parse_artifact_id(art_dict_or_obj.artifact_id)
+            lp = parsed_lp or (Path(art_dict_or_obj.path).name if art_dict_or_obj.path else "")
+        p_id = art_dict_or_obj.project_id or project_id
+        r_id = art_dict_or_obj.run_id or run_id
+    else:
+        lp = art_dict_or_obj.get("logical_path")
+        if not lp:
+            _, _, parsed_lp, _ = parse_artifact_id(art_dict_or_obj.get("artifact_id", ""))
+            lp = parsed_lp or (Path(art_dict_or_obj.get("path", "")).name if art_dict_or_obj.get("path") else "")
+        p_id = art_dict_or_obj.get("project_id") or project_id
+        r_id = art_dict_or_obj.get("run_id") or run_id
+
+    lp = (lp or "").split("@sha256_")[0].lstrip("/")
+    prefix = f"{p_id}/{r_id}/"
+    if p_id and r_id and lp.startswith(prefix):
+        lp = lp[len(prefix):].lstrip("/")
+    return lp
+
+
 def _build_stored_artifact(art_dict: Dict[str, Any]) -> StoredArtifact:
     return StoredArtifact.from_dict(art_dict)
 
@@ -104,24 +132,31 @@ class PublicationManifest:
 
         # Check if we are updating an already-superseded revision
         existing = self.artifacts.get(rev_id, {})
-        is_updating_superseded = bool(
-            (existing and (existing.get("superseded_by") or existing.get("is_latest") is False))
-            or (artifact.superseded_by or artifact.is_latest is False)
+        is_historical = bool(
+            artifact.is_latest is False
+            or artifact.superseded_by is not None
+            or (artifact.metadata and artifact.metadata.get("is_latest") is False)
+            or (existing and (existing.get("is_latest") is False or existing.get("superseded_by")))
         )
 
-        if not is_updating_superseded:
+        art_created = existing.get("created_at") or artifact.created_at or ""
+
+        # Check existing latest for this logical path to ensure we never demote the real latest
+        current_latest_id = self.latest_by_path.get(logical_path)
+        current_latest = self.artifacts.get(current_latest_id) if current_latest_id else None
+
+        if current_latest and not is_historical:
+            latest_created = current_latest.get("created_at") or ""
+            if latest_created and art_created and latest_created > art_created:
+                # An existing latest is strictly newer than this artifact, so this artifact cannot become latest
+                is_historical = True
+
+        if not is_historical:
             # Prior revisions for the same logical_path:
-            # iterate over existing entries in self.artifacts.values() whose logical_path matches logical_path and key != rev_id
-            # set their ["is_latest"] = False and mark superseded_by
+            # Demote them to is_latest=False and maintain immediate-successor superseded_by
             for k, v in self.artifacts.items():
                 if k != rev_id:
-                    v_lp = v.get("logical_path")
-                    if not v_lp:
-                        _, _, v_lp, _ = parse_artifact_id(v.get("artifact_id", k))
-                    v_lp = (v_lp or "").split("@sha256_")[0].lstrip("/")
-                    v_prefix = f"{v.get('project_id', '')}/{v.get('run_id', '')}/"
-                    if v.get('project_id') and v.get('run_id') and v_lp.startswith(v_prefix):
-                        v_lp = v_lp[len(v_prefix):].lstrip("/")
+                    v_lp = _extract_logical_path(v, self.project_id, self.run_id)
                     if v_lp == logical_path:
                         v["is_latest"] = False
                         v.setdefault("metadata", {})["is_latest"] = False
@@ -146,13 +181,29 @@ class PublicationManifest:
         storage_provider = artifact.storage_provider or existing.get("storage_provider", "local")
         artifact_type = artifact.artifact_type or existing.get("artifact_type", "checkpoint")
 
+        # Determine superseded_by_val for this artifact
         superseded_by_val: Optional[str] = None
         if existing and existing.get("superseded_by"):
             superseded_by_val = str(existing["superseded_by"])
         elif artifact.superseded_by:
             superseded_by_val = str(artifact.superseded_by)
+        elif is_historical:
+            # When a historical revision is inserted AFTER a newer one exists,
+            # set its superseded_by only if the successor is known in the manifest
+            # (the next revision by created order); otherwise leave None but is_latest False.
+            newer_revisions = []
+            for k, v in self.artifacts.items():
+                if k != rev_id:
+                    v_lp = _extract_logical_path(v, self.project_id, self.run_id)
+                    if v_lp == logical_path:
+                        v_created = v.get("created_at") or ""
+                        if v_created > art_created:
+                            newer_revisions.append((v_created, k))
+            if newer_revisions:
+                newer_revisions.sort(key=lambda x: (x[0], x[1]))
+                superseded_by_val = str(newer_revisions[0][1])
 
-        is_latest_val = False if superseded_by_val else (not is_updating_superseded)
+        is_latest_val = False if (is_historical or superseded_by_val is not None) else True
         if superseded_by_val is not None:
             merged_metadata["superseded_by"] = superseded_by_val
         merged_metadata["is_latest"] = is_latest_val
@@ -180,6 +231,8 @@ class PublicationManifest:
         self.artifacts[rev_id] = updated.to_dict()
         if is_latest_val:
             self.latest_by_path[logical_path] = str(rev_id)
+        elif self.latest_by_path.get(logical_path) == str(rev_id):
+            self.latest_by_path.pop(logical_path, None)
         self.updated_at = _utc_now_iso()
         return updated
 
@@ -193,7 +246,9 @@ class PublicationManifest:
         if artifact_id in self.latest_by_path:
             rev_id = self.latest_by_path[artifact_id]
             if rev_id in self.artifacts:
-                return _build_stored_artifact(self.artifacts[rev_id])
+                art_dict = self.artifacts[rev_id]
+                if art_dict.get("is_latest") is True:
+                    return _build_stored_artifact(art_dict)
 
         # 3. Third, parse _, _, logical_path, sha_suffix = parse_artifact_id(artifact_id)
         _, _, logical_path, sha_suffix = parse_artifact_id(artifact_id)
@@ -205,7 +260,9 @@ class PublicationManifest:
         if sha_suffix is None and clean_lp in self.latest_by_path:
             rev_id = self.latest_by_path[clean_lp]
             if rev_id in self.artifacts:
-                return _build_stored_artifact(self.artifacts[rev_id])
+                art_dict = self.artifacts[rev_id]
+                if art_dict.get("is_latest") is True:
+                    return _build_stored_artifact(art_dict)
 
         # Fallback: scan self.artifacts.values() for matching logical_path
         candidates = []
@@ -244,8 +301,7 @@ class PublicationManifest:
             latest_candidate = next((c for c in candidates if c.get("is_latest") is True), None)
             if latest_candidate:
                 return _build_stored_artifact(latest_candidate)
-            sorted_candidates = sorted(candidates, key=lambda c: c.get("created_at") or "", reverse=True)
-            return _build_stored_artifact(sorted_candidates[0])
+            return None
 
         return None
 
