@@ -647,6 +647,107 @@ class TestDashboardUIIntegration(unittest.TestCase):
         finally:
             server.shutdown()
 
+    def test_dashboard_renders_multiple_checkpoint_revisions_with_latest_and_historical_state(self):
+        """Verify dashboard API returns multiple revisions with logical_path, step, and is_latest."""
+        collector = AccountUsageCollector(ledger_path=self.ledger_path)
+        registry = ManagedSessionRegistry(self.registry_path)
+        multirev_run_id = "run-multirev-01"
+        emitter = TelemetryEmitter(
+            ledger_path=self.telemetry_path,
+            run_id=multirev_run_id,
+            project_id=self.project_id,
+        )
+
+        run_artifacts_dir = self.artifacts_dir / "projects" / self.project_id / "runs" / multirev_run_id
+        run_artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (run_artifacts_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+
+        t1 = "2026-10-24T10:00:00Z"
+        sha_a = "1111111111111111111111111111111111111111111111111111111111111111"
+        art_a_id = f"{self.project_id}/{multirev_run_id}/checkpoints/model.pt@sha256_{sha_a}"
+        art_a = StoredArtifact(
+            artifact_id=art_a_id,
+            storage_provider="google_drive",
+            path=str(run_artifacts_dir / "checkpoints" / f"model.pt.sha256_{sha_a[:12]}"),
+            size_bytes=1024,
+            sha256=sha_a,
+            project_id=self.project_id,
+            run_id=multirev_run_id,
+            artifact_type="checkpoint",
+            remote_file_id="drive-rev-a",
+            created_at=t1,
+            verified_at=t1,
+            metadata={"step": 100, "epoch": 1, "logical_path": "checkpoints/model.pt", "revision_id": f"sha256_{sha_a[:12]}"},
+        )
+
+        t2 = "2026-10-24T12:00:00Z"
+        sha_b = "2222222222222222222222222222222222222222222222222222222222222222"
+        art_b_id = f"{self.project_id}/{multirev_run_id}/checkpoints/model.pt@sha256_{sha_b}"
+        art_b = StoredArtifact(
+            artifact_id=art_b_id,
+            storage_provider="google_drive",
+            path=str(run_artifacts_dir / "checkpoints" / "model.pt"),
+            size_bytes=2048,
+            sha256=sha_b,
+            project_id=self.project_id,
+            run_id=multirev_run_id,
+            artifact_type="checkpoint",
+            remote_file_id="drive-rev-b",
+            created_at=t2,
+            verified_at=t2,
+            metadata={"step": 200, "epoch": 2, "logical_path": "checkpoints/model.pt", "revision_id": f"sha256_{sha_b[:12]}"},
+        )
+
+        manifest = PublicationManifest(
+            project_id=self.project_id,
+            run_id=multirev_run_id,
+            manifest_version=2,
+            environment={"python": "3.8"},
+        )
+        manifest.add_artifact(art_a)
+        manifest.add_artifact(art_b)
+        manifest.save(run_artifacts_dir / "manifest.json")
+
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            collector=collector,
+            registry=registry,
+            telemetry=emitter,
+            auth_token=self.auth_token,
+            allow_external=False,
+            artifacts_dir=self.artifacts_dir,
+        )
+        port = server.server_port
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            headers = {"Authorization": f"Bearer {self.auth_token}", "Accept": "application/json"}
+            req = urllib.request.Request(f"{base_url}/api/v1/runs/{multirev_run_id}/artifacts", headers=headers)
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read().decode("utf-8"))
+
+            self.assertEqual(data["run_id"], multirev_run_id)
+            artifacts = data["artifacts"]
+            self.assertEqual(len(artifacts), 2)
+
+            rev_a = next(a for a in artifacts if a.get("sha256") == sha_a)
+            rev_b = next(a for a in artifacts if a.get("sha256") == sha_b)
+
+            self.assertEqual(rev_a["logical_path"], "checkpoints/model.pt")
+            self.assertEqual(rev_a["step"], 100)
+            self.assertFalse(rev_a["is_latest"])
+
+            self.assertEqual(rev_b["logical_path"], "checkpoints/model.pt")
+            self.assertEqual(rev_b["step"], 200)
+            self.assertTrue(rev_b["is_latest"])
+
+        finally:
+            server.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

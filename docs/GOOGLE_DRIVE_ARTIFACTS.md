@@ -115,6 +115,97 @@ When multiple local processes (e.g., concurrent training jobs, background upload
 
 ---
 
+## Canonical Revision Identity & PublicationManifest V2 Schema
+
+In real-world deep learning workflows, multiple checkpoints frequently share the same logical path (e.g. `checkpoints/model.pt` overwritten each epoch). Google Drive Artifact Storage V2 manages multi-revision experiments transparently:
+
+### 1. Canonical Revision Key Format
+Each immutable revision is indexed by its content-addressed versioned ID:
+```text
+<project_id>/<run_id>/<logical_path>@sha256_<full_64_character_sha256>
+```
+Example:
+```text
+vision_v2/run-001/checkpoints/model.pt@sha256_3b4f5d133bb7c9c693999b2620703353cba10983fc4aa8162ac1e456fdffa766
+```
+
+### 2. PublicationManifest V2 Schema
+The publication manifest on disk (`manifest.json`) adheres to version 2 schema:
+```json
+{
+  "manifest_version": 2,
+  "project_id": "vision_v2",
+  "run_id": "run-001",
+  "status": "PUBLISHED",
+  "latest_by_path": {
+    "checkpoints/model.pt": "vision_v2/run-001/checkpoints/model.pt@sha256_2222..."
+  },
+  "artifacts": {
+    "vision_v2/run-001/checkpoints/model.pt@sha256_1111...": {
+      "artifact_id": "vision_v2/run-001/checkpoints/model.pt@sha256_1111...",
+      "storage_provider": "google_drive",
+      "logical_path": "checkpoints/model.pt",
+      "revision_id": "sha256_111111111111",
+      "size_bytes": 1024,
+      "sha256": "1111...",
+      "remote_file_id": "drive-file-rev1",
+      "created_at": "2026-10-24T10:00:00Z",
+      "metadata": {"step": 100, "epoch": 1}
+    },
+    "vision_v2/run-001/checkpoints/model.pt@sha256_2222...": {
+      "artifact_id": "vision_v2/run-001/checkpoints/model.pt@sha256_2222...",
+      "storage_provider": "google_drive",
+      "logical_path": "checkpoints/model.pt",
+      "revision_id": "sha256_222222222222",
+      "size_bytes": 2048,
+      "sha256": "2222...",
+      "remote_file_id": "drive-file-rev2",
+      "created_at": "2026-10-24T12:00:00Z",
+      "metadata": {"step": 200, "epoch": 2}
+    }
+  },
+  "migration_notes": [
+    "2026-10-24T12:00:00Z: Migrated manifest from version 1 to 2; indexed latest_by_path."
+  ]
+}
+```
+
+### 3. Automatic V1 to V2 Migration
+When loading older `manifest_version: 1` files where `artifacts` keys lacked `@sha256_`, `PublicationManifest.load()` automatically:
+- Preserves all historical records.
+- Keys records by their canonical `@sha256_<full_sha256>` identity.
+- Populates `latest_by_path` based on timestamps and step metadata.
+- Updates `manifest_version` to `2` and appends an entry to `migration_notes`.
+
+### 4. Retrieving Latest vs. Specific Historical Revisions
+- **Retrieving Latest**:
+  ```python
+  # Resolves logical path "checkpoints/model.pt" via latest_by_path
+  store.retrieve(
+      artifact_id="vision_v2/run-001/checkpoints/model.pt",
+      destination="./latest_model.pt",
+  )
+  ```
+- **Retrieving Specific Historical Revision**:
+  ```python
+  # Retrieves exact historical revision from Epoch 1
+  store.retrieve(
+      artifact_id="vision_v2/run-001/checkpoints/model.pt@sha256_1111111111111111111111111111111111111111111111111111111111111111",
+      destination="./epoch1_model.pt",
+  )
+  ```
+
+### 5. Cross-Process Locking & Staging Protection
+- All manifest modifications acquire `.manifest.lock` via `fcntl.flock`.
+- Staged revisions are written to temporary files named `*.sha256_<hash[:12]>` or `*.tmp.*` before verification and atomic replacement.
+- Disk scanners skip internal `*.sha256_*` staging files while preserving all historical records registered in `manifest.json`.
+
+### 6. Real-Browser CI Security Testing
+- Headless Chromium/Playwright test suites execute in CI against loopback `MonitorServer` instances.
+- Verifies that `#artifacts-table` displays `LATEST` (green badge) for current revisions and `HISTORICAL` (neutral badge) for superseded revisions, with zero `.innerHTML` and strict CSP nonce enforcement.
+
+---
+
 ## Authoritative Verification Guarantees
 
 1. **No Local Size Substitution & Readback Fallback**: The store never substitutes expected local file sizes when remote metadata is missing. Authoritative remote size and `md5Checksum` are queried from the Drive REST API (`GET /drive/v3/files/<id>?fields=id,name,size,md5Checksum`); if remote size is absent, a `DriveIntegrityError` is raised. If `md5Checksum` is omitted by the server, `publish()` performs a bounded streaming readback (`alt=media`) to verify the remote content's SHA256 and byte length before marking `DRIVE_VERIFIED`.

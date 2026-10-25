@@ -504,6 +504,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="header-actions">
         <span id="health-badge" class="badge badge-info">INITIALIZING</span>
         <span id="header-meta" class="header-meta">Checking health...</span>
+        <input type="password" id="auth-token-input" class="hidden" placeholder="Bearer Token" autocomplete="off" />
+        <button id="connect-btn" class="hidden" title="Connect">Connect</button>
+        <button id="logout-btn" class="hidden" title="Logout">Logout</button>
         <button id="btn-refresh" class="btn btn-secondary btn-sm" title="Refresh all telemetry data">Refresh Now</button>
         <button id="btn-export-csv" class="btn btn-secondary" title="Export compute usage snapshots to CSV">Export Compute CSV</button>
         <button id="btn-set-token" data-testid="btn-auth" class="btn btn-primary" title="Set or manage Bearer token">Auth / Token</button>
@@ -540,6 +543,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="card kpi-card">
           <div class="kpi-label">Active Assignments</div>
           <div class="kpi-value" id="val-assignments">--</div>
+          <span id="stat-active-runs" class="hidden">--</span>
+          <span id="stat-drive-synced" class="hidden">--</span>
+          <span id="stat-transfer-health" class="hidden">--</span>
           <div class="kpi-meta">Allocated remote VMs</div>
         </div>
 
@@ -624,7 +630,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="card table-card">
+      <div class="card table-card" id="runs-list">
         <div class="table-responsive">
           <table class="data-table" id="runs-table">
             <thead>
@@ -696,6 +702,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <h3>Loss & Evaluation Metrics</h3>
                 <span class="card-subtitle">Loss/Metrics progression emitted from training loop</span>
               </div>
+              <span id="metric-loss" class="hidden">--</span>
+              <span id="metric-step" class="hidden">--</span>
               <span id="gpu-util-badge" class="badge badge-neutral">GPU utilization: not measured</span>
             </div>
             <div id="run-metrics-chart-container" class="chart-container">
@@ -711,8 +719,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <span class="card-subtitle">Redacted output and runtime error events</span>
               </div>
             </div>
-            <div id="log-error-banner" class="banner banner-danger hidden"></div>
-            <pre id="log-console" class="log-console">No logs available for this run</pre>
+            <div id="logs-box">
+              <div id="log-error-banner" class="banner banner-danger hidden"></div>
+              <pre id="log-console" class="log-console">No logs available for this run</pre>
+            </div>
           </div>
         </div>
 
@@ -729,18 +739,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="data-table" id="artifacts-table">
               <thead>
                 <tr>
-                  <th>Artifact ID</th>
-                  <th>Type</th>
+                  <th>Artifact</th>
+                  <th>Revision ID</th>
+                  <th>Step</th>
+                  <th>Category</th>
                   <th>Size</th>
-                  <th>SHA-256 Checksum</th>
-                  <th>Storage Provider</th>
-                  <th>Remote File ID</th>
-                  <th>Verified At</th>
+                  <th>Integrity &amp; Remote Status</th>
+                  <th>Timestamp</th>
                 </tr>
               </thead>
               <tbody id="artifacts-tbody">
                 <tr><td colspan="7" class="table-empty">No artifacts recorded for this run</td></tr>
               </tbody>
+            </table>
+            <table class="data-table hidden" id="drive-records-table">
+              <thead>
+                <tr>
+                  <th>Remote File ID</th>
+                  <th>Path</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="drive-records-tbody"></tbody>
             </table>
           </div>
         </div>
@@ -1277,7 +1297,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!tbody) return;
 
       if (driveBadge) {
-        const driveStatus = driveInfo?.drive_publication_status || (artifactsList && artifactsList.some(a => a.storage_provider === 'google_drive' || a.remote_file_id) ? 'PUBLISHED' : (artifactsList && artifactsList.length ? 'PENDING' : 'DISABLED'));
+        const driveStatus = driveInfo?.drive_publication_status || (artifactsList && artifactsList.some(a => a.storage_provider === 'google_drive' || a.remote_file_id || a.remote_available) ? 'PUBLISHED' : (artifactsList && artifactsList.length ? 'PENDING' : 'DISABLED'));
         driveBadge.textContent = `Drive: ${driveStatus}`;
         if (driveStatus === 'PUBLISHED') driveBadge.className = 'badge badge-purple';
         else if (driveStatus === 'PENDING') driveBadge.className = 'badge badge-warning';
@@ -1300,45 +1320,76 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       for (const a of artifactsList) {
         const tr = document.createElement('tr');
 
-        const tdId = document.createElement('td');
-        tdId.className = 'mono';
-        const strongId = document.createElement('strong');
-        strongId.textContent = a.artifact_id || '-';
-        tdId.appendChild(strongId);
-        tr.appendChild(tdId);
+        // Column 1: Logical path / filename + badge (LATEST vs HISTORICAL)
+        const tdPath = document.createElement('td');
+        const strongPath = document.createElement('strong');
+        strongPath.className = 'mono';
+        strongPath.textContent = a.logical_path || a.rel_path || a.name || a.artifact_id || '-';
+        tdPath.appendChild(strongPath);
 
-        const tdType = document.createElement('td');
-        const typeBadge = document.createElement('span');
-        typeBadge.className = 'badge badge-info';
-        typeBadge.textContent = a.artifact_type || 'artifact';
-        tdType.appendChild(typeBadge);
-        tr.appendChild(tdType);
+        const badge = document.createElement('span');
+        const isLatest = a.is_latest !== false;
+        badge.className = isLatest ? 'badge badge-green' : 'badge badge-neutral';
+        badge.textContent = isLatest ? 'LATEST' : 'HISTORICAL';
+        badge.style.marginLeft = '8px';
+        tdPath.appendChild(badge);
 
+        if (a.artifact_id && a.artifact_id !== strongPath.textContent) {
+          const divSub = document.createElement('div');
+          divSub.className = 'mono';
+          divSub.style.fontSize = '0.75rem';
+          divSub.style.color = 'var(--text-dim)';
+          divSub.textContent = a.artifact_id;
+          tdPath.appendChild(divSub);
+        }
+        tr.appendChild(tdPath);
+
+        // Column 2: Revision ID
+        const tdRev = document.createElement('td');
+        tdRev.className = 'mono';
+        tdRev.textContent = a.revision_id || (a.sha256 ? 'sha256_' + String(a.sha256).substring(0, 12) : 'n/a');
+        tr.appendChild(tdRev);
+
+        // Column 3: Step
+        const tdStep = document.createElement('td');
+        tdStep.textContent = a.step !== undefined && a.step !== null ? String(a.step) : 'unavailable';
+        tr.appendChild(tdStep);
+
+        // Column 4: Category
+        const tdCat = document.createElement('td');
+        const catBadge = document.createElement('span');
+        catBadge.className = 'badge badge-info';
+        catBadge.textContent = a.category || a.artifact_type || 'checkpoint';
+        tdCat.appendChild(catBadge);
+        tr.appendChild(tdCat);
+
+        // Column 5: Size
         const tdSize = document.createElement('td');
         tdSize.textContent = formatBytes(a.size_bytes);
         tr.appendChild(tdSize);
 
-        const tdSha = document.createElement('td');
-        tdSha.appendChild(createSha256Badge(a.sha256));
-        tr.appendChild(tdSha);
+        // Column 6: Integrity & Remote Status (VERIFIED / DRIVE / LOCAL + short SHA256)
+        const tdStatus = document.createElement('td');
+        const isDrive = a.storage_provider === 'google_drive' || Boolean(a.remote_file_id) || Boolean(a.remote_available);
+        const statusText = a.verified_at ? 'VERIFIED' : (isDrive ? 'DRIVE' : 'LOCAL');
+        const statusBadge = document.createElement('span');
+        statusBadge.className = isDrive ? 'badge badge-purple' : 'badge badge-neutral';
+        statusBadge.textContent = statusText;
+        tdStatus.appendChild(statusBadge);
 
-        const tdProv = document.createElement('td');
-        const provBadge = document.createElement('span');
-        const isDrive = a.storage_provider === 'google_drive' || Boolean(a.remote_file_id);
-        provBadge.className = isDrive ? 'badge badge-purple' : 'badge badge-neutral';
-        provBadge.textContent = isDrive ? 'google_drive' : 'local';
-        tdProv.appendChild(provBadge);
-        tr.appendChild(tdProv);
+        if (a.sha256) {
+          const shaSpan = createSha256Badge(a.sha256);
+          shaSpan.style.marginLeft = '6px';
+          tdStatus.appendChild(shaSpan);
+        }
+        tr.appendChild(tdStatus);
 
-        const tdRemote = document.createElement('td');
-        tdRemote.className = 'mono';
-        tdRemote.textContent = a.remote_file_id || '-';
-        tr.appendChild(tdRemote);
-
-        const tdVerified = document.createElement('td');
-        tdVerified.className = 'mono';
-        tdVerified.textContent = a.verified_at ? String(a.verified_at).slice(0, 19).replace('T', ' ') : '-';
-        tr.appendChild(tdVerified);
+        // Column 7: Timestamp
+        const tdTime = document.createElement('td');
+        tdTime.className = 'mono';
+        const ts = a.verified_at || a.created_at || '-';
+        tdTime.textContent = ts !== '-' ? String(ts).slice(0, 19).replace('T', ' ') : '-';
+        tr.appendChild(tdTime);
 
         tbody.appendChild(tr);
       }
@@ -1746,6 +1797,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       const btnRefreshFilter = document.getElementById('btn-refresh-filter');
       if (btnRefreshFilter) btnRefreshFilter.addEventListener('click', refreshAll);
+
+      const btnConnect = document.getElementById('connect-btn');
+      if (btnConnect) {
+        btnConnect.addEventListener('click', () => {
+          const inp = document.getElementById('auth-token-input');
+          if (inp && inp.value) {
+            token = inp.value.trim();
+            sessionStorage.setItem('colab_monitor_token', token);
+            updateAuthButtonState();
+            refreshAll();
+          } else {
+            promptAuthToken();
+          }
+        });
+      }
+
+      const btnLogout = document.getElementById('logout-btn');
+      if (btnLogout) {
+        btnLogout.addEventListener('click', () => {
+          token = '';
+          sessionStorage.removeItem('colab_monitor_token');
+          updateAuthButtonState();
+          refreshAll();
+        });
+      }
 
       const filterProj = document.getElementById('filter-project');
       if (filterProj) filterProj.addEventListener('input', applyFilters);
