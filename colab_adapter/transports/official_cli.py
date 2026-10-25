@@ -10,8 +10,9 @@ Uses Google's official google-colab-cli commands:
 Guaranteed fail-closed: upstream commands fail with exit code 1 if session is missing;
 they NEVER auto-allocate a new VM.
 """
+import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import tempfile
@@ -30,8 +31,21 @@ from ..provider import ManagedSessionRegistry
 from .base import BaseTransport
 
 
+def _validate_remote_path(remote_path: str) -> str:
+    """Validate remote path against empty values, null bytes, newlines, and path traversal."""
+    if not isinstance(remote_path, str) or not remote_path.strip():
+        raise TransportError(f"Invalid or unsafe remote path: {remote_path!r}")
+    if "\x00" in remote_path or "\n" in remote_path or "\r" in remote_path:
+        raise TransportError(f"Invalid or unsafe remote path: {remote_path!r}")
+    if ".." in PurePosixPath(remote_path).parts:
+        raise TransportError(f"Invalid or unsafe remote path: {remote_path!r}")
+    return remote_path
+
+
 class OfficialCliTransport(BaseTransport):
     """Primary transport implementation backed by official google-colab-cli."""
+
+    _validate_remote_path = staticmethod(_validate_remote_path)
 
     def __init__(
         self,
@@ -94,6 +108,7 @@ class OfficialCliTransport(BaseTransport):
         remote_path: str,
     ) -> None:
         self._verify_session_managed(session_id)
+        remote_path = _validate_remote_path(remote_path)
         local_p = Path(local_path).resolve()
         if not local_p.is_file():
             raise TransportError(f"Local file to upload does not exist: {local_p}")
@@ -101,17 +116,68 @@ class OfficialCliTransport(BaseTransport):
         args = ["upload", "-s", session_id, str(local_p), remote_path]
         try:
             self._run_cmd(args, timeout=300.0)
-        except UpstreamCliError as e:
-            parent_dir = str(Path(remote_path).parent)
-            if "500 Server Error" in str(e) and parent_dir and parent_dir not in (".", "/"):
-                self.exec_code(
-                    session_id,
-                    f"import os\nos.makedirs({parent_dir!r}, exist_ok=True)\n",
-                    timeout=30.0,
-                )
-                self._run_cmd(args, timeout=300.0)
-            else:
+        except UpstreamCliError as orig_err:
+            err_str = str(orig_err)
+            err_lower = err_str.lower()
+
+            is_500 = ("500 server error" in err_lower) or (
+                "500" in err_str and ("/api/contents/" in err_str or "upload failed" in err_lower)
+            )
+            is_disconnect_or_auth = any(
+                term in err_lower
+                for term in ("not found", "unauthorized", "401", "403", "disconnected", "quota")
+            )
+            parent_dir = str(PurePosixPath(remote_path).parent)
+            is_nontrivial_parent = parent_dir not in ("", ".", "/", "/content", "content")
+
+            if not (is_500 and not is_disconnect_or_auth and is_nontrivial_parent):
+                raise orig_err
+
+            self._verify_session_managed(session_id)
+
+            probe_code = (
+                "import json, os\n"
+                f"p = {parent_dir!r}\n"
+                "existed = os.path.isdir(p)\n"
+                "if not existed:\n"
+                "    os.makedirs(p, exist_ok=True)\n"
+                'print("COLAB_MKDIR_STATUS:" + json.dumps({"existed": existed, "isdir": os.path.isdir(p)}))\n'
+            )
+
+            try:
+                probe_res = self.exec_code(session_id, probe_code, timeout=30.0)
+            except SessionNotFoundError:
                 raise
+            except Exception:
+                raise orig_err
+
+            if not isinstance(probe_res, dict) or not probe_res.get("success", False):
+                out = probe_res.get("output", "") if isinstance(probe_res, dict) else ""
+                if not hasattr(orig_err, "details") or not isinstance(orig_err.details, dict):
+                    orig_err.details = {}
+                orig_err.details["mkdir_recovery_failed"] = out
+                raise orig_err
+
+            output = probe_res.get("output", "")
+            if "COLAB_MKDIR_STATUS:" in output:
+                try:
+                    marker = "COLAB_MKDIR_STATUS:"
+                    status_part = output.split(marker, 1)[1].strip()
+                    status_line = status_part.splitlines()[0] if status_part else ""
+                    status_obj = json.loads(status_line)
+                    if status_obj.get("existed") is True or not status_obj.get("isdir", False):
+                        raise orig_err
+                except (json.JSONDecodeError, KeyError, IndexError, ValueError):
+                    raise orig_err
+
+            try:
+                self._run_cmd(args, timeout=300.0)
+            except UpstreamCliError as retry_err:
+                if not hasattr(retry_err, "details") or not isinstance(retry_err.details, dict):
+                    retry_err.details = {}
+                retry_err.details["original_upload_error"] = str(orig_err)
+                retry_err.details["recovery_attempted"] = True
+                raise retry_err from orig_err
 
     def download_file(
         self,
@@ -120,6 +186,7 @@ class OfficialCliTransport(BaseTransport):
         local_path: Union[str, Path],
     ) -> None:
         self._verify_session_managed(session_id)
+        remote_path = _validate_remote_path(remote_path)
         local_p = Path(local_path).resolve()
         local_p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -147,6 +214,7 @@ class OfficialCliTransport(BaseTransport):
         remote_path: str,
     ) -> None:
         self._verify_session_managed(session_id)
+        remote_path = _validate_remote_path(remote_path)
         args = ["rm", "-s", session_id, remote_path]
         self._run_cmd(args, timeout=30.0)
 

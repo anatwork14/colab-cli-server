@@ -191,6 +191,345 @@ class TestTransports(unittest.TestCase):
             transport.upload_file(self.session_id, local_file, "/content/colab-workspaces/proj/train.py")
             self.assertEqual(mock_run.call_count, 3)
 
+    def test_upload_scenario_1_genuine_missing_parent_directory(self):
+        """1. Genuine missing remote parent directory -> creates dir and retries upload once, succeeding."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        with patch("subprocess.run") as mock_run:
+            err_500 = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error: /api/contents/workspace/train.py\n",
+            )
+            probe_out = 'COLAB_MKDIR_STATUS:{"existed": false, "isdir": true}\n'
+            ok_exec = MagicMock(returncode=0, stdout=probe_out, stderr="")
+            ok_upload = MagicMock(returncode=0, stdout="[colab] Uploaded\n", stderr="")
+            mock_run.side_effect = [err_500, ok_exec, ok_upload]
+
+            transport.upload_file(self.session_id, local_file, "/content/workspace/models/train.py")
+            self.assertEqual(mock_run.call_count, 3)
+
+            # First call was upload
+            self.assertIn("upload", mock_run.call_args_list[0][0][0])
+            # Second call was exec (probe)
+            self.assertIn("exec", mock_run.call_args_list[1][0][0])
+            # Third call was retry upload
+            self.assertIn("upload", mock_run.call_args_list[2][0][0])
+
+    def test_upload_scenario_2_http_500_unrelated_to_directories(self):
+        """2. HTTP 500 unrelated to directories -> does NOT retry upload, raises original UpstreamCliError."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        # Case A: Probe indicates parent directory already existed (existed=True)
+        with patch("subprocess.run") as mock_run:
+            err_500 = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error: Internal Server Error\n",
+            )
+            probe_out = 'COLAB_MKDIR_STATUS:{"existed": true, "isdir": true}\n'
+            ok_exec = MagicMock(returncode=0, stdout=probe_out, stderr="")
+            mock_run.side_effect = [err_500, ok_exec]
+
+            with self.assertRaises(UpstreamCliError) as ctx:
+                transport.upload_file(self.session_id, local_file, "/content/workspace/models/train.py")
+            self.assertEqual(mock_run.call_count, 2)  # upload + exec, NO retry
+            self.assertIn("500 Server Error", str(ctx.exception))
+
+        # Case B: CLI error message has no 500 or upload failure (e.g. unhandled internal CLI error)
+        with patch("subprocess.run") as mock_run:
+            err_other = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Network handshake failed with status 502 Bad Gateway\n",
+            )
+            mock_run.side_effect = err_other
+
+            with self.assertRaises(UpstreamCliError):
+                transport.upload_file(self.session_id, local_file, "/content/workspace/models/train.py")
+            self.assertEqual(mock_run.call_count, 1)  # only initial upload, zero exec calls
+
+    def test_upload_scenario_3_directory_creation_fails(self):
+        """3. Directory creation fails (exec_code raises UpstreamCliError) -> preserves and raises original upload UpstreamCliError."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        with patch("subprocess.run") as mock_run:
+            err_upload = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error\n",
+            )
+            err_exec = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "exec"],
+                stderr="[colab] exec command failed internally\n",
+            )
+            mock_run.side_effect = [err_upload, err_exec]
+
+            with self.assertRaises(UpstreamCliError) as ctx:
+                transport.upload_file(self.session_id, local_file, "/content/workspace/models/train.py")
+            self.assertEqual(mock_run.call_count, 2)  # upload + exec, NO retry
+            # Verify original error context is preserved, NOT the exec error
+            self.assertIn("Upload failed: 500 Server Error", str(ctx.exception))
+
+    def test_upload_scenario_4_directory_creation_reports_unsuccessful_execution(self):
+        """4. Directory creation reports unsuccessful execution -> does NOT retry upload, raises original UpstreamCliError with mkdir_recovery_failed in details."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        with patch("subprocess.run") as mock_run:
+            err_upload = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error\n",
+            )
+            traceback_out = (
+                "Traceback (most recent call last):\n"
+                "  File '/tmp/tmp123.py', line 5, in <module>\n"
+                "    os.makedirs(p, exist_ok=True)\n"
+                "PermissionError: [Errno 13] Permission denied: '/content/workspace/models'\n"
+            )
+            exec_fail = MagicMock(returncode=0, stdout=traceback_out, stderr="")
+            mock_run.side_effect = [err_upload, exec_fail]
+
+            with self.assertRaises(UpstreamCliError) as ctx:
+                transport.upload_file(self.session_id, local_file, "/content/workspace/models/train.py")
+            self.assertEqual(mock_run.call_count, 2)  # upload + exec, NO retry
+            self.assertIn("mkdir_recovery_failed", ctx.exception.details)
+            self.assertIn("PermissionError", ctx.exception.details["mkdir_recovery_failed"])
+
+    def test_upload_scenario_5_runtime_disappears_during_retry(self):
+        """5. Runtime disappears during retry (SessionNotFoundError) -> raises SessionNotFoundError, never allocates a VM."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        # Case A: Runtime disappears during exec_code
+        with patch("subprocess.run") as mock_run:
+            err_upload = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error\n",
+            )
+            err_exec_disappeared = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "exec"],
+                stderr="[colab] Session 'test-session-m3' not found.\n",
+            )
+            mock_run.side_effect = [err_upload, err_exec_disappeared]
+
+            with self.assertRaises(SessionNotFoundError):
+                transport.upload_file(self.session_id, local_file, "/content/workspace/models/train.py")
+            self.assertEqual(mock_run.call_count, 2)
+
+        # Case B: Runtime disappears during retry upload
+        with patch("subprocess.run") as mock_run:
+            err_upload = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error\n",
+            )
+            probe_out = 'COLAB_MKDIR_STATUS:{"existed": false, "isdir": true}\n'
+            ok_exec = MagicMock(returncode=0, stdout=probe_out, stderr="")
+            err_retry_disappeared = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] No active sessions found\n",
+            )
+            mock_run.side_effect = [err_upload, ok_exec, err_retry_disappeared]
+
+            with self.assertRaises(SessionNotFoundError):
+                transport.upload_file(self.session_id, local_file, "/content/workspace/models/train.py")
+            self.assertEqual(mock_run.call_count, 3)
+
+    def test_upload_scenario_6_parent_directory_already_exists_or_root(self):
+        """6. Parent directory already exists (existed: true or root /content/file.py) -> does not retry upload, raises original UpstreamCliError."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        # Case A: Root /content/train.py has parent /content (trivial directory), no exec or retry
+        with patch("subprocess.run") as mock_run:
+            err_upload = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error\n",
+            )
+            mock_run.side_effect = [err_upload]
+
+            with self.assertRaises(UpstreamCliError):
+                transport.upload_file(self.session_id, local_file, "/content/train.py")
+            self.assertEqual(mock_run.call_count, 1)  # only initial upload, no exec or retry
+
+        # Case B: Parent existed on remote (existed: true)
+        with patch("subprocess.run") as mock_run:
+            err_upload = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error\n",
+            )
+            probe_out = 'COLAB_MKDIR_STATUS:{"existed": true, "isdir": true}\n'
+            ok_exec = MagicMock(returncode=0, stdout=probe_out, stderr="")
+            mock_run.side_effect = [err_upload, ok_exec]
+
+            with self.assertRaises(UpstreamCliError):
+                transport.upload_file(self.session_id, local_file, "/content/workspace/models/train.py")
+            self.assertEqual(mock_run.call_count, 2)  # upload + probe, NO retry
+
+    def test_upload_scenario_7_invalid_remote_path_rejected_before_cli(self):
+        """7. Invalid remote path (path traversal /content/../etc/passwd or null byte) -> rejected before any CLI invocation with TransportError."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        invalid_paths = [
+            "/content/../etc/passwd",
+            "../secret.txt",
+            "models/../../root",
+            "/content/\x00nullbyte",
+            "/content/newline\nfile.py",
+            "/content/carriage\rfile.py",
+            "",
+            "   ",
+        ]
+        for bad_path in invalid_paths:
+            with patch("subprocess.run") as mock_run:
+                with self.assertRaises(TransportError) as ctx:
+                    transport.upload_file(self.session_id, local_file, bad_path)
+                mock_run.assert_not_called()
+                self.assertIn("Invalid or unsafe remote path", str(ctx.exception))
+
+    def test_upload_scenario_8_timeout_during_remote_directory_check(self):
+        """8. Timeout during remote directory check (TransportError on exec_code) -> raises original UpstreamCliError without retry."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        with patch("subprocess.run") as mock_run:
+            err_upload = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error\n",
+            )
+            timeout_exec = subprocess.TimeoutExpired(
+                cmd=["colab", "exec"],
+                timeout=30.0,
+            )
+            mock_run.side_effect = [err_upload, timeout_exec]
+
+            with self.assertRaises(UpstreamCliError) as ctx:
+                transport.upload_file(self.session_id, local_file, "/content/workspace/models/train.py")
+            self.assertEqual(mock_run.call_count, 2)  # upload + probe, NO retry
+            self.assertIn("Upload failed: 500 Server Error", str(ctx.exception))
+
+    def test_upload_scenario_9_repeated_500_after_recovery_retries_at_most_once(self):
+        """9. Repeated HTTP 500 after recovery -> retries at most once, raises UpstreamCliError with original_upload_error and recovery_attempted=True in details."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        with patch("subprocess.run") as mock_run:
+            err_upload1 = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error (first try)\n",
+            )
+            probe_out = 'COLAB_MKDIR_STATUS:{"existed": false, "isdir": true}\n'
+            ok_exec = MagicMock(returncode=0, stdout=probe_out, stderr="")
+            err_upload2 = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error (second try)\n",
+            )
+            mock_run.side_effect = [err_upload1, ok_exec, err_upload2]
+
+            with self.assertRaises(UpstreamCliError) as ctx:
+                transport.upload_file(self.session_id, local_file, "/content/workspace/models/train.py")
+            self.assertEqual(mock_run.call_count, 3)  # upload + probe + retry (at most once)
+            self.assertTrue(ctx.exception.details.get("recovery_attempted"))
+            self.assertIn("500 Server Error (first try)", ctx.exception.details.get("original_upload_error", ""))
+
+    def test_upload_scenario_10_unmanaged_session_rejected_immediately(self):
+        """10. Unmanaged session -> rejected immediately with UnmanagedSessionError before any CLI call."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        with patch("subprocess.run") as mock_run:
+            with self.assertRaises(UnmanagedSessionError):
+                transport.upload_file("unregistered-session-xyz", local_file, "/content/workspace/train.py")
+            mock_run.assert_not_called()
+
+    def test_upload_scenario_11_normal_successful_upload(self):
+        """11. Normal successful upload -> single CLI call, zero exec_code calls."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        with patch("subprocess.run") as mock_run:
+            ok_upload = MagicMock(returncode=0, stdout="[colab] Uploaded 'train.py'\n", stderr="")
+            mock_run.return_value = ok_upload
+
+            transport.upload_file(self.session_id, local_file, "/content/workspace/train.py")
+            self.assertEqual(mock_run.call_count, 1)
+            args = mock_run.call_args[0][0]
+            self.assertIn("upload", args)
+            self.assertNotIn("exec", args)
+
+    def test_upload_scenario_12_no_implicit_vm_allocation(self):
+        """12. No implicit VM allocation -> verify new or run is never present in any CLI invocation across all failure modes."""
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        sequences = [
+            # 1: Successful upload
+            [MagicMock(returncode=0, stdout="ok", stderr="")],
+            # 2: 500 then successful recovery
+            [
+                subprocess.CalledProcessError(1, ["colab", "upload"], stderr="500 Server Error\n"),
+                MagicMock(returncode=0, stdout='COLAB_MKDIR_STATUS:{"existed": false, "isdir": true}\n', stderr=""),
+                MagicMock(returncode=0, stdout="ok", stderr=""),
+            ],
+            # 3: Repeated 500
+            [
+                subprocess.CalledProcessError(1, ["colab", "upload"], stderr="500 Server Error\n"),
+                MagicMock(returncode=0, stdout='COLAB_MKDIR_STATUS:{"existed": false, "isdir": true}\n', stderr=""),
+                subprocess.CalledProcessError(1, ["colab", "upload"], stderr="500 Server Error\n"),
+            ],
+            # 4: Directory already exists
+            [
+                subprocess.CalledProcessError(1, ["colab", "upload"], stderr="500 Server Error\n"),
+                MagicMock(returncode=0, stdout='COLAB_MKDIR_STATUS:{"existed": true, "isdir": true}\n', stderr=""),
+            ],
+            # 5: Directory creation fails
+            [
+                subprocess.CalledProcessError(1, ["colab", "upload"], stderr="500 Server Error\n"),
+                subprocess.CalledProcessError(1, ["colab", "exec"], stderr="exec failed\n"),
+            ],
+        ]
+
+        for seq in sequences:
+            with patch("subprocess.run") as mock_run:
+                mock_run.side_effect = seq
+                try:
+                    transport.upload_file(self.session_id, local_file, "/content/workspace/sub/train.py")
+                except Exception:
+                    pass
+
+                self.assertGreater(mock_run.call_count, 0)
+                for call in mock_run.call_args_list:
+                    cmd_args = call[0][0]
+                    self.assertNotIn("new", cmd_args)
+                    self.assertNotIn("run", cmd_args)
+
 
 if __name__ == "__main__":
     unittest.main()
