@@ -274,6 +274,9 @@ class GoogleDriveArtifactStore:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         max_retries: int = 5,
         initial_backoff_sec: float = 0.5,
+        list_page_size: int = 100,
+        max_list_pages: int = 50,
+        max_list_candidates: int = 5000,
     ):
         self.credentials = credentials
         self.credentials_file = Path(credentials_file).resolve() if credentials_file else None
@@ -283,6 +286,17 @@ class GoogleDriveArtifactStore:
         if chunk_size <= 0 or chunk_size % (256 * 1024) != 0:
             raise ValueError(f"chunk_size must be a positive multiple of 256 KiB (262144 bytes), got {chunk_size}")
         self.chunk_size = chunk_size
+
+        if list_page_size <= 0:
+            raise ValueError(f"list_page_size must be positive (>= 1), got {list_page_size}")
+        if max_list_pages <= 0:
+            raise ValueError(f"max_list_pages must be positive (>= 1), got {max_list_pages}")
+        if max_list_candidates <= 0:
+            raise ValueError(f"max_list_candidates must be positive (>= 1), got {max_list_candidates}")
+
+        self.list_page_size = list_page_size
+        self.max_list_pages = max_list_pages
+        self.max_list_candidates = max_list_candidates
 
         self.max_retries = max_retries
         self.initial_backoff_sec = initial_backoff_sec
@@ -518,21 +532,64 @@ class GoogleDriveArtifactStore:
             return self._folder_cache[cache_key]
 
         # Query existing folder
-        q = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        safe_folder_name = folder_name.replace("'", "\\'")
+        q = f"name = '{safe_folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         if parent_id:
-            q += f" and '{parent_id}' in parents"
+            safe_parent = parent_id.replace("'", "\\'")
+            q += f" and '{safe_parent}' in parents"
         else:
             q += " and 'root' in parents"
 
         url = f"https://www.googleapis.com/drive/v3/files?q={urllib.parse.quote(q)}&fields=files(id,name)&spaces=drive"
-        status, headers, body = self._request_with_retry("GET", url)
-        if status == 200:
+        try:
+            status, headers, body = self._request_with_retry("GET", url)
+        except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+            raise
+        except Exception as e:
+            raise DriveTransferError(
+                f"Failed to query Drive folder '{folder_name}': {_sanitize_drive_error(str(e), url)}"
+            ) from e
+
+        if status == 401:
+            raise DriveAuthenticationError(
+                f"Drive folder lookup unauthorized (401): {_sanitize_drive_error(body, url)}"
+            )
+        if status == 403:
+            body_text = body.decode("utf-8", errors="replace")
+            if any(k in body_text for k in ("quotaExceeded", "storageQuotaExceeded", "rateLimitExceeded", "userRateLimitExceeded")):
+                raise DriveQuotaExceededError(
+                    f"Drive storage quota exceeded during folder lookup (403): {_sanitize_drive_error(body, url)}"
+                )
+            raise DriveAuthenticationError(
+                f"Drive permission denied during folder lookup (403): {_sanitize_drive_error(body, url)}"
+            )
+        if status != 200:
+            raise DriveTransferError(
+                f"Failed to query Drive folder '{folder_name}' (HTTP {status}): {_sanitize_drive_error(body, url)}"
+            )
+
+        try:
             data = json.loads(body.decode("utf-8"))
-            files = data.get("files", [])
-            if files:
-                folder_id = files[0]["id"]
-                self._folder_cache[cache_key] = folder_id
-                return folder_id
+        except Exception as je:
+            raise DriveTransferError(
+                f"Malformed JSON in Drive folder lookup response: {_sanitize_drive_error(body, url)}"
+            ) from je
+
+        if not isinstance(data, dict) or "files" not in data or not isinstance(data["files"], list):
+            raise DriveTransferError(
+                f"Invalid Drive folder lookup payload structure (missing 'files' list): {_sanitize_drive_error(body, url)}"
+            )
+
+        files = data["files"]
+        if files:
+            first_folder = files[0]
+            if not isinstance(first_folder, dict) or not first_folder.get("id") or not isinstance(first_folder.get("id"), str):
+                raise DriveTransferError(
+                    f"Invalid folder entry in Drive lookup response (missing string 'id'): {_sanitize_drive_error(body, url)}"
+                )
+            folder_id = first_folder["id"]
+            self._folder_cache[cache_key] = folder_id
+            return folder_id
 
         # Folder does not exist, create it
         metadata: Dict[str, Any] = {
@@ -544,18 +601,37 @@ class GoogleDriveArtifactStore:
 
         create_url = "https://www.googleapis.com/drive/v3/files?fields=id,name"
         payload = json.dumps(metadata).encode("utf-8")
-        status, headers, body = self._request_with_retry(
-            "POST",
-            create_url,
-            headers={"Content-Type": "application/json; charset=UTF-8"},
-            data=payload,
-        )
+        try:
+            status, headers, body = self._request_with_retry(
+                "POST",
+                create_url,
+                headers={"Content-Type": "application/json; charset=UTF-8"},
+                data=payload,
+            )
+        except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+            raise
+        except Exception as e:
+            raise DriveTransferError(
+                f"Failed to create Drive folder '{folder_name}': {_sanitize_drive_error(str(e), create_url)}"
+            ) from e
+
         if status not in (200, 201):
             raise DriveTransferError(
                 f"Failed to create Drive folder '{folder_name}' (HTTP {status}): {_sanitize_drive_error(body, create_url)}"
             )
 
-        res = json.loads(body.decode("utf-8"))
+        try:
+            res = json.loads(body.decode("utf-8"))
+        except Exception as je:
+            raise DriveTransferError(
+                f"Malformed JSON in Drive folder creation response: {_sanitize_drive_error(body, create_url)}"
+            ) from je
+
+        if not isinstance(res, dict) or not res.get("id") or not isinstance(res.get("id"), str):
+            raise DriveTransferError(
+                f"Invalid folder creation response (missing string 'id'): {_sanitize_drive_error(body, create_url)}"
+            )
+
         folder_id = res["id"]
         self._folder_cache[cache_key] = folder_id
         return folder_id
@@ -580,29 +656,115 @@ class GoogleDriveArtifactStore:
             return self._find_or_create_folder(subfolder, parent_id=run_folder_id)
         return run_folder_id
 
-    def _list_files_in_folder(self, filename: str, folder_id: str) -> List[Dict[str, Any]]:
-        """Query for all non-trashed files with matching name in folder."""
+    def _list_files_in_folder(
+        self,
+        filename: str,
+        folder_id: str = "",
+        parent_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Query for all non-trashed files with matching name in folder across pages."""
+        target_folder = parent_id if parent_id is not None else folder_id
         safe_name = filename.replace("'", "\\'")
-        query = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
-        encoded = urllib.parse.quote(query)
-        fields = "files(id,name,size,md5Checksum,appProperties,description,createdTime)"
-        url = f"https://www.googleapis.com/drive/v3/files?q={encoded}&fields={fields}"
-        try:
-            status, _, body = self._request_with_retry("GET", url)
-        except (DriveAuthenticationError, DriveQuotaExceededError):
-            raise
-        except Exception:
-            return []
+        safe_folder = target_folder.replace("'", "\\'")
+        query = f"name = '{safe_name}' and trashed = false and '{safe_folder}' in parents"
+        fields = "nextPageToken,files(id,name,size,md5Checksum,appProperties,description,createdTime)"
 
-        if status != 200:
-            return []
+        collected_files: List[Dict[str, Any]] = []
+        seen_file_ids: set[str] = set()
+        seen_tokens: set[str] = set()
+        page_token: Optional[str] = None
+        pages_fetched = 0
 
-        try:
-            res = json.loads(body.decode("utf-8"))
-        except Exception:
-            return []
+        while True:
+            params = [
+                f"q={urllib.parse.quote(query)}",
+                f"fields={fields}",
+                f"pageSize={self.list_page_size}",
+            ]
+            if page_token is not None:
+                params.append(f"pageToken={urllib.parse.quote(page_token, safe='')}")
 
-        return res.get("files", [])
+            url = f"https://www.googleapis.com/drive/v3/files?{'&'.join(params)}"
+            try:
+                status, _, body = self._request_with_retry("GET", url)
+            except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+                raise
+            except Exception as e:
+                raise DriveTransferError(
+                    f"Drive file listing failed for '{filename}': {_sanitize_drive_error(str(e), url)}"
+                ) from e
+
+            if status == 401:
+                raise DriveAuthenticationError(
+                    f"Drive file listing unauthorized (401): {_sanitize_drive_error(body, url)}"
+                )
+            if status == 403:
+                body_text = body.decode("utf-8", errors="replace")
+                if any(k in body_text for k in ("quotaExceeded", "storageQuotaExceeded", "rateLimitExceeded", "userRateLimitExceeded")):
+                    raise DriveQuotaExceededError(
+                        f"Drive storage quota exceeded during file listing: {_sanitize_drive_error(body, url)}"
+                    )
+                raise DriveAuthenticationError(
+                    f"Drive access forbidden during file listing: {_sanitize_drive_error(body, url)}"
+                )
+            if status == 404:
+                raise ArtifactNotFoundError(
+                    f"Drive parent folder '{target_folder}' not found (404): {_sanitize_drive_error(body, url)}"
+                )
+            if status != 200:
+                raise DriveTransferError(
+                    f"Drive file listing failed with HTTP {status}: {_sanitize_drive_error(body, url)}"
+                )
+
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except Exception as je:
+                raise DriveTransferError(
+                    f"Malformed JSON in Drive file listing response: {_sanitize_drive_error(body, url)}"
+                ) from je
+
+            if not isinstance(data, dict) or "files" not in data or not isinstance(data["files"], list):
+                raise DriveTransferError(
+                    f"Invalid Drive file listing payload structure (missing 'files' list): {_sanitize_drive_error(body, url)}"
+                )
+
+            pages_fetched += 1
+
+            for item in data["files"]:
+                if not isinstance(item, dict) or not item.get("id") or not isinstance(item.get("id"), str):
+                    raise DriveTransferError(
+                        "Invalid file entry in Drive listing response (missing string 'id')"
+                    )
+                file_id = item["id"]
+                if file_id not in seen_file_ids:
+                    seen_file_ids.add(file_id)
+                    collected_files.append(item)
+                    if len(collected_files) > self.max_list_candidates:
+                        raise DriveTransferError(
+                            f"Drive file listing exceeded max_list_candidates ({self.max_list_candidates}) for '{filename}'"
+                        )
+
+            next_token = data.get("nextPageToken")
+            if next_token is None or next_token == "":
+                break
+            if not isinstance(next_token, str) or not next_token.strip():
+                raise DriveTransferError(
+                    "Malformed non-string or whitespace nextPageToken in Drive file listing"
+                )
+            if next_token in seen_tokens:
+                raise DriveTransferError(
+                    f"Detected repeating nextPageToken loop in Drive file listing: {next_token!r}"
+                )
+            seen_tokens.add(next_token)
+
+            if pages_fetched >= self.max_list_pages:
+                raise DriveTransferError(
+                    f"Drive file listing exceeded max_list_pages ({self.max_list_pages}) while nextPageToken is still present"
+                )
+
+            page_token = next_token
+
+        return collected_files
 
     def _find_file_in_folder(
         self,
@@ -2260,6 +2422,8 @@ class GoogleDriveArtifactStore:
             if not meta or not meta.remote_file_id:
                 try:
                     f_id = self.resolve_target_folder_id(proj_id, r_id, sub_f)
+                except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+                    raise
                 except Exception as fe:
                     raise ArtifactNotFoundError(f"Folder not found on Drive for '{artifact_id}': {fe}") from fe
 
@@ -2351,6 +2515,8 @@ class GoogleDriveArtifactStore:
             if not meta or not meta.remote_file_id:
                 try:
                     f_id = self.resolve_target_folder_id(proj_id, r_id, sub_f)
+                except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+                    raise
                 except Exception as fe:
                     raise ArtifactNotFoundError(f"Folder not found on Drive for '{artifact_id}': {fe}") from fe
 
@@ -2464,6 +2630,8 @@ class GoogleDriveArtifactStore:
                             return True
                     return False
                 return True
+            except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+                raise
             except Exception:
                 return False
         return False
