@@ -78,3 +78,72 @@ All API endpoints strictly require authentication via `Authorization: Bearer <to
    Raw unencrypted HTTP on external interfaces or `trusted_proxy=True` without a shared secret is rejected with `ValueError` / `BrokerAuthenticationError`.
 3. **Strict CORS Policy**: Wildcard CORS (`Access-Control-Allow-Origin: *`) is completely eliminated. The server restricts access to same-origin requests or explicitly configured allowed origins, sending `Vary: Origin`.
 4. **Persistent Credentials**: Broker tokens can be loaded from and persisted to a protected `tokens_file` with `0600` permissions (parent directory `0700`), ensuring authentication configuration survives service restarts.
+
+---
+
+## Single-Host Cross-Process Atomicity & Publication Guarantees
+
+When multiple local processes (e.g., concurrent training jobs, background upload workers, and the Workspace Broker) interact with workspace state on the host:
+1. **File Locks & Durable Leases**: Per-artifact OS-level `fcntl.flock` lock files (`.transfer_locks/<id>.lock`) and durable `TransferRecord` leases (`owner_pid`, `lease_token`, `lease_expires_at`, `fencing_epoch`) prevent concurrent workers from interleaving transfers. Dead-PID lease reclamation (`os.kill(pid, 0)`) prevents orphaned locks from dead processes.
+2. **Content-Addressed Revision Safety**: Identical content (`sha256` + `size_bytes`) deduplicates across processes to a single Drive upload, while modified content at the same filename uploads a new verified revision without corrupting state or returning stale hashes.
+3. **Manifest Locking**: `PublicationManifest` reads and writes are protected by cross-process `.manifest.lock`, ensuring broker clients always observe consistent snapshot state.
+4. **Scope Boundary**: Single-host cross-process atomicity is strictly guaranteed via local filesystem `fcntl.flock` and durable journal leases; multi-host distributed writers without a shared lock coordinator are out of scope for local workspace journals.
+
+---
+
+## Dashboard XSS & CSP Security Architecture
+
+For browser clients accessing the embedded monitoring UI through the broker:
+- **Zero Inline Event Handlers**: HTML templates contain zero inline handlers (`onclick`, `oninput`, `onchange`, `onerror`).
+- **Safe DOM Construction**: Zero unsafe `innerHTML` interpolation for untrusted run/log/artifact/session data; all dynamic DOM nodes are built via `document.createElement` and `.textContent`.
+- **Per-Response Cryptographic CSP Nonces**: Enforces `script-src 'self' 'nonce-...'`, `style-src 'self' 'nonce-...'`, `object-src 'none'`, `base-uri 'none'`, and `frame-ancestors 'none'`, with `'unsafe-inline'` completely removed, alongside static `/monitor.js` and `/monitor.css` asset routes.
+
+---
+
+## Verification Scope, PR Stack Status & Operational Rollback
+
+### Three-Tier Verification Scope
+
+1. **Tier 1 — Offline Unit, Integration & Two-Process Tests (Verified in CI & Locally)**:
+   - 219 offline tests verifying all broker methods (`test_workspace_broker.py`, `test_v2_security_and_resumable_recovery.py`, `test_adversarial_security_and_fault_injection.py`, `test_project_e2e.py`).
+   - Asserts multi-client concurrency (Client A MacBook and Client B Windows attaching to the same run without interference), unmanaged session rejections, trusted-proxy header validation, and token persistence with 0 cloud VM calls.
+2. **Tier 2 — Local Headless Browser DOM & XSS Verification (Playwright / Chromium)**:
+   - Headless browser verification against live loopback `MonitorServer`, verifying that broker run telemetry and Drive artifact lists render cleanly without script execution from adversarial logs.
+3. **Tier 3 — Owner-Gated Live Environment Checks (Pending Final Owner Signoff)**:
+   - Live cloud verification requiring explicit human credentials:
+     - Real Google OAuth credentials and live Google Drive cloud API.
+     - Live Google Colab GPU runtime allocation.
+     - Production reverse-proxy deployment with verified TLS and proxy headers.
+   - Strictly excluded from automated CI runs pending owner authorization.
+
+### PR Review Stack Status
+
+The WorkspaceBroker and cross-device attachment subsystem are part of a reconciled review stack:
+- **PR #3**: Initial Project Workspace Architecture Proposal.
+- **PRs #13–#20**: Milestones M1–M8 implementations (including M7 WorkspaceBroker and M8 web interface).
+- **PR #22**: Multi-worker integration, security hardening, and documentation reconciliation.
+
+> [!IMPORTANT]
+> PRs #3, #13–#20, and #22 form a reconciled review stack and **remain unmerged into `main`** pending final owner approval and completion of Tier 3 live environment checks.
+
+### Operational Rollback Instructions
+
+If a regression or deployment issue occurs:
+
+1. **Stop Active Daemons**:
+   ```bash
+   kill $(pgrep -f "colab_adapter.broker") 2>/dev/null || true
+   kill $(pgrep -f "colab_adapter.monitor") 2>/dev/null || true
+   ```
+2. **Clear Stale Locks**:
+   ```bash
+   rm -rf ./artifacts/.transfer_locks/*.lock
+   ```
+3. **Revert Git Branch**:
+   ```bash
+   git checkout main
+   # Or revert merge commit
+   git revert -m 1 <MERGE_COMMIT_SHA>
+   ```
+4. **Session Protection**:
+   Active Colab sessions are never modified or terminated during rollback, as unmanaged session protection strictly isolates external runtimes.

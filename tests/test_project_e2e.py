@@ -66,6 +66,49 @@ from colab_adapter.workspace import WorkspaceSyncEngine
 from tests.test_google_drive_store import MockDriveHttpClient
 
 
+class E2EMockDriveHttpClient(MockDriveHttpClient):
+    """MockDriveHttpClient with automatic metadata cataloging for idempotency testing."""
+
+    def __init__(self):
+        super().__init__()
+        self.session_to_metadata: dict[str, dict] = {}
+
+    def request(self, method: str, url: str, headers=None, data=None, timeout: float = 30.0):
+        if "uploadType=resumable" in url and method == "POST" and data:
+            try:
+                meta = json.loads(data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else data)
+                next_file_id = f"file-{self.file_id_counter + 1}"
+                next_session_id = f"upload-session-{self.file_id_counter + 1}"
+                self.session_to_metadata[next_file_id] = meta
+                self.session_to_metadata[next_session_id] = meta
+            except Exception:
+                pass
+
+        status, resp_headers, body = super().request(method, url, headers=headers, data=data, timeout=timeout)
+
+        if method == "PUT" and "session_id=upload-session" in url and status in (200, 201):
+            try:
+                res = json.loads(body.decode("utf-8"))
+                fid = res.get("id")
+                meta = self.session_to_metadata.get(fid, {})
+                fname = meta.get("name", "uploaded_file")
+                c_data = self.committed_files.get(fid, b"")
+                import hashlib
+                md5_val = hashlib.md5(c_data).hexdigest()
+                res["name"] = fname
+                body = json.dumps(res).encode("utf-8")
+                self.mock_files.append({
+                    "id": fid,
+                    "name": fname,
+                    "size": len(c_data),
+                    "md5Checksum": md5_val,
+                })
+            except Exception:
+                pass
+
+        return status, resp_headers, body
+
+
 def _future_iso(seconds: float = 3600.0) -> str:
     return datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat()
 
@@ -292,7 +335,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         )
         self.assertEqual(self.registry.get_all_managed()[managed_id]["state"], ProjectSessionState.TERMINATED.value)
 
-    def test_complete_v2_pipeline_with_drive_and_cross_device_monitor(self):
+    def test_full_13_stage_research_lifecycle(self):
         """13-Stage V2 End-to-End Pipeline Verification with Drive durable publication and cross-device monitoring.
 
         Fully offline, deterministic verification (0 cloud GPU allocations, 0 live Drive API calls):
@@ -529,6 +572,15 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             metrics={"final_loss": 0.123},
             details={"session_id": session.session_id},
         )
+        # Emit logs and details with special HTML characters (<, >, ", ')
+        telemetry.emit(
+            event_type="log_line",
+            run_id=run_id,
+            project_id=project_id,
+            epoch=1,
+            step=100,
+            details={"log_line": "<script>alert('XSS & \"test\"')</script> <b>loss: 0.123</b> & payload <1> >0"},
+        )
 
         # =====================================================================
         # Stage 8: Monitoring dashboard backend verification
@@ -560,6 +612,17 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         server_thread.start()
         self.addCleanup(lambda: (server.shutdown(), server.server_close()))
         base_url = f"http://127.0.0.1:{port}"
+
+        # 8.0 Dashboard HTML security headers check (strict Content-Security-Policy & nosniff)
+        for dashboard_path in ("/", "/index.html"):
+            req_dashboard = urllib.request.Request(f"{base_url}{dashboard_path}")
+            with urllib.request.urlopen(req_dashboard) as resp:
+                self.assertEqual(resp.status, 200)
+                csp_hdr = resp.headers.get("Content-Security-Policy")
+                nosniff_hdr = resp.headers.get("X-Content-Type-Options")
+                self.assertIsNotNone(csp_hdr, f"Content-Security-Policy header missing on {dashboard_path}")
+                self.assertIn("'self'", csp_hdr, f"Strict CSP must specify 'self' on {dashboard_path}")
+                self.assertEqual(nosniff_hdr, "nosniff", f"X-Content-Type-Options must be nosniff on {dashboard_path}")
 
         # 8.1 Unauthenticated request rejected with 401
         req_unauth = urllib.request.Request(f"{base_url}/api/v1/summary")
@@ -610,6 +673,32 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             loss_points = [p for p in metrics_data if p.get("metrics", {}).get("loss") is not None]
             self.assertGreaterEqual(len(loss_points), 1)
             self.assertEqual(loss_points[0]["metrics"]["loss"], 0.123)
+
+        # 8.6 Verify API endpoints return run/artifact/log entries containing special HTML characters safely as JSON
+        req_logs = urllib.request.Request(
+            f"{base_url}/api/v1/runs/{run_id}/logs",
+            headers={"Authorization": f"Bearer {monitor_token}"},
+        )
+        with urllib.request.urlopen(req_logs) as resp:
+            self.assertEqual(resp.status, 200)
+            logs_payload = json.loads(resp.read().decode("utf-8"))
+            self.assertIn("logs", logs_payload)
+            expected_html_log = "<script>alert('XSS & \"test\"')</script> <b>loss: 0.123</b> & payload <1> >0"
+            self.assertIn(expected_html_log, logs_payload["logs"])
+
+        req_run_detail = urllib.request.Request(
+            f"{base_url}/api/v1/runs/{run_id}",
+            headers={"Authorization": f"Bearer {monitor_token}"},
+        )
+        with urllib.request.urlopen(req_run_detail) as resp:
+            self.assertEqual(resp.status, 200)
+            run_detail = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(run_detail["run_id"], run_id)
+            matching_events = [
+                e for e in run_detail.get("events", [])
+                if e.get("details", {}).get("log_line") == expected_html_log
+            ]
+            self.assertEqual(len(matching_events), 1, "HTML-laden log event must be safely serialized in JSON without corrupting state")
 
         # =====================================================================
         # Stage 9: Verified checkpoint download
@@ -669,7 +758,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         creds_file = staging_dir / "credentials.json"
         creds.save(creds_file)
 
-        mock_http = MockDriveHttpClient()
+        mock_http = E2EMockDriveHttpClient()
         journal_file = staging_dir / "transfer_journal.json"
         journal = TransferJournal(journal_file)
 
@@ -721,6 +810,36 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             self.assertEqual(t.status, "PUBLISHED")
             self.assertIsNotNone(t.remote_file_id)
             self.assertGreater(len(t.remote_file_id), 0)
+
+        # Verify idempotency of GoogleDriveArtifactStore.publish()
+        # Re-publishing an already-published artifact is idempotent and returns the same verified
+        # remote_file_id and sha256 without creating a duplicate remote copy on the simulated Drive server.
+        idem_artifact_path = staging_dir / "eval_weights.pt"
+        idem_artifact_path.write_bytes(b"EVAL_WEIGHTS_DETERMINISTIC_PAYLOAD_V2" * 32)
+        initial_remote_files = len(mock_http.mock_files)
+        pub1 = drive_store.publish(
+            source=idem_artifact_path,
+            project_id=project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+        self.assertIsNotNone(pub1.remote_file_id)
+        remote_files_after_first = len(mock_http.mock_files)
+        self.assertEqual(remote_files_after_first, initial_remote_files + 1)
+
+        pub2 = drive_store.publish(
+            source=idem_artifact_path,
+            project_id=project_id,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+        self.assertEqual(pub2.remote_file_id, pub1.remote_file_id)
+        self.assertEqual(pub2.sha256, pub1.sha256)
+        self.assertEqual(
+            len(mock_http.mock_files),
+            remote_files_after_first,
+            "Re-publishing an already-published artifact must not create duplicate remote files on Drive",
+        )
 
         # =====================================================================
         # Stage 12: Remote session cleanup
@@ -792,6 +911,10 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         for cmd in executed_cmds:
             self.assertNotIn("--gpu A100", " ".join(cmd))
             self.assertNotIn("colab run", " ".join(cmd))
+
+    def test_complete_v2_pipeline_with_drive_and_cross_device_monitor(self):
+        """Backward-compatible alias for 13-stage test."""
+        return self.test_full_13_stage_research_lifecycle()
 
 
 if __name__ == "__main__":
