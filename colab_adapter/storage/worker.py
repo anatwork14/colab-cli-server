@@ -251,26 +251,29 @@ class ArtifactUploadWorker:
                 f"Artifact checksum mismatch for {src.name}: expected {sha_arg}, got {current_sha256}"
             )
 
-        # Protect against in-place source file mutation after enqueue():
-        staging_dir = self.journal.path.parent / ".staged_uploads" / f"{proj_arg}_{run_arg}_{current_sha256[:16]}"
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        staged_file = staging_dir / src.name
-        shutil.copy2(str(src), str(staged_file))
-        staged_sha256 = ArtifactStore.compute_sha256(staged_file)
-        if staged_sha256.lower() != current_sha256.lower():
-            if staged_file.exists():
-                try:
-                    staged_file.unlink()
-                except OSError:
-                    pass
-            raise ArtifactValidationError("Source file mutated during enqueue staging")
-
         meta_arg["artifact_id"] = artifact_id
         meta_arg["artifact_type"] = type_arg
         if cat_arg:
             meta_arg["category"] = cat_arg
 
         with self.journal.acquire_artifact_lock(self.store.provider_name, proj_arg, run_arg, src.name):
+            # Protect against in-place source file mutation after enqueue() using atomic temp copy under lock:
+            staging_dir = self.journal.path.parent / ".staged_uploads" / f"{proj_arg}_{run_arg}_{current_sha256[:16]}"
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            staged_file = staging_dir / src.name
+            if not staged_file.exists() or ArtifactStore.compute_sha256(staged_file).lower() != current_sha256.lower():
+                tmp_staged = staging_dir / f"{src.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+                shutil.copy2(str(src), str(tmp_staged))
+                staged_sha256 = ArtifactStore.compute_sha256(tmp_staged)
+                if staged_sha256.lower() != current_sha256.lower():
+                    if tmp_staged.exists():
+                        try:
+                            tmp_staged.unlink()
+                        except OSError:
+                            pass
+                    raise ArtifactValidationError("Source file mutated during enqueue staging")
+                os.replace(str(tmp_staged), str(staged_file))
+
             self.journal._load()
             existing = self.journal.get_transfer(transfer_id)
             now = time.time()
