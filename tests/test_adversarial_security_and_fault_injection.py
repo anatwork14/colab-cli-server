@@ -1468,7 +1468,8 @@ class TestResourceUsageAndBoundedMemoryStreaming(unittest.TestCase):
         m.add_artifact(art)
         m.save(m_dir / "manifest.json")
 
-        with self.assertRaises((DriveTransferError, DriveAuthenticationError)):
+        # Non-64-hex versioned identities are rejected up front (ArtifactValidationError, contract B8).
+        with self.assertRaises((DriveTransferError, DriveAuthenticationError, ArtifactValidationError)):
             store.retrieve(
                 artifact_id=art.artifact_id,
                 destination=dest_dir / "model.pt",

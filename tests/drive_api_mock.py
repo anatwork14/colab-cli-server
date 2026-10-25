@@ -655,3 +655,60 @@ class StrictDriveMock(MockDriveHttpClient):
                 })
                 result.append(snap)
         return result
+
+
+class FileBackedDriveMock(StrictDriveMock):
+    """StrictDriveMock whose remote state is shared between OS processes.
+
+    Every request loads the pickled state under an exclusive flock on ``<state_path>.lock``,
+    runs the normal mock logic and saves the state back. Used by multi-process tests to
+    simulate one Drive account seen by independent processes.
+    """
+
+    _NON_PERSISTED = frozenset({"lock", "requests_log", "recorded_requests", "recorded_patches", "recorded_posts"})
+
+    def __init__(self, state_path: Union[str, Path]):
+        super().__init__()
+        self._state_path = Path(state_path)
+
+    def _load_state(self) -> None:
+        import pickle
+
+        if not self._state_path.exists():
+            return
+        with open(self._state_path, "rb") as f:
+            state = pickle.load(f)
+        for k, v in state.items():
+            setattr(self, k, v)
+
+    def _save_state(self) -> None:
+        import os
+        import pickle
+
+        state = {k: v for k, v in self.__dict__.items() if k not in self._NON_PERSISTED}
+        tmp = self._state_path.with_name(f"{self._state_path.name}.tmp.{os.getpid()}")
+        with open(tmp, "wb") as f:
+            pickle.dump(state, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(self._state_path))
+
+    def _locked_request(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[bytes] = None,
+        timeout: float = 30.0,
+    ) -> Tuple[int, Dict[str, str], bytes]:
+        import fcntl
+
+        lock_path = self._state_path.with_name(self._state_path.name + ".lock")
+        with open(lock_path, "a+") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                self._load_state()
+                return super()._locked_request(method, url, headers=headers, data=data, timeout=timeout)
+            finally:
+                self._save_state()
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)

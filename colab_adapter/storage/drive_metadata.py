@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Dict, Mapping, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional
 
 from ..errors import DriveTransferError
 
@@ -41,6 +42,19 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 STATE_LATEST = "latest"
 STATE_HISTORICAL = "historical"
 STATE_PENDING = "pending"
+
+# Compact remote property recording the revision that was the authoritative
+# latest of the same logical path when this pending upload was intended.
+# Value is a full 64-hex sha256, or the literal BASE_NONE when no latest existed.
+PROP_BASE_SHA256 = "base_sha256"
+BASE_NONE = "none"
+
+# pending_disposition() outcomes. No caller may promote a pending revision
+# except on PROMOTE (or ALREADY_LATEST, which needs no write).
+DISPOSITION_PROMOTE = "PROMOTE"
+DISPOSITION_ALREADY_LATEST = "ALREADY_LATEST"
+DISPOSITION_STALE = "STALE"
+DISPOSITION_FAIL_CLOSED = "FAIL_CLOSED"
 
 
 def is_sha256_hex(value: Any) -> bool:
@@ -80,6 +94,28 @@ def path_digest(project_id: str, run_id: str, logical_path: str) -> str:
     return hashlib.sha256(logical_artifact_id(project_id, run_id, logical_path).encode("utf-8")).hexdigest()
 
 
+def normalize_base_sha256(value: Optional[str]) -> Optional[str]:
+    """Validate a base marker: None (legacy/unknown), ``"none"`` or a full 64-hex sha256."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise DriveTransferError("Drive base_sha256 must be a string")
+    v = value.strip().lower()
+    if v == BASE_NONE:
+        return BASE_NONE
+    if not is_sha256_hex(v):
+        raise DriveTransferError("Drive base_sha256 must be 'none' or a full 64-hex sha256")
+    return v
+
+
+def base_from_props(props: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Base marker persisted on a remote revision, or None for legacy files without one."""
+    raw = (props or {}).get(PROP_BASE_SHA256)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return normalize_base_sha256(raw)
+
+
 def build_revision_properties(
     sha256: str,
     project_id: str,
@@ -87,6 +123,7 @@ def build_revision_properties(
     logical_path: str,
     is_latest: bool,
     next_sha256: Optional[str] = None,
+    base_sha256: Optional[str] = None,
 ) -> Dict[str, str]:
     """Build and validate compact v2 properties for one revision."""
     sha = sha256.strip().lower()
@@ -103,6 +140,9 @@ def build_revision_properties(
         if not is_sha256_hex(nxt):
             raise DriveTransferError("Drive next_sha256 must be a full 64-hex sha256")
         props["next_sha256"] = nxt
+    base = normalize_base_sha256(base_sha256)
+    if base is not None:
+        props[PROP_BASE_SHA256] = base
     validate_drive_properties(props)
     return props
 
@@ -150,3 +190,81 @@ def props_match_path(props: Optional[Mapping[str, Any]], project_id: str, run_id
 
 def canonical_successor_id(project_id: str, run_id: str, logical_path: str, next_sha256: str) -> str:
     return f"{logical_artifact_id(project_id, run_id, logical_path)}@sha256_{next_sha256.lower()}"
+
+
+@dataclass(frozen=True)
+class RemoteRevisionRef:
+    """Observed remote revision: file id, content sha256 and immediate successor (if any)."""
+
+    file_id: str
+    sha256: str
+    successor_sha256: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PendingDecision:
+    disposition: str
+    reason: str
+
+
+def pending_disposition(
+    *,
+    pending_id: str,
+    pending_sha256: str,
+    pending_base_sha256: Optional[str],
+    head: Optional[RemoteRevisionRef],
+    base_revision: Optional[RemoteRevisionRef] = None,
+    path_has_other_non_pending: bool = False,
+) -> PendingDecision:
+    """Decide what may happen to a pending (uploaded, never promoted) revision.
+
+    Inputs are an observed snapshot: ``head`` is the unique remote revision marked
+    latest for the path (``None`` if none), ``pending_base_sha256`` the base marker
+    recorded at intent time (``"none"``, a sha, or ``None`` for legacy pending
+    files), ``base_revision`` the remote file whose sha equals the base (looked up
+    only when there is no head), and ``path_has_other_non_pending`` whether any
+    non-pending revision of the path exists.
+
+    * PROMOTE        - pending is the genuine successor of the current head (or the
+                       interrupted coordination left no head and the base names the
+                       pending revision as its successor).
+    * ALREADY_LATEST - the head already is this content; idempotent no-op.
+    * STALE          - the head moved on since the pending upload was intended; the
+                       pending revision must stay pending (never promoted).
+    * FAIL_CLOSED    - the remote state cannot be explained; never guess.
+    """
+    pending_sha = pending_sha256.strip().lower()
+    base = normalize_base_sha256(pending_base_sha256)
+
+    if head is None:
+        if base is None or base == BASE_NONE:
+            # No latest now. Legacy files without a marker are treated like "none": nothing can be
+            # superseded unless some other non-pending revision of the path exists.
+            if path_has_other_non_pending:
+                return PendingDecision(DISPOSITION_FAIL_CLOSED, "no latest revision but other non-pending revisions exist")
+            if base is None:
+                return PendingDecision(DISPOSITION_PROMOTE, "legacy pending with no latest and no other revisions")
+            return PendingDecision(DISPOSITION_PROMOTE, "no latest existed at intent time and none exists now")
+        if (
+            base_revision is not None
+            and base_revision.sha256 == base
+            and base_revision.successor_sha256 == pending_sha
+        ):
+            return PendingDecision(DISPOSITION_PROMOTE, "interrupted coordination: base names pending as successor")
+        return PendingDecision(DISPOSITION_FAIL_CLOSED, "no latest revision and base does not name pending as successor")
+
+    head_sha = head.sha256.strip().lower()
+    if head.file_id == pending_id or head_sha == pending_sha:
+        return PendingDecision(DISPOSITION_ALREADY_LATEST, "pending content is already the latest revision")
+
+    if base is None:
+        if head.successor_sha256 == pending_sha:
+            return PendingDecision(DISPOSITION_PROMOTE, "legacy pending named as successor by current latest")
+        return PendingDecision(DISPOSITION_FAIL_CLOSED, "legacy pending revision without base marker conflicts with latest")
+
+    if base == head_sha:
+        if head.successor_sha256 not in (None, pending_sha):
+            return PendingDecision(DISPOSITION_FAIL_CLOSED, "latest revision names a different successor")
+        return PendingDecision(DISPOSITION_PROMOTE, "pending is the genuine successor of the current latest")
+
+    return PendingDecision(DISPOSITION_STALE, "latest moved on since the pending upload was intended")

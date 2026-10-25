@@ -278,6 +278,8 @@ class TestV2IntegrationReview25(unittest.TestCase):
         "path_sha256",
         "is_latest",
         "next_sha256",
+        # C1: compact base marker recorded at intent time ("none" or full sha256).
+        "base_sha256",
     })
 
     def setUp(self) -> None:

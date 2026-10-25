@@ -100,6 +100,8 @@ class TransferRecord:
     fencing_epoch: int = 0
     expected_sha256: Optional[str] = None
     source_path: Optional[str] = None
+    # Base marker captured once at transfer intent ("none" or a full sha256); None for legacy records.
+    base_sha256: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.expected_sha256 is None and self.sha256:
@@ -156,7 +158,7 @@ class TransferRecord:
             "retry_count", "max_retries", "next_retry_at", "last_error",
             "created_at", "updated_at", "metadata",
             "owner_pid", "lease_token", "lease_expires_at", "fencing_epoch",
-            "expected_sha256", "source_path",
+            "expected_sha256", "source_path", "base_sha256",
         }
         filtered = {k: v for k, v in data.items() if k in valid}
         return cls(**filtered)
