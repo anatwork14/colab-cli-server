@@ -173,6 +173,24 @@ class TestTransports(unittest.TestCase):
         self.assertIn("ssh", cmd)
         self.assertIn("--proxy-mode", cmd)
 
+    def test_official_cli_upload_creates_parent_dir_on_500(self):
+        transport = OfficialCliTransport(registry=self.registry, cli_path="/usr/bin/colab")
+        local_file = Path(self.tmp_dir) / "train.py"
+        local_file.write_text("print('ok')", encoding="utf-8")
+
+        with patch("subprocess.run") as mock_run:
+            err_500 = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["colab", "upload"],
+                stderr="[colab] Upload failed: 500 Server Error: Internal Server Error\n",
+            )
+            ok_exec = MagicMock(returncode=0, stdout="", stderr="")
+            ok_upload = MagicMock(returncode=0, stdout="[colab] Uploaded\n", stderr="")
+            mock_run.side_effect = [err_500, ok_exec, ok_upload]
+
+            transport.upload_file(self.session_id, local_file, "/content/colab-workspaces/proj/train.py")
+            self.assertEqual(mock_run.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

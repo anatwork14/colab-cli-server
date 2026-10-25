@@ -99,7 +99,19 @@ class OfficialCliTransport(BaseTransport):
             raise TransportError(f"Local file to upload does not exist: {local_p}")
 
         args = ["upload", "-s", session_id, str(local_p), remote_path]
-        self._run_cmd(args, timeout=300.0)
+        try:
+            self._run_cmd(args, timeout=300.0)
+        except UpstreamCliError as e:
+            parent_dir = str(Path(remote_path).parent)
+            if "500 Server Error" in str(e) and parent_dir and parent_dir not in (".", "/"):
+                self.exec_code(
+                    session_id,
+                    f"import os\nos.makedirs({parent_dir!r}, exist_ok=True)\n",
+                    timeout=30.0,
+                )
+                self._run_cmd(args, timeout=300.0)
+            else:
+                raise
 
     def download_file(
         self,
