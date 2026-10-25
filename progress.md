@@ -7,13 +7,17 @@
 - **V1: MERGED / verified on GitHub.** PR #2 squash-merged into main at commit 2bfd2194ad8259d785ca59935579eab6bdad052c. Human operator reported server synchronization and 43/43 offline tests on Python 3.8 and 3.12, OAuth diagnostics and no active sessions. The maintainer has not independently inspected the user's running server in this planning PR.
 - **V1 live evidence:** earlier explicitly approved Colab T4 one-shot and stateful E2E executions proved basic remote CUDA execution, input upload, artifact download, checksum/ZIP checks and teardown. These tests predate V2 and do **not** validate SSH, directory sync or new development workflows.
 - **Dashboard M8: COMPLETE (Offline, local headless Chromium & GitHub Actions `browser-security` CI verified).** Full-stack monitor backend (`colab_adapter/monitor/server.py`, `collector.py`, `schemas.py`) and responsive embedded SPA (`colab_adapter/monitor/ui.py`) are implemented and verified offline and in headless Chromium (`playwright-core` with `COLAB_REQUIRE_BROWSER_TESTS=1`) with strict Bearer/trusted-proxy authentication, per-response cryptographic CSP nonces (`script-src 'self' 'nonce-...'` without `'unsafe-inline'`), zero unsafe `innerHTML` or inline event handlers, checkpoint revision history (`LATEST` / `HISTORICAL`), TLS enforcement, and deep secret redaction.
-- **V2 implementation: MERGED into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`).** All V2 milestones (M1–M8) and Cross-Device Workspaces & Google Drive Durable Storage (Issue #21, PR #22) are fully merged and verified on `main`. Post-merge hardening and end-to-end integration verification are tracked under **Issue #23 (`fix/v2-postmerge-hardening-23`)**, delivering:
-  1. P1 Verified Google Drive Recovery (3-case retrieval: exact `@sha256_<HASH>`, verified latest pointer via manifest/backup, fail-closed on ambiguous/unverified fallback when local manifest is missing).
-  2. P1 Private Checkpoint Staging (`0700` staging directories, `0600` temporary/staged files with `fsync`, symlink/special-file rejection, canonical staging-root containment validation).
-  3. P2 Local Artifact Retrieval Size-Mismatch Error Handling (capturing `actual_size` before unlinking `.part.` temp file so `ArtifactValidationError` is always raised instead of `FileNotFoundError`).
-  4. P2 Controlled Colab HTTP 500 Upload Recovery (validating remote paths, probing whether parent directory is missing via bounded `exec_code`, checking `result["success"]`, and retrying at most once only when missing directory was newly created).
-  5. Browser security test host-state isolation & 5-revision (`SHA256 A..E`) multi-process history verification.
-  6. Comprehensive 21-stage offline E2E pipeline test (`test_complete_21_stage_v2_research_lifecycle_and_recovery`) in `tests/test_project_e2e.py`.
+- **V2 implementation: MERGED into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`).** All V2 milestones (M1–M8) and Cross-Device Workspaces & Google Drive Durable Storage (Issue #21, PR #22) are fully merged and verified on `main`. Post-merge hardening and multi-revision catastrophic recovery are tracked under **Issue #23 (`fix/v2-postmerge-hardening-23`)** and **Review `5642047783` (F1–F4)**, delivering:
+  1. F1 Canonical Versioned Revision Identity & Accessors (`get_latest_artifact()`, `get_latest_revision_id()`, `get_latest_sha256()`, immediate-successor `superseded_by` chain `A -> B -> C -> D -> E -> None`).
+  2. F2 Two-Phase Remote Coordination Protocol (upload with `is_latest="false"`, content verify, demote prior and promote new via Drive v3 `PATCH`).
+  3. F3 Bounded Pagination & Strict Error Classification (`pageSize=100`, `max_list_pages=50`, `max_list_candidates=5000`, loop detection, 0 empty list `[]` fallback on HTTP/network errors).
+  4. F4 Catastrophic Loss Recovery Matrix (unversioned latest recovery via single remote `is_latest="true"`, fail-closed `DriveIntegrityError` on 0 or >1 remote latest, fail-closed on listing faults).
+  5. P1 Private Checkpoint Staging (`0700` staging directories, `0600` temporary/staged files with `fsync`, symlink/special-file rejection, canonical staging-root containment validation).
+  6. P2 Local Artifact Retrieval Size-Mismatch Error Handling (capturing `actual_size` before unlinking `.part.` temp file so `ArtifactValidationError` is always raised instead of `FileNotFoundError`).
+  7. P2 Controlled Colab HTTP 500 Upload Recovery (validating remote paths, probing whether parent directory is missing via bounded `exec_code`, checking `result["success"]`, and retrying at most once only when missing directory was newly created).
+  8. Browser security test host-state isolation & 5-revision (`SHA256 A..E`) multi-process history verification.
+  9. Comprehensive 21-stage offline E2E pipeline test and Section 9 5-revision catastrophic manifest loss scenario (`TestV2FullEndToEndPipeline.test_five_revision_history_and_catastrophic_manifest_loss_e2e`) in `tests/test_project_e2e.py`.
+  10. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW`. All human approval gates strictly preserved (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 - **Account safety:** NO cloud allocations, SSH auto-provision, Drive mount, paid API, GPU spend or unattended deployment authorized or executed during V2 development and testing. Automated test suites run in strictly offline/mock environments (`OFFLINE_RELEASE_READY`); all real cloud operations remain approval-gated (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 
 ## Baseline inventory (evidence from main)
@@ -52,6 +56,27 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-25 — Review 5642047783 Resolution (F1–F4) & Section 9 E2E Verification (branch `work/24-e-e2e-docs`):**
+  - **F1 Canonical Versioned Revision Identity & Accessors (`PublicationManifest` v2)**:
+    - Formalized canonical string artifact IDs: `{project_id}/{run_id}/{logical_path}@sha256_{FULL_SHA256}`.
+    - Preserves immediate-successor `superseded_by` chain (`A -> B -> C -> D -> E -> None`) and `latest_by_path`.
+    - Added programmatic accessors `get_latest_artifact()`, `get_latest_revision_id()`, `get_latest_sha256()`.
+  - **F2 Two-Phase Remote Coordination Protocol (`GoogleDriveArtifactStore`)**:
+    - Revisions uploaded with `is_latest="false"`; content verified via byte length and MD5 / SHA256 readback.
+    - Demotes prior revisions to `is_latest="false"` and `superseded_by="<new_id>"` via Drive v3 `PATCH`.
+    - Promotes new verified revision to `is_latest="true"` via Drive v3 `PATCH`.
+  - **F3 Bounded Pagination & Strict Listing Error Classification (`GoogleDriveArtifactStore`)**:
+    - Bounded pagination with `pageSize=100`, `max_list_pages=50`, and `max_list_candidates=5000`.
+    - Loop detection via visited ID set preventing circular reference deadlocks.
+    - Strict error classification: never returns empty list `[]` on HTTP/network errors, raising typed `DriveAuthenticationError` (401/403), `DriveQuotaExceededError` (429/quota), or `DriveTransferError` (5xx/network/JSON parse).
+  - **F4 Disaster Recovery Matrix & Catastrophic Loss Recovery**:
+    - Documented and tested complete matrix: recovers from `manifest.json.bak` on primary manifest loss.
+    - On catastrophic loss of both `manifest.json`, `.bak`, and journal: exact `@sha256_<digest>` IDs recover all 5 revisions byte-for-byte; unversioned retrieval succeeds if and only if exactly 1 remote file has `is_latest="true"`, failing closed with `DriveIntegrityError` if 0 or >1 remote files claim `is_latest="true"`.
+  - **E2E Pipeline Test in `tests/test_project_e2e.py`**:
+    - Added `TestV2FullEndToEndPipeline.test_five_revision_history_and_catastrophic_manifest_loss_e2e` exercising all 5 steps: project init, 5-revision publication, manifest v2 verification, backup recovery after `manifest.json` deletion, catastrophic loss recovery with fresh store/journal, exact byte-for-byte retrieval of all 5 revisions, unversioned latest retrieval, remote split-brain `DriveIntegrityError`, and idempotent re-publication.
+    - Test execution: `python3 -m unittest tests/test_project_e2e.py -v` -> **11/11 tests pass in 6.08s**.
+    - Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW`.
+    - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 cloud spend; `OFFLINE_RELEASE_READY`).
 - **2026-10-25 — Issue #23 Resolution: Post-Merge Hardening, Security Isolation & 21-Stage E2E Pipeline (branch `fix/v2-postmerge-hardening-23`):**
   - **P1 Verified Google Drive Recovery (`colab_adapter/storage/google_drive.py`)**:
     - Implemented strict 3-case retrieval resolution: (1) exact immutable revision ID `@sha256_<HASH>`, (2) verified latest pointer via local PublicationManifest or backup cache, and (3) fail-closed rejection on ambiguous or unverified fallback when local manifest is missing, preventing hash mismatches and silent corruptions.

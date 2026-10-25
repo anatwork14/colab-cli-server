@@ -112,6 +112,27 @@ No automatic VM allocation is ever provoked; the user explicitly reviews and app
 
 ---
 
+## Disaster Recovery Matrix & Failure Mode Taxonomy
+
+The table below specifies exact system recovery behaviors across all local and remote failure modes, including catastrophic local manifest and journal loss:
+
+| Failure Mode | Local State Available | Retrieval Request | Resolution Mechanism | Invariant / Expected Outcome |
+| :--- | :--- | :--- | :--- | :--- |
+| **Normal Operation** | `manifest.json` intact, journal intact | Logical path (`checkpoints/model.pt`) | Resolved directly via `manifest.latest_by_path` pointer | Fetches newest revision (`is_latest=True`) with multi-tier hash verification. |
+| **Normal Historical** | `manifest.json` intact, journal intact | Canonical ID (`...@sha256_<HASH>`) | Resolved directly from `manifest.artifacts[rev_id]` | Fetches exact historical revision matching hash. |
+| **Primary Manifest Corruption / Deletion** | `manifest.json` missing/corrupt, `manifest.json.bak` exists | Any valid ID or logical path | `PublicationManifest.load()` automatically falls back to `.json.bak` | All revisions recovered; primary manifest rebuilt atomically with mode `0600`. |
+| **Journal Loss Only** | `manifest.json` intact, `transfer_journal.json` lost | Any valid ID or logical path | Resolved via `manifest.json` metadata cache | Recovery succeeds without remote listing; journal re-created on next write. |
+| **Catastrophic State Loss (Exact Historical)** | `manifest.json`, `.bak`, and journal all deleted | Canonical ID (`...@sha256_<HASH>`) | Drive folder queried; remote files filtered by `appProperties["sha256"]` | Matching remote file resolved, streamed to temporary file, verified, and safely restored. |
+| **Catastrophic State Loss (Single Latest)** | `manifest.json`, `.bak`, and journal all deleted | Unversioned path (`checkpoints/model.pt`) | Remote Drive files queried for `appProperties["is_latest"] == "true"` | Exactly 1 file matches `is_latest="true"`: successfully downloads newest verified revision. |
+| **Catastrophic Loss: Unversioned Ambiguity (0 latest)** | `manifest.json`, `.bak`, and journal all deleted | Unversioned path (`checkpoints/model.pt`) | Remote Drive files queried for `appProperties["is_latest"] == "true"` | 0 files match `is_latest="true"`: **Fails closed** with `DriveIntegrityError`. No unverified file returned. |
+| **Catastrophic Loss: Remote Split-Brain (>1 latest)** | `manifest.json`, `.bak`, and journal all deleted | Unversioned path (`checkpoints/model.pt`) | Remote Drive files queried for `appProperties["is_latest"] == "true"` | >1 files match `is_latest="true"`: **Fails closed** with `DriveIntegrityError`. Ambiguous download blocked. |
+| **Remote Auth Failure During Recovery** | Any local state | Any retrieval or idempotency check | Drive v3 listing returns HTTP 401/403 | **Fails closed** with `DriveAuthenticationError`. Never returns empty `[]` or false 404. |
+| **Remote Rate Limit / Quota Exceeded** | Any local state | Any retrieval or idempotency check | Drive v3 listing returns HTTP 429 / quota limit | **Fails closed** with `DriveQuotaExceededError`. Never returns empty `[]`. |
+| **Network Timeout / Malformed Remote JSON** | Any local state | Any retrieval or idempotency check | Socket drop, timeout, 5xx, or invalid JSON | **Fails closed** with `DriveTransferError`. Never falls back to empty listing or silent failure. |
+| **Corrupted Download Payload** | Any state | Any retrieval | Streamed content SHA256 does not match expected hash | Download rejected; temporary file unlinked; pre-existing local file **never overwritten**. |
+
+---
+
 ## Single-Host Cross-Process Artifact Publication Atomicity Guarantee
 
 During experiment execution, checkpoint recovery, and disaster recovery resumption, multiple host processes (e.g. background upload workers, training runs, and CLI recovery tools) coordinate safely:
@@ -197,15 +218,15 @@ The artifact recovery and reproducibility subsystem was merged into `main` via *
 - **PRs #13–#20**: Milestones M1–M8 implementations (including M6 reproducibility and M7 durable artifact store).
 - **PR #22**: Multi-worker integration, fault-injection tests, and documentation reconciliation.
 
-Post-merge hardening under **Issue #23 (`fix/v2-postmerge-hardening-23`)** delivers:
-- **P1 Verified 3-Case Retrieval Resolution**:
-  1. Exact historical revision recovery via canonical `@sha256_<HASH>` identifier.
-  2. Verified latest revision recovery via local `PublicationManifest` or backup cache pointer.
-  3. Fail-closed rejection (`ArtifactNotFoundError` / `DriveIntegrityError`) on ambiguous or unverified remote folder matches when the local manifest is absent.
+Post-merge hardening under **Issue #23 (`fix/v2-postmerge-hardening-23`)** and **Review `5642047783` (F1–F4)** delivers:
+- **F1 Canonical Versioned Revision Identity & Accessors**: Canonical string IDs (`{project_id}/{run_id}/{logical_path}@sha256_{FULL_SHA256}`), immediate-successor `superseded_by` chain (`A -> B -> C -> D -> E -> None`), and typed accessors `get_latest_artifact()`, `get_latest_revision_id()`, `get_latest_sha256()`.
+- **F2 Two-Phase Remote Coordination Protocol**: Drive upload with `is_latest="false"`, content verification, demote prior revisions via Drive v3 `PATCH`, promote new revision to `is_latest="true"` via `PATCH`.
+- **F3 Bounded Pagination & Strict Error Classification**: `pageSize=100`, bounded `max_list_pages=50`, `max_list_candidates=5000`, loop detection via visited ID tracking, and strict error classification (never returning `[]` on HTTP 401/403/429/5xx or network errors).
+- **F4 Catastrophic Loss Recovery Matrix**: Unversioned latest recovery via single verified remote `is_latest="true"` marker; fail-closed `DriveIntegrityError` when 0 or >1 remote revisions claim `is_latest="true"`; fail-closed `DriveTransferError` / `DriveAuthenticationError` / `DriveQuotaExceededError` on remote listing faults.
 - **P1 Private Checkpoint Staging**: Staging directories created with `0700` and files with `0600` permissions and explicit `os.fsync()`, rejecting symlinks and special files.
 - **P2 Local Artifact Size-Mismatch Error Handling**: Captures `actual_size` before unlinking partial `.part.` temp file, raising `ArtifactValidationError` deterministically.
 - **P2 Controlled Colab HTTP 500 Upload Recovery**: Validates remote path and parent directory existence, retrying at most once if newly created.
-- **Mandatory 21-Stage Offline Pipeline**: Complete end-to-end verification passing in `tests/test_project_e2e.py`.
+- **Mandatory E2E Pipeline Verification**: Complete 21-stage offline lifecycle test and 5-revision catastrophic manifest loss scenario (`test_five_revision_history_and_catastrophic_manifest_loss_e2e`) passing in `tests/test_project_e2e.py`. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW`.
 
 > [!NOTE]
 > All automated tests execute in offline/mock mode (`OFFLINE_RELEASE_READY`). Real cloud operations remain gated on explicit operator approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
