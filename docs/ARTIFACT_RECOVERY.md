@@ -251,7 +251,7 @@ A comprehensive runbook using strictly real, supported CLI commands (`python3 co
 11. **Initial Workspace Sync**: `python3 -m colab_adapter.cli project sync ./research-project --json`.
 12. **Remote Training Execution**: `python3 -m colab_adapter.cli project exec ./research-project -- --epochs 10 --batch-size 32 --json`.
 13. **Incremental Code Hot-Reload**: Modify local source code and run `python3 -m colab_adapter.cli project sync ./research-project --json`.
-14. **Monitoring Dashboard Launch**: `python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080 --auth-token "<SECRET_TOKEN>"`.
+14. **Monitoring Dashboard Launch**: `COLAB_MONITOR_TOKEN="$(cat /path/to/private/monitor.token)" python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080`.
 15. **Drive Credential Security (0600)**: Configure `~/.config/colab-cli/drive_credentials.json` with permissions `chmod 0600 ~/.config/colab-cli/drive_credentials.json`.
 16. **Multi-Revision Checkpoint Publishing**: Verify `LocalArtifactStore` and `GoogleDriveArtifactStore` preserve all revisions under immutable `@sha256_<HASH>` identities in `PublicationManifest` v2.
 17. **Historical & Latest Checkpoint Retrieval**: Retrieve latest checkpoint via logical path `research-project/<run_id>/checkpoints/model.pt` or historical revision via canonical `@sha256_<HASH>` identity.

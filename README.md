@@ -199,11 +199,11 @@ All commands support `--json` for machine-readable output by autonomous agents a
 
 ```bash
 # Start local authenticated monitoring server with web dashboard (loopback default)
-python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080 --auth-token "<SECRET_TOKEN>"
+COLAB_MONITOR_TOKEN="$(cat /path/to/private/monitor.token)" python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080
 
 # Start monitoring server with TLS encryption or behind a verified identity proxy
-python3 -m colab_adapter.cli monitor --host 0.0.0.0 --port 8443 --allow-external \
-  --auth-token "<SECRET_TOKEN>" --require-tls \
+COLAB_MONITOR_TOKEN="$(cat /path/to/private/monitor.token)" python3 -m colab_adapter.cli monitor --host 0.0.0.0 --port 8443 --allow-external \
+  --require-tls \
   --tls-certfile /path/to/cert.pem --tls-keyfile /path/to/key.pem
 ```
 
@@ -280,7 +280,7 @@ A step-by-step operator guide using strictly real, supported CLI commands (`pyth
 14. **Cross-Device Monitoring Dashboard Startup**:
     Launch the read-only web monitoring server with per-response CSP nonces:
     ```bash
-    python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080 --auth-token "<SECRET_TOKEN>"
+    COLAB_MONITOR_TOKEN="$(cat /path/to/private/monitor.token)" python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080
     ```
 15. **Google Drive Credential Setup (0600 Permissions)**:
     Set up Google Drive API credentials with private filesystem permissions:

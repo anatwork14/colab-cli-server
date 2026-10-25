@@ -569,6 +569,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         self._send_405()
 
+    def do_PATCH(self) -> None:
+        self._send_405()
+
     def do_GET(self) -> None:
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path

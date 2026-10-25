@@ -129,28 +129,16 @@ class TestCheckerAgainstSeededMonitor(_SeededMonitorMixin, unittest.TestCase):
         self.assertEqual(len(matches), 1, f"expected exactly one check {check_id}")
         return matches[0]
 
-    def test_all_checks_pass_except_known_patch_gap(self):
-        result, data = self._run_with_evidence(self.expect_args)
-        self.assertEqual(result.returncode, 1)
-        failed = sorted(c["id"] for c in data["checks"] if c["status"] == "FAIL")
-        # Known defect: the stock BaseHTTPRequestHandler answers PATCH with 501, not 405/404.
-        self.assertEqual(failed, ["d1_mutating_methods_refused"])
-        d1 = self._check(data, "d1_mutating_methods_refused")
-        self.assertEqual(d1["details"]["PATCH /api/v1/runs"], 501)
-        self.assertEqual(d1["details"]["POST /api/v1/runs"], 405)
-        for check_id in ("a1_unauthenticated_401", "a2_query_token_rejected", "a3_wrong_bearer_401",
-                         "b_owner_reads_200", "c1_run_key_project_and_run", "c2_revision_latest_state",
-                         "c3_run_list_latest_matches_head", "d2_no_mutating_methods_advertised",
-                         "d3_state_unchanged_by_probes", "f_csp_nonce_no_inline",
-                         "e1_no_secret_in_responses", "e2_no_secret_in_log"):
-            self.assertEqual(self._check(data, check_id)["status"], "PASS", check_id)
-
-    @unittest.expectedFailure
-    def test_full_pass_once_patch_returns_405(self):
-        # Remove this decorator once colab_adapter/monitor/server.py answers PATCH with 405.
+    def test_full_pass_and_patch_is_405(self):
+        # PATCH used to fall through to the stock handler's 501; the monitor now refuses it with 405.
         result, data = self._run_with_evidence(self.expect_args)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(data["overall"], "PASS")
+        d1 = self._check(data, "d1_mutating_methods_refused")
+        self.assertEqual(d1["details"]["PATCH /api/v1/runs"], 405)
+        self.assertEqual(d1["details"]["POST /api/v1/runs"], 405)
+        for check in data["checks"]:
+            self.assertEqual(check["status"], "PASS", check["id"])
 
     def test_leaked_token_in_log_file_fails(self):
         log = self.tmp / "monitor.log"
