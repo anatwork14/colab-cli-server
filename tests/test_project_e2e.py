@@ -56,6 +56,7 @@ from colab_adapter.project_sessions import (
     ProjectSessionState,
 )
 from colab_adapter.provider import ApprovalRequiredError, ManagedSessionRegistry
+from tests.approval_helpers import grant_v2
 from colab_adapter.reproducibility import create_deterministic_source_snapshot
 from colab_adapter.storage import (
     ArtifactType,
@@ -162,7 +163,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         spec = load_manifest(self.manifest_path)
 
         # Provision first session
-        s1 = mgr.up(spec, lease_seconds=1800.0)
+        s1 = mgr.up(spec, lease_seconds=1800.0, approval_id=grant_v2(mgr, spec, 1800.0))
         self.assertEqual(s1.state, ProjectSessionState.READY.value)
         self.assertEqual(len(executed_cmds), 1)
         self.assertEqual(executed_cmds[0][:3], ["colab", "new", "-s"])
@@ -422,18 +423,17 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         session_mgr = ProjectSessionManager(
             registry=self.registry,
             run_cmd_fn=mock_run_cmd,
-            require_approval=True,
         )
 
         # Unapproved allocation is strictly blocked (fail closed)
         with self.assertRaises(ApprovalRequiredError) as ctx:
             session_mgr.up(spec, lease_seconds=1800.0)
-        self.assertIn("Explicit approval token required", str(ctx.exception))
+        self.assertEqual(ctx.exception.reason, "missing")
         self.assertEqual(len(executed_cmds), 0, "No allocation command may be dispatched without approval")
 
-        # Authorize via explicit approval token
-        approval_token = f"ALLOCATE {spec.gpu} auth-nonce-token-7777"
-        session = session_mgr.up(spec, lease_seconds=1800.0, approval_token=approval_token)
+        # Authorize via a granted, single-use approval record
+        approval_id = grant_v2(session_mgr, spec, 1800.0)
+        session = session_mgr.up(spec, lease_seconds=1800.0, approval_id=approval_id)
         self.assertEqual(session.state, ProjectSessionState.READY.value)
         self.assertEqual(session.accelerator, "T4")
         self.assertEqual(len(executed_cmds), 1)
@@ -998,18 +998,14 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         session_mgr = ProjectSessionManager(
             registry=self.registry,
             run_cmd_fn=mock_run_cmd,
-            require_approval=True,
         )
 
         # Implicit / unapproved GPU allocation is rejected (negative control)
         with self.assertRaises(ApprovalRequiredError):
             session_mgr.up(spec, lease_seconds=1800.0)
 
-        approval_token = f"ALLOCATE {spec.gpu} auth-nonce-19step-999"
-        if "allow_gpu" in ProjectSessionManager.up.__code__.co_varnames:
-            session = session_mgr.up(spec, lease_seconds=1800.0, allow_gpu=True, approval_token=approval_token)
-        else:
-            session = session_mgr.up(spec, lease_seconds=1800.0, approval_token=approval_token)
+        approval_id = grant_v2(session_mgr, spec, 1800.0)
+        session = session_mgr.up(spec, lease_seconds=1800.0, approval_id=approval_id)
 
         self.assertEqual(session.state, ProjectSessionState.READY.value)
         self.assertEqual(session.accelerator, "T4")
@@ -1340,7 +1336,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         1. Local Research Project ('vision-research') initialization
         2. Manifest Validation (validate_manifest)
         3. Execution Plan (plan_project — 0 cloud allocations)
-        4. Explicit Mock GPU Approval (require_approval=True, verifies refusal without token and success with ALLOCATE T4 ...)
+        4. Explicit Mock GPU Approval (approval record required; refusal without it, success with a granted record)
         5. Managed Mock Colab Session (ProjectSessionManager.up)
         6. Incremental Source Synchronization (WorkspaceSyncEngine.apply_sync)
         7. Remote Training Execution (ProjectSessionManager.exec)
@@ -1465,23 +1461,20 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             registry=self.registry,
             run_cmd_fn=mock_run_cmd,
             transport=mock_transport,
-            require_approval=True,
         )
 
-        # Refusal without approval token
+        # Refusal without approval id
         with self.assertRaises(ApprovalRequiredError):
             session_mgr.up(spec, lease_seconds=1800.0)
 
-        # Refusal with malformed token
-        with self.assertRaises(ApprovalRequiredError):
-            session_mgr.up(spec, lease_seconds=1800.0, approval_token="ALLOCATE A100 invalid-gpu-token")
+        # Refusal with a made-up approval id (never granted)
+        with self.assertRaises(ApprovalRequiredError) as bogus:
+            session_mgr.up(spec, lease_seconds=1800.0, approval_id="apr-" + "0123456789abcdef" * 2)
+        self.assertEqual(bogus.exception.reason, "not_found")
 
-        # Success with valid approval token
-        approval_token = f"ALLOCATE {spec.gpu} auth-nonce-vision-stage4-token"
-        if "allow_gpu" in ProjectSessionManager.up.__code__.co_varnames:
-            session = session_mgr.up(spec, lease_seconds=1800.0, allow_gpu=True, approval_token=approval_token)
-        else:
-            session = session_mgr.up(spec, lease_seconds=1800.0, approval_token=approval_token)
+        # Success with a granted approval id
+        approval_id = grant_v2(session_mgr, spec, 1800.0)
+        session = session_mgr.up(spec, lease_seconds=1800.0, approval_id=approval_id)
 
         # =====================================================================
         # Stage 5: Managed Mock Colab Session Verification

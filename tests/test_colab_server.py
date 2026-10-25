@@ -17,6 +17,13 @@ class TestColabServer(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.script = Path(self.directory.name) / "probe.py"
         self.script.write_text("print('ok')\n", encoding="utf-8")
+        # Approval records go to a temporary registry directory, never the real home directory.
+        from colab_adapter.provider import ManagedSessionRegistry
+
+        registry = ManagedSessionRegistry(Path(self.directory.name) / "managed_sessions.json")
+        patcher = mock.patch.object(server, "_state_registry", return_value=registry)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_plan_does_not_spawn_subprocess_or_allocate(self):
         with mock.patch.object(server.subprocess, "run") as run:
@@ -45,7 +52,7 @@ class TestColabServer(unittest.TestCase):
     def test_wrong_confirmation_is_refused(self):
         with mock.patch.object(server.shutil, "which", return_value="/usr/bin/colab"):
             with mock.patch.object(server.sys.stdin, "isatty", return_value=True):
-                with mock.patch("builtins.input", return_value="ALLOCATE A100"):
+                with mock.patch("colab_adapter.approval.read_tty_phrase", return_value="ALLOCATE A100"):
                     with mock.patch.object(server.subprocess, "run") as run:
                         with contextlib.redirect_stderr(io.StringIO()):
                             code = server.main(["run", "--gpu", "T4", "--script", str(self.script)])
@@ -55,7 +62,7 @@ class TestColabServer(unittest.TestCase):
     def test_approved_run_invokes_official_cli_once(self):
         with mock.patch.object(server.shutil, "which", return_value="/usr/bin/colab"):
             with mock.patch.object(server.sys.stdin, "isatty", return_value=True):
-                with mock.patch("builtins.input", return_value="ALLOCATE T4"):
+                with mock.patch("colab_adapter.approval.read_tty_phrase", return_value="ALLOCATE T4"):
                     with mock.patch.object(server.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
                         code = server.main(["run", "--gpu", "T4", "--script", str(self.script)])
         self.assertEqual(code, 0)

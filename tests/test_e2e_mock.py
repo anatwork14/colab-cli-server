@@ -1,6 +1,7 @@
 """Offline mock test for E2E stateful training and verification."""
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -8,7 +9,10 @@ from pathlib import Path
 from unittest import mock
 
 from examples.verify_checkpoint import verify_checkpoint
-from colab_adapter.provider import ApprovedJob, ColabGPUProvider, JobSpec
+from colab_adapter.provider import ApprovedJob, ColabGPUProvider, ColabProcessLock, JobSpec, ManagedSessionRegistry
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from approval_helpers import grant_v1  # noqa: E402
 
 
 class TestE2EMockWorkflow(unittest.TestCase):
@@ -26,7 +30,12 @@ class TestE2EMockWorkflow(unittest.TestCase):
         self.artifacts_dir = self.base_dir / "artifacts"
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-        self.provider = ColabGPUProvider(cli_executable="/usr/local/bin/colab")
+        # Keep registry, lock and approval records inside the temporary directory.
+        self.provider = ColabGPUProvider(
+            cli_executable="/usr/local/bin/colab",
+            registry=ManagedSessionRegistry(self.base_dir / "managed_sessions.json"),
+            lock=ColabProcessLock(self.base_dir / "colab.lock"),
+        )
 
     def test_mock_stateful_e2e_lifecycle_and_verification(self):
         spec = JobSpec(
@@ -42,6 +51,7 @@ class TestE2EMockWorkflow(unittest.TestCase):
         prep = self.provider.prepare_job(spec)
         approved = ApprovedJob(
             prepared_job=prep,
+            approval_id=grant_v1(self.provider, prep),
             approval_code=prep.approval_nonce,
             approved_by="tester",
             fingerprint=prep.fingerprint,

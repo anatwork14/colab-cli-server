@@ -30,10 +30,14 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from approval_helpers import grant_v1  # noqa: E402
 
 from colab_adapter.provider import (
     AllocationError,
@@ -177,19 +181,18 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
                 self.provider.approve_job_interactive(prep)
             self.assertIn("stdin is not a tty", str(ctx.exception))
 
-        # Rejection when wrong phrase entered
-        with mock.patch("sys.stdin.isatty", return_value=True):
-            with mock.patch("builtins.input", return_value="NO"):
-                with self.assertRaises(ApprovalRequiredError):
-                    self.provider.approve_job_interactive(prep)
+        # Rejection when wrong phrase entered on the terminal (/dev/tty)
+        with mock.patch("colab_adapter.approval.read_tty_phrase", return_value="NO"):
+            with self.assertRaises(ApprovalRequiredError):
+                self.provider.approve_job_interactive(prep)
 
-        # Success when exact phrase entered
+        # Success when exact phrase entered on the terminal
         expected_phrase = f"ALLOCATE T4 {prep.approval_nonce}"
-        with mock.patch("sys.stdin.isatty", return_value=True):
-            with mock.patch("builtins.input", return_value=expected_phrase):
-                approved = self.provider.approve_job_interactive(prep)
-                self.assertEqual(approved.approval_code, prep.approval_nonce)
-                self.assertEqual(approved.fingerprint, prep.fingerprint)
+        with mock.patch("colab_adapter.approval.read_tty_phrase", return_value=expected_phrase):
+            approved = self.provider.approve_job_interactive(prep)
+            self.assertEqual(approved.approval_code, prep.approval_nonce)
+            self.assertEqual(approved.fingerprint, prep.fingerprint)
+            self.assertIsNotNone(approved.approval_id)
 
     # 8. Job tampering rejection
     def test_job_tampering_rejected(self):
@@ -246,6 +249,7 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
         prep = self.provider.prepare_job(spec)
         approved = ApprovedJob(
             prepared_job=prep,
+            approval_id=grant_v1(self.provider, prep),
             approval_code=prep.approval_nonce,
             approved_by="tester",
             fingerprint=prep.fingerprint,
@@ -269,6 +273,7 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
         prep = self.provider.prepare_job(spec)
         approved = ApprovedJob(
             prepared_job=prep,
+            approval_id=grant_v1(self.provider, prep),
             approval_code=prep.approval_nonce,
             approved_by="tester",
             fingerprint=prep.fingerprint,
@@ -300,6 +305,7 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
         prep = self.provider.prepare_job(spec)
         approved = ApprovedJob(
             prepared_job=prep,
+            approval_id=grant_v1(self.provider, prep),
             approval_code=prep.approval_nonce,
             approved_by="tester",
             fingerprint=prep.fingerprint,
@@ -345,6 +351,7 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
         prep = self.provider.prepare_job(spec)
         approved = ApprovedJob(
             prepared_job=prep,
+            approval_id=grant_v1(self.provider, prep),
             approval_code=prep.approval_nonce,
             approved_by="tester",
             fingerprint=prep.fingerprint,
@@ -381,6 +388,7 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
         prep = self.provider.prepare_job(spec)
         approved = ApprovedJob(
             prepared_job=prep,
+            approval_id=grant_v1(self.provider, prep),
             approval_code=prep.approval_nonce,
             approved_by="tester",
             fingerprint=prep.fingerprint,
@@ -474,6 +482,7 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
         prep = self.provider.prepare_job(spec)
         approved = ApprovedJob(
             prepared_job=prep,
+            approval_id=grant_v1(self.provider, prep),
             approval_code=prep.approval_nonce,
             approved_by="tester",
             fingerprint=prep.fingerprint,
@@ -635,6 +644,7 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
         prep = self.provider.prepare_job(spec)
         approved = ApprovedJob(
             prepared_job=prep,
+            approval_id=grant_v1(self.provider, prep),
             approval_code=prep.approval_nonce,
             approved_by="tester",
             fingerprint=prep.fingerprint,
@@ -667,6 +677,7 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
         prep = self.provider.prepare_job(spec)
         approved = ApprovedJob(
             prepared_job=prep,
+            approval_id=grant_v1(self.provider, prep),
             approval_code=prep.approval_nonce,
             approved_by="tester",
             fingerprint=prep.fingerprint,
@@ -701,6 +712,7 @@ class TestColabAdapterSecurityAndReliability(unittest.TestCase):
         prep = self.provider.prepare_job(spec)
         approved = ApprovedJob(
             prepared_job=prep,
+            approval_id=grant_v1(self.provider, prep),
             approval_code=prep.approval_nonce,
             approved_by="tester",
             fingerprint=prep.fingerprint,

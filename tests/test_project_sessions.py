@@ -34,6 +34,7 @@ from colab_adapter.project_sessions import (
     VALID_TRANSITIONS,
 )
 from colab_adapter.provider import ColabProcessLock, ManagedSessionRegistry
+from tests.approval_helpers import grant_v2
 
 
 class TestProjectSessions(unittest.TestCase):
@@ -43,9 +44,13 @@ class TestProjectSessions(unittest.TestCase):
         self.lock_path = Path(self.tmp_dir) / "colab.lock"
         self.registry = ManagedSessionRegistry(self.registry_path)
         self.lock = ColabProcessLock(self.lock_path)
+        # The plan fingerprint covers the project tree, so keep the project apart from the registry and approvals.
+        project_root = Path(self.tmp_dir) / "project"
+        project_root.mkdir()
+        (project_root / "train.py").write_text("print('train')\n", encoding="utf-8")
         self.spec = ProjectSpec(
             name="resnet_cifar",
-            root=Path(self.tmp_dir),
+            root=project_root,
             entrypoint="train.py",
             gpu="T4",
             timeout_seconds=1800.0,
@@ -135,7 +140,7 @@ class TestProjectSessions(unittest.TestCase):
             run_cmd_fn=mock_run_cmd,
         )
 
-        session = manager.up(self.spec, lease_seconds=3600.0)
+        session = manager.up(self.spec, lease_seconds=3600.0, approval_id=grant_v2(manager, self.spec, 3600.0))
         self.assertEqual(session.state, ProjectSessionState.READY.value)
         self.assertIn(ProjectSessionState.PROVISIONING.value, recorded_states)
 
@@ -157,7 +162,7 @@ class TestProjectSessions(unittest.TestCase):
         )
 
         with self.assertRaises(AllocationError) as ctx:
-            manager.up(self.spec)
+            manager.up(self.spec, approval_id=grant_v2(manager, self.spec))
         self.assertIn("Quota exceeded", str(ctx.exception))
 
         all_managed = self.registry.get_all_managed()
@@ -174,7 +179,7 @@ class TestProjectSessions(unittest.TestCase):
             run_cmd_fn=mock_run,
         )
 
-        s1 = manager.up(self.spec, lease_seconds=3600.0)
+        s1 = manager.up(self.spec, lease_seconds=3600.0, approval_id=grant_v2(manager, self.spec, 3600.0))
         self.assertEqual(mock_run.call_count, 1)
 
         # Second call to up with reuse_active=True (default)
