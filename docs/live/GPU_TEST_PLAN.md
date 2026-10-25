@@ -1,6 +1,8 @@
 # Bounded live GPU test plan (live-smoke)
 
-Status: **DRAFT, NOT APPROVED.** No Colab allocation may happen until the owner approves this plan in writing (see [Approval](#approval)). This document was prepared offline. Nothing in it has been executed against Colab.
+Status: **DRAFT, NOT APPROVED.** No Colab allocation may happen until the owner approves this plan in writing (see [Approval](#4-approval)). This document was prepared offline. Nothing in it has been executed against Colab.
+
+**What the 900 s lease is, and is not.** The lease is a *deadline the host tries to enforce*, not a billing cap and not a guarantee. `project up` starts a detached, session-scoped **lease guard** (`colab_adapter/lease_guard.py`) that, at the deadline, runs `colab --auth=oauth2 stop -s <SID>` for that one session and verifies with `colab sessions` that it is gone (bounded retries; then it flags `NEEDS_RECONCILIATION`). The guard does **not** survive a host reboot, `kill -9`, or loss of OAuth, its verification parses `sessions` output whose real format is **not yet verified against live Colab**, and the lease clock starts at `up` (it includes provisioning time). The operator must always check `sessions` and `usage` themselves after the test. The backstop for a dead guard is `project reconcile` (which auto-stops expired managed sessions) run by the operator.
 
 Project fixtures: `examples/live-smoke/` (manifest `colab-project.json`, `gpu_probe.py`, `train_tiny.py`, `workload_manifest.json`). Offline tests: `tests/test_live_gpu_fixtures.py`.
 
@@ -9,9 +11,9 @@ Project fixtures: `examples/live-smoke/` (manifest `colab-project.json`, `gpu_pr
 | Bound | Value |
 |---|---|
 | Accelerator | 1 x T4 |
-| Allocations (`project up` / `colab new`) | at most 1, for the whole plan |
-| Lease | `--lease-seconds 900` (the lease, not a billing cap; a best-effort host-side guard stops only this session at the deadline and verifies it with `sessions`; check `sessions` and `usage` after every step) |
-| Sessions touched | only the one session created by G3 |
+| Allocations (`project up` / `colab new`) | at most 1, for the whole plan; one single-use approval = at most one allocation; a failed or timed-out `up` burns the approval and any retry needs a new owner approval |
+| Lease | `--lease-seconds 900`: approval maximum and host-side guard deadline (best effort, session-scoped; not a billing cap; verify with `sessions` and `usage`) |
+| Sessions touched | only the one session created by G3c |
 | Remote workload | `gpu_probe.py` and `train_tiny.py` only; no dataset download, no pip install |
 | Training size | 60 steps by default, hard maximum 200 (enforced by the script) |
 | Keepalive / polling loops | none; status checks are manual and capped at 3 calls |
@@ -24,14 +26,14 @@ Steps are deliberately tiny. These are estimates, not measurements; the first li
 |---|---|
 | G1 offline checks (local) | under 1 min |
 | G2 baseline usage and sessions | about 10 s |
-| G3 provisioning (`project up`) | 1 to 5 min (unknown; this dominates) |
+| G3 approval steps and provisioning (`project up`) | 1 to 5 min (unknown; provisioning dominates; the 900 s lease clock starts when `up` is called) |
 | G4 sync and GPU probe | about 1 min |
 | G5 tiny training (60 steps) | under 1 min including torch import |
 | G6 checkpoint retrieval and hash compare | about 1 min |
 | Teardown and final usage | about 1 min |
 | **Total wall clock** | **about 6 to 12 min**, within the 900 s lease only if provisioning is fast |
 
-Abort if the remaining lease falls below 300 s before G5 (see abort criteria).
+Abort if the remaining lease falls below 300 s before G5 (see abort criteria). The guard will stop the session at the deadline regardless of what is running.
 
 ## 3. Cost measurement
 
@@ -39,19 +41,24 @@ CU consumption is measured as an **account-wide delta** from `usage` before G2 a
 
 ## 4. Approval
 
-<APPROVAL-GATE-FIX PENDING>
+The approval gate from Issue #25 is implemented (single-use, expiring, plan-bound approval records; see `docs/SECURITY.md`). The owner gives two separate approvals:
 
-`project up` currently provisions paid compute without the approval gate that Issue #25 will add. Until that fix lands, the owner must approve this plan explicitly and an operator must run G3 by hand from a terminal. Agents must not run G3 autonomously.
+1. **Plan approval (chat):** the owner replies with the exact text `APPROVE 1 T4 SESSION — 900 SECONDS — <CU limit>` after reading the current balance. This authorizes the agent to *request* an approval record. It does not by itself allow an allocation.
+2. **Operator approval (terminal):** the owner personally runs `project approve <approval-id>` in their own terminal and types the printed phrase (`ALLOCATE T4 <code> 900s`). The phrase is read from `/dev/tty`; piped or non-interactive input is refused. The record is valid for 15 minutes and is consumed by the first `project up` that uses it.
 
-- Owner approval (name, date, GPU, lease, max allocations): ____________________
-- Operator who runs G3-T: ____________________
+Who runs the paid `project up` (G3c): the **owner (recommended; strongest boundary)** or the agent immediately after the owner's terminal approval. The gate is an interlock, not a security boundary against a process with your OS account (it can read the HMAC key, forge records, or call `colab` directly); do not rely on it against an untrusted agent.
+
+- Owner plan approval (name, date, GPU, lease, max allocations, CU limit): ____________________
+- Operator who runs `project approve` and G3c: ____________________
+- Optional guard drill chosen (see G7)? yes / no
 
 ## 5. Commands
 
-All commands run from the repository root at commit `f4c9ee5` or later. Every flag below was checked against `python3 -m colab_adapter.cli project <sub> --help` at `f4c9ee5`. Do not add flags that are not listed here.
+All commands run from the repository root of the integrated branch that contains the approval gate and the lease guard. Every flag below must be re-checked against `python3 -m colab_adapter.cli project <sub> --help` immediately before the run (the approval commands and `--timeout` are new). Do not add flags that are not listed here.
 
 Placeholders:
-- `<SID>`: the session id returned by G3 (read its key from the JSON output; do not guess the key name).
+- `<SID>`: the `session_id` value in the JSON printed by G3c.
+- `<APPROVAL_ID>`: the `approval_id` value printed by G3a (form `apr-` plus 32 hex).
 - `<SCRATCH>`: a new empty directory for retrieved files (for example, a directory under the agent scratchpad).
 
 ### G1: offline gate (local, zero allocation)
@@ -74,19 +81,47 @@ python3 -m colab_adapter.cli sessions
 
 Record the output verbatim (CU balance and the list of existing sessions). Note any managed `live-smoke` session that already exists. Do not touch any session in this step.
 
-### G3: the single allocation <APPROVAL-GATE-FIX PENDING>
+### G3: approval and the single allocation
+
+Run G3a, G3b, G3c back to back; the approval expires after 15 minutes and the workspace digest must not change in between (do not edit files under `examples/live-smoke/` between G3a and G3c).
+
+**G3a (agent or operator, no cloud contact):**
 
 ```
-python3 -m colab_adapter.cli project up --manifest examples/live-smoke/colab-project.json --lease-seconds 900 --json
+python3 -m colab_adapter.cli project approve-request --manifest examples/live-smoke/colab-project.json --lease-seconds 900 --json
 ```
 
-Expected: exactly one new managed session; its id is `<SID>`. If the output shows a session id that was not present in G2 and is not managed by this project, stop (see abort criteria). Do not run `project up` a second time for any reason.
+Expected: JSON with `approval_id`, `status: "pending"`, `max_lease_seconds: 900.0`, a `phrase` of the form `ALLOCATE T4 <code> 900s` and an `expires_at` about 15 minutes ahead. No `colab` command runs.
+
+**G3b (operator only, own terminal, interactive):**
+
+```
+python3 -m colab_adapter.cli project approve <APPROVAL_ID>
+```
+
+The operator reads the summary and plan digest, then types the phrase exactly. Expected: the record becomes `approved`. If the terminal is not interactive the command refuses with `non_tty`; do not work around it.
+
+**G3c (the only allocation; operator recommended):**
+
+```
+python3 -m colab_adapter.cli project up --manifest examples/live-smoke/colab-project.json --lease-seconds 900 --approval-id <APPROVAL_ID> --json
+```
+
+Expected: exactly one new managed session whose `session_id` is `<SID>` and whose `state` is `READY`; the lease guard has been started (exit code 0). Exit code 3 means the approval was refused (zero `colab new` calls); exit code 4 means the global cap of one active managed session is reached (the approval is not consumed). If `up` fails after the approval was consumed (allocation error, timeout, or the guard could not start, in which case `up` stops the new session itself), the approval is **spent**: run teardown, report, and do **not** request a new approval without the owner's fresh instruction. Never run `project up` a second time.
+
+**G3d (verify the guard before any workload; read-only):**
+
+```
+python3 -m colab_adapter.cli project status --session-id <SID> --json
+```
+
+Expected: the guard is reported alive with a deadline about 900 s after the allocation and a positive remaining time. If the guard is not alive, run teardown immediately (a session without a live guard has no deadline enforcement).
 
 ### G4: sync and GPU probe
 
 ```
 python3 -m colab_adapter.cli project sync --manifest examples/live-smoke/colab-project.json --session-id <SID> --json
-python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --json "python3 gpu_probe.py --require-gpu"
+python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --timeout 120 --json "python3 gpu_probe.py --require-gpu"
 ```
 
 Expected output markers (all must appear in the captured output):
@@ -99,7 +134,7 @@ The checksum is exact (small-integer inputs), so the same integer must be report
 ### G5: tiny training run
 
 ```
-python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --json "python3 train_tiny.py --steps 60 --require-gpu"
+python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --timeout 300 --json "python3 train_tiny.py --steps 60 --require-gpu"
 ```
 
 Expected output:
@@ -114,7 +149,7 @@ Verify the DONE_OK line; do not treat exit code 0 alone as success (AGENTS.md ru
 ### G6: checkpoint retrieval and hash compare
 
 ```
-python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --json "sha256sum artifacts/checkpoints/model.pt && cat artifacts/checkpoints/model.pt.sha256 && base64 -w0 artifacts/checkpoints/model.pt"
+python3 -m colab_adapter.cli project exec --session-id <SID> --working-dir /content/colab-workspaces/live-smoke --timeout 120 --json "sha256sum artifacts/checkpoints/model.pt && cat artifacts/checkpoints/model.pt.sha256 && base64 -w0 artifacts/checkpoints/model.pt"
 ```
 
 Procedure:
@@ -128,7 +163,7 @@ Assumption to verify at execution: `project exec` runs its argument through a sh
 
 ## 6. Teardown (mandatory)
 
-Teardown runs after G6 and also after any abort, including a failed G4 or G5.
+Teardown runs after G6 and also after any abort, including a failed G3c, G4 or G5. It is done by the operator or agent by hand; the lease guard is only the backstop.
 
 ```
 python3 -m colab_adapter.cli project status --session-id <SID> --json
@@ -137,9 +172,15 @@ python3 -m colab_adapter.cli sessions
 python3 -m colab_adapter.cli usage
 ```
 
-- `status` records the remaining lease for the report (at most 3 status calls in the whole plan).
-- `stop` targets only `<SID>`.
-- After `stop`, `sessions` must not list `<SID>`. If it still does, retry `project stop --session-id <SID> --json` once and report the result. Do not stop any other session.
+- `status` records the remaining lease and the guard state for the report (at most 3 status calls in the whole plan).
+- `stop` targets only `<SID>` (and terminates that session's guard after a successful stop).
+- After `stop`, `sessions` must not list `<SID>`. If it still does, retry `project stop --session-id <SID> --json` once and report the result; if it is still listed, tell the owner immediately so they can stop it from the Colab UI. Do not stop any other session.
+- If `up` failed in a way that may have left a runtime (timeout, nonzero exit after `new` started), `sessions` is the source of truth: report any unexpected session id to the owner; do not stop sessions this plan did not create.
+- If the guard is not alive and the session cannot be stopped, the operator runs `python3 -m colab_adapter.cli project reconcile --json` (this auto-stops expired *managed* sessions only) and then re-checks `sessions`.
+
+### G7 (optional, owner decides): guard drill
+
+To verify the guard against real Colab instead of trusting the offline fake, the owner may choose to skip the manual `stop` in teardown and let the guard stop the session at the deadline (the session stays allocated until at most the 900 s lease ends, costing a few extra minutes of T4 time). The operator watches `project status --session-id <SID> --json` (at most 3 calls) and, **if the session is still listed 120 s after the deadline**, performs the manual `stop` above. PASS only if `sessions` no longer lists `<SID>` and the registry shows `guard_outcome: STOPPED_VERIFIED`. This is the only step that validates the real `colab sessions` output format that the guard parses. If the owner does not choose G7, the guard's live behaviour stays **UNVERIFIED** and must be reported that way.
 
 ## 7. Usage before and after
 
@@ -164,8 +205,10 @@ Any single failed check means the plan has not passed. Record the failure as a f
 
 Abort the plan, run teardown (section 6), and stop further steps when any of these happens:
 
-- `project up` yields more than one session, or a session that was not created by G3.
-- `project up` is run again, or any step would allocate a second accelerator.
+- `project up` yields more than one session, or a session that was not created by G3c.
+- `project up` fails after consuming the approval (do not request a second approval on your own; report to the owner).
+- G3d shows the lease guard is not alive.
+- `project up` is run again, or any step would allocate a second accelerator, or an approval is requested or used for a second allocation without a fresh owner instruction.
 - G4 exits 2 or the `GPU_PROBE_OK` marker is missing.
 - G5 exits with a non-zero code, or the `DONE_OK` marker is missing.
 - The remaining lease from `status` is below 300 s before G5.
@@ -179,17 +222,20 @@ During this plan, do **not**:
 
 - allocate more than one accelerator, or run `project up` more than once;
 - run `colab new`, `colab run`, `colab ssh`, or any `colab` command directly;
-- stop, attach to, or execute on any session not created by G3 (AGENTS.md Q08 invariant);
-- run `project reconcile` (it can stop expired sessions; this plan does not need it);
+- stop, attach to, or execute on any session not created by G3c (AGENTS.md Q08 invariant);
+- run `project reconcile` except as the documented backstop in section 6 (it can stop expired managed sessions);
+- forge, copy, or script the approval phrase, pipe input into `project approve`, set any bypass, or call `colab new` directly;
 - start any keepalive, ping, or polling loop, or use `sleep` loops to hold a session open;
 - download datasets, install packages with pip, or fetch models from the network;
 - start the monitor server with any mutating endpoint, or expose it to a network;
-- use `--no-reuse` or any flag not listed in section 5;
+- use `--no-reuse` (with a live session it always fails the global cap) or any flag not listed in section 5;
 - publish or commit captured outputs that contain credentials or account details.
 
 ## 11. Limitations
 
-- Nothing in this plan has been run against Colab. Provisioning time, lease behaviour during provisioning and exec output size are unverified.
-- `project up` will change with the approval-gate fix (Issue #25); all G3 and related lines must be re-checked against the `--help` output of the fixed version before use.
+- Nothing in this plan has been run against Colab. Provisioning time, lease behaviour during provisioning, exec output size, whether `project exec` runs through a shell, and the real `colab sessions`/`colab stop` output and exit codes are unverified.
+- The lease guard is best effort: no billing cap; not robust to host reboot, `kill -9`, OAuth loss, or a changed `sessions` output format; its verification is only validated live if G7 is chosen. Operator checks of `sessions` and `usage` are mandatory regardless.
+- The approval gate is an interlock, not a security boundary against a process running as the same OS user.
 - CU cost is an account-wide delta, not per-job billing.
 - The torch-dependent code paths were not executed locally (torch is not installed on the offline host); they are verified only by the remote run.
+- It is unverified whether `-s` calls to `exec`/`upload` can auto-create a missing session (the installed upstream CLI exits with an error for a missing session in the paths inspected, but this is re-verified during G4 by checking `sessions` for unexpected ids).
