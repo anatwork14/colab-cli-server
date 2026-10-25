@@ -37,6 +37,8 @@ try:
 except ImportError:
     fcntl = None
 
+import shutil
+
 from ..errors import (
     ArtifactNotFoundError,
     ArtifactValidationError,
@@ -50,6 +52,8 @@ from ..errors import (
 from .base import ArtifactStore, ArtifactType, StoredArtifact, _utc_now_iso
 from .manifest import PublicationManifest, compute_file_md5, compute_file_sha256
 from .transfer import TransferJournal, TransferRecord, TransferStatus
+
+ArtifactTransferError = DriveTransferError
 
 DEFAULT_CHUNK_SIZE = 1024 * 1024  # 1 MiB chunks (multiple of 256 KiB)
 DEFAULT_DRIVE_ROOT_FOLDER = "Colab-Research"
@@ -295,6 +299,14 @@ class GoogleDriveArtifactStore:
     @property
     def provider_name(self) -> str:
         return "google_drive"
+
+    def compute_sha256(self, file_path: Union[str, Path]) -> str:
+        """Compute streaming SHA256 of local file."""
+        return compute_file_sha256(file_path)
+
+    def _compute_md5(self, file_path: Union[str, Path]) -> str:
+        """Compute streaming MD5 of local file for Drive v3 comparison."""
+        return compute_file_md5(file_path)
 
     @contextlib.contextmanager
     def _exclusive_lock(self, lock_name: str, timeout: float = 60.0):
@@ -775,6 +787,23 @@ class GoogleDriveArtifactStore:
             allow_revision_mismatch=True,
         )
         if existing and existing.get("id"):
+            existing_id = existing.get("id")
+            is_diff = False
+            target_sha = transfer_record.sha256 if transfer_record else None
+            if target_sha:
+                for rec in self.journal.list_transfers(project_id=transfer_record.project_id, run_id=transfer_record.run_id):
+                    if rec.remote_file_id == existing_id and rec.sha256 and rec.sha256.lower() != target_sha.lower():
+                        is_diff = True
+                        break
+            if is_diff:
+                existing = None
+            elif target_sha:
+                try:
+                    self._verify_remote_file_content(existing_id, total_size, target_sha)
+                except Exception:
+                    existing = None
+
+        if existing and existing.get("id"):
             transfer_record.bytes_transferred = total_size
             transfer_record.remote_file_id = existing.get("id")
             self.journal.record_transfer(transfer_record)
@@ -791,11 +820,18 @@ class GoogleDriveArtifactStore:
         local_path: Union[str, Path],
         target_folder_id: str,
         transfer_record: TransferRecord,
+        filename: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Perform chunked resumable upload with state updates in transfer journal."""
         src = Path(local_path).resolve()
         total_size = src.stat().st_size
-        filename = src.name
+        if filename is None:
+            if transfer_record and transfer_record.target_rel_path:
+                filename = Path(transfer_record.target_rel_path).name
+            elif transfer_record and transfer_record.local_path:
+                filename = Path(transfer_record.local_path).name
+            else:
+                filename = src.name
         local_md5 = transfer_record.md5 or compute_file_md5(src)
         if not transfer_record.md5:
             transfer_record.md5 = local_md5
@@ -808,6 +844,23 @@ class GoogleDriveArtifactStore:
             expected_md5=local_md5,
             allow_revision_mismatch=True,
         )
+        if existing and existing.get("id"):
+            existing_id = existing.get("id")
+            is_diff = False
+            target_sha = transfer_record.sha256 if transfer_record else None
+            if target_sha:
+                for rec in self.journal.list_transfers(project_id=transfer_record.project_id, run_id=transfer_record.run_id):
+                    if rec.remote_file_id == existing_id and rec.sha256 and rec.sha256.lower() != target_sha.lower():
+                        is_diff = True
+                        break
+            if is_diff:
+                existing = None
+            elif target_sha:
+                try:
+                    self._verify_remote_file_content(existing_id, total_size, target_sha)
+                except Exception:
+                    existing = None
+
         if existing and existing.get("id"):
             transfer_record.bytes_transferred = total_size
             transfer_record.remote_file_id = existing.get("id")
@@ -1116,12 +1169,12 @@ class GoogleDriveArtifactStore:
             raise ArtifactValidationError(f"Source file does not exist: {src}")
 
         # Step 1: Verify local SHA256 & MD5
-        local_sha256 = compute_file_sha256(src)
+        local_sha256 = self.compute_sha256(src)
         if expected_sha256 and expected_sha256.lower() != local_sha256.lower():
             raise ArtifactValidationError(
                 f"Local checksum mismatch before Drive upload: expected {expected_sha256}, got {local_sha256}"
             )
-        local_md5 = compute_file_md5(src)
+        local_md5 = self._compute_md5(src)
         local_size = src.stat().st_size
 
         # Resolve subfolder
@@ -1132,32 +1185,179 @@ class GoogleDriveArtifactStore:
             subfolder = "outputs"
 
         rel_path = f"{subfolder}/{src.name}" if subfolder else src.name
-        artifact_id = f"{project_id}/{run_id}/{rel_path}"
+        logical_artifact_id = f"{project_id}/{run_id}/{rel_path}"
+        artifact_id = f"{logical_artifact_id}@sha256_{local_sha256.lower()}"
+        base_transfer_id = f"{self.provider_name}-{project_id}-{run_id}-{src.name}"
+        rev_transfer_id = f"{base_transfer_id}-{local_sha256.lower()[:12]}"
+        transfer_id = rev_transfer_id
+        lock_name = f"artifact-{self.provider_name}-{project_id}-{run_id}-{src.name}"
+        manifest_lock_name = f"manifest-{project_id}-{run_id}"
         m_key = (project_id, run_id)
 
-        base_transfer_id = f"{self.provider_name}-{project_id}-{run_id}-{src.name}"
+        staged_src = src
+        cleanup_staged = False
+        is_already_staged = (".upload_staging" in src.parts or ".staged_uploads" in src.parts)
 
-        with self._exclusive_lock(f"artifact-{base_transfer_id}"):
-            # 1. Reload record from journal
-            record = self.journal.get_transfer(base_transfer_id)
+        with self._exclusive_lock(lock_name):
+            # Snapshot src into immutable temporary staging file under lock
+            if not is_already_staged:
+                staging_dir = self.staging_dir / ".upload_staging"
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                staging_target = staging_dir / f"{project_id}_{run_id}_{local_sha256[:16]}_{src.name}"
+                tmp_staging = staging_dir / f"{project_id}_{run_id}_{local_sha256[:16]}_{src.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+                try:
+                    shutil.copy2(src, tmp_staging)
+                except Exception as e:
+                    if tmp_staging.exists():
+                        try:
+                            tmp_staging.unlink()
+                        except OSError:
+                            pass
+                    raise ArtifactTransferError(f"Failed to snapshot source file for staging: {e}") from e
 
-            # 2. Determine whether this is the same content or a new revision
-            is_new_revision = False
-            if record is not None and record.sha256 and record.sha256 != local_sha256 and record.status == TransferStatus.PUBLISHED.value:
-                transfer_id = f"{base_transfer_id}-{local_sha256[:12]}"
-                record = self.journal.get_transfer(transfer_id)
-                is_new_revision = True
-            else:
-                transfer_id = base_transfer_id
-                is_new_revision = False
+                # Verify that staged copy matches local_size and local_sha256
+                staged_size = tmp_staging.stat().st_size
+                staged_sha = self.compute_sha256(tmp_staging)
+                if staged_size != local_size or staged_sha.lower() != local_sha256.lower():
+                    try:
+                        tmp_staging.unlink()
+                    except OSError:
+                        pass
+                    raise ArtifactTransferError("Source file mutated during staging before upload")
 
-            allow_revision_mismatch = is_new_revision or (record is None)
-
-            # 3. Ensure remote folder hierarchy exists
-            target_folder_id = self.resolve_target_folder_id(project_id, run_id, subfolder)
+                os.replace(str(tmp_staging), str(staging_target))
+                staged_src = staging_target
+                cleanup_staged = True
 
             try:
-                # 4. Fast-path idempotent check + Remote folder deduplication check under lock
+                # 1. Reload journal if supported
+                if hasattr(self.journal, "_load"):
+                    self.journal._load()
+
+                # 2. Load PublicationManifest under manifest lock
+                local_manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+                with self._exclusive_lock(manifest_lock_name):
+                    if local_manifest_path.exists():
+                        manifest = PublicationManifest.load(local_manifest_path)
+                    elif m_key in self._manifest_cache:
+                        manifest = self._manifest_cache[m_key]
+                    else:
+                        manifest = PublicationManifest(project_id=project_id, run_id=run_id)
+                    self._manifest_cache[m_key] = manifest
+
+                # 3. Check if exact revision is already in manifest with valid remote_file_id
+                existing_art = manifest.get_artifact(artifact_id)
+                if existing_art and existing_art.remote_file_id and existing_art.storage_provider == self.provider_name:
+                    return existing_art
+
+                # 4. Check journal for this exact revision or pre-enqueued in-progress transfer
+                base_rec = self.journal.get_transfer(base_transfer_id)
+                if base_rec is not None and (
+                    base_rec.status != TransferStatus.PUBLISHED.value
+                    or (base_rec.sha256 and base_rec.sha256.lower() == local_sha256.lower())
+                ):
+                    transfer_id = base_transfer_id
+                    record = base_rec
+                else:
+                    transfer_id = rev_transfer_id
+                    record = self.journal.get_transfer(transfer_id)
+
+                if record is None:
+                    # Scan journal for any published record for (project_id, run_id) with matching sha256
+                    for rec in self.journal.list_transfers(project_id=project_id, run_id=run_id):
+                        if rec.status == TransferStatus.PUBLISHED.value and rec.remote_file_id:
+                            if rec.sha256 and rec.sha256.lower() == local_sha256.lower():
+                                if Path(rec.local_path).name == src.name or rec.target_rel_path == rel_path:
+                                    record = rec
+                                    transfer_id = rec.transfer_id
+                                    break
+
+                if record is not None and record.status == TransferStatus.PUBLISHED.value and record.remote_file_id:
+                    meta_dict = dict(metadata or {})
+                    meta_dict["logical_path"] = rel_path
+                    meta_dict["revision_id"] = f"sha256_{local_sha256.lower()}"
+                    meta_dict["is_latest"] = True
+
+                    stored = StoredArtifact(
+                        artifact_id=artifact_id,
+                        storage_provider=self.provider_name,
+                        path=rel_path,
+                        size_bytes=local_size,
+                        sha256=local_sha256,
+                        project_id=project_id,
+                        run_id=run_id,
+                        artifact_type=artifact_type,
+                        remote_file_id=record.remote_file_id,
+                        md5=local_md5,
+                        verified_at=_utc_now_iso(),
+                        metadata=meta_dict,
+                    )
+                    with self._exclusive_lock(manifest_lock_name):
+                        if local_manifest_path.exists():
+                            manifest = PublicationManifest.load(local_manifest_path)
+                        for k, art_dict in manifest.artifacts.items():
+                            if (
+                                art_dict.get("path") == rel_path
+                                or art_dict.get("metadata", {}).get("logical_path") == rel_path
+                                or k.split("@sha256_")[0] == logical_artifact_id
+                            ) and k != artifact_id:
+                                if "metadata" not in art_dict or not isinstance(art_dict["metadata"], dict):
+                                    art_dict["metadata"] = {}
+                                art_dict["metadata"]["is_latest"] = False
+                        for k, art_dict in manifest.artifacts.items():
+                            if (
+                                art_dict.get("path") == rel_path
+                                or art_dict.get("metadata", {}).get("logical_path") == rel_path
+                                or k.split("@sha256_")[0] == logical_artifact_id
+                            ) and k != artifact_id:
+                                if "metadata" not in art_dict or not isinstance(art_dict["metadata"], dict):
+                                    art_dict["metadata"] = {}
+                                art_dict["metadata"]["is_latest"] = False
+                        manifest.add_artifact(stored)
+                        manifest.status = "PUBLISHED"
+                        manifest.save(local_manifest_path)
+                        self._manifest_cache[m_key] = manifest
+                    return stored
+
+                # If record is None, also check legacy unversioned transfer_id for in-progress transfers
+                if record is None:
+                    legacy_tid = f"{self.provider_name}-{project_id}-{run_id}-{src.name}"
+                    record = self.journal.get_transfer(legacy_tid)
+
+                # Check if manifest already contains an earlier revision for the SAME logical path with a DIFFERENT sha256
+                has_earlier_revision = any(
+                    (
+                        a.metadata.get("logical_path") == rel_path
+                        or a.path == rel_path
+                        or a.artifact_id.startswith(f"{logical_artifact_id}@")
+                    )
+                    and a.sha256.lower() != local_sha256.lower()
+                    for a in manifest.list_artifacts()
+                )
+
+                is_new_revision = False
+                if (
+                    record is not None
+                    and record.sha256
+                    and record.sha256.lower() != local_sha256.lower()
+                    and record.status == TransferStatus.PUBLISHED.value
+                ):
+                    is_new_revision = True
+
+                allow_revision_mismatch = (
+                    has_earlier_revision
+                    or is_new_revision
+                    or (record is None)
+                    or (
+                        record.status != TransferStatus.UPLOADING.value
+                        and record.status != TransferStatus.UPLOAD_PENDING.value
+                    )
+                )
+
+                # 5. Ensure remote folder hierarchy exists
+                target_folder_id = self.resolve_target_folder_id(project_id, run_id, subfolder)
+
+                # 6. Check remote Drive folder for existing matching file
                 existing_file = self._find_file_in_folder(
                     src.name,
                     target_folder_id,
@@ -1169,10 +1369,48 @@ class GoogleDriveArtifactStore:
                     remote_id = existing_file.get("id")
                     if not remote_id:
                         raise DriveIntegrityError("Drive existing file found but has no ID.")
-                    if local_md5 and not existing_file.get("md5Checksum"):
-                        self._verify_remote_file_content(remote_id, local_size, local_sha256)
 
-                    if record is None:
+                    # Check whether existing_remote_id is associated with a DIFFERENT sha256 in manifest or journal
+                    is_different_sha = False
+                    for art in manifest.list_artifacts():
+                        if art.remote_file_id == remote_id and art.sha256.lower() != local_sha256.lower():
+                            is_different_sha = True
+                            break
+                    if not is_different_sha:
+                        for rec in self.journal.list_transfers(project_id=project_id, run_id=run_id):
+                            if rec.remote_file_id == remote_id and rec.sha256 and rec.sha256.lower() != local_sha256.lower():
+                                is_different_sha = True
+                                break
+
+                    if is_different_sha:
+                        existing_file = None
+                    else:
+                        already_associated = False
+                        for art in manifest.list_artifacts():
+                            if art.remote_file_id == remote_id and art.sha256.lower() == local_sha256.lower():
+                                already_associated = True
+                                break
+                        if not already_associated:
+                            for rec in self.journal.list_transfers(project_id=project_id, run_id=run_id):
+                                if (
+                                    rec.remote_file_id == remote_id
+                                    and rec.sha256
+                                    and rec.sha256.lower() == local_sha256.lower()
+                                    and rec.status == TransferStatus.PUBLISHED.value
+                                ):
+                                    already_associated = True
+                                    break
+
+                        # If not already associated or missing md5Checksum, verify content via readback
+                        if not already_associated or (local_md5 and not existing_file.get("md5Checksum")):
+                            try:
+                                self._verify_remote_file_content(remote_id, local_size, local_sha256)
+                            except Exception:
+                                existing_file = None
+
+                if existing_file:
+                    remote_id = existing_file.get("id")
+                    if record is None or record.transfer_id != transfer_id:
                         record = TransferRecord(
                             transfer_id=transfer_id,
                             project_id=project_id,
@@ -1197,6 +1435,11 @@ class GoogleDriveArtifactStore:
                         record.updated_at = _utc_now_iso()
                     self.journal.record_transfer(record)
 
+                    meta_dict = dict(metadata or {})
+                    meta_dict["logical_path"] = rel_path
+                    meta_dict["revision_id"] = f"sha256_{local_sha256.lower()}"
+                    meta_dict["is_latest"] = True
+
                     stored = StoredArtifact(
                         artifact_id=artifact_id,
                         storage_provider=self.provider_name,
@@ -1209,23 +1452,17 @@ class GoogleDriveArtifactStore:
                         remote_file_id=remote_id,
                         md5=local_md5,
                         verified_at=_utc_now_iso(),
-                        metadata=metadata or {},
+                        metadata=meta_dict,
                     )
 
-                    with self._exclusive_lock(f"manifest-{project_id}-{run_id}"):
-                        local_manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+                    with self._exclusive_lock(manifest_lock_name):
                         if local_manifest_path.exists():
                             manifest = PublicationManifest.load(local_manifest_path)
-                        elif m_key in self._manifest_cache:
-                            manifest = self._manifest_cache[m_key]
-                        else:
-                            manifest = PublicationManifest(project_id=project_id, run_id=run_id)
-
                         existing_art = manifest.get_artifact(artifact_id)
                         if existing_art and existing_art.storage_provider == "local":
                             stored = StoredArtifact(
                                 artifact_id=artifact_id,
-                                storage_provider="google_drive",
+                                storage_provider=self.provider_name,
                                 path=existing_art.path,
                                 size_bytes=local_size,
                                 sha256=local_sha256,
@@ -1235,9 +1472,18 @@ class GoogleDriveArtifactStore:
                                 remote_file_id=remote_id,
                                 md5=local_md5,
                                 verified_at=_utc_now_iso(),
-                                metadata={**existing_art.metadata, **(metadata or {})},
+                                metadata={**existing_art.metadata, **meta_dict},
                             )
 
+                        for k, art_dict in manifest.artifacts.items():
+                            if (
+                                art_dict.get("path") == rel_path
+                                or art_dict.get("metadata", {}).get("logical_path") == rel_path
+                                or k.split("@sha256_")[0] == logical_artifact_id
+                            ) and k != artifact_id:
+                                if "metadata" not in art_dict or not isinstance(art_dict["metadata"], dict):
+                                    art_dict["metadata"] = {}
+                                art_dict["metadata"]["is_latest"] = False
                         manifest.add_artifact(stored)
                         manifest.status = "PUBLISHED"
                         manifest.save(local_manifest_path)
@@ -1245,8 +1491,8 @@ class GoogleDriveArtifactStore:
 
                     return stored
 
-                # 5. Not found remotely: perform resumable upload
-                if not record:
+                # 7. Not found remotely: perform resumable upload from staged_src
+                if not record or record.transfer_id != transfer_id:
                     record = TransferRecord(
                         transfer_id=transfer_id,
                         project_id=project_id,
@@ -1294,7 +1540,7 @@ class GoogleDriveArtifactStore:
                     record.transition_to(TransferStatus.UPLOADING)
                     self.journal.record_transfer(record)
 
-                drive_file_meta = self.upload_file_resumable(src, target_folder_id, record)
+                drive_file_meta = self.upload_file_resumable(staged_src, target_folder_id, record)
 
                 remote_id = drive_file_meta.get("id")
                 if not remote_id:
@@ -1347,6 +1593,11 @@ class GoogleDriveArtifactStore:
                     record.remote_file_id = remote_id
                     self.journal.record_transfer(record)
 
+                meta_dict = dict(metadata or {})
+                meta_dict["logical_path"] = rel_path
+                meta_dict["revision_id"] = f"sha256_{local_sha256.lower()}"
+                meta_dict["is_latest"] = True
+
                 stored = StoredArtifact(
                     artifact_id=artifact_id,
                     storage_provider=self.provider_name,
@@ -1359,10 +1610,10 @@ class GoogleDriveArtifactStore:
                     remote_file_id=remote_id,
                     md5=local_md5,
                     verified_at=_utc_now_iso(),
-                    metadata=metadata or {},
+                    metadata=meta_dict,
                 )
 
-                with self._exclusive_lock(f"manifest-{project_id}-{run_id}"):
+                with self._exclusive_lock(manifest_lock_name):
                     local_manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
                     if local_manifest_path.exists():
                         manifest = PublicationManifest.load(local_manifest_path)
@@ -1375,7 +1626,7 @@ class GoogleDriveArtifactStore:
                     if existing_art and existing_art.storage_provider == "local":
                         stored = StoredArtifact(
                             artifact_id=artifact_id,
-                            storage_provider="google_drive",
+                            storage_provider=self.provider_name,
                             path=existing_art.path,
                             size_bytes=local_size,
                             sha256=local_sha256,
@@ -1385,7 +1636,7 @@ class GoogleDriveArtifactStore:
                             remote_file_id=remote_id,
                             md5=local_md5,
                             verified_at=_utc_now_iso(),
-                            metadata={**existing_art.metadata, **(metadata or {})},
+                            metadata={**existing_art.metadata, **meta_dict},
                         )
 
                     manifest.add_artifact(stored)
@@ -1413,10 +1664,106 @@ class GoogleDriveArtifactStore:
                             record.last_error = sanitized_err
                     self.journal.record_transfer(record)
                 raise
+            finally:
+                if cleanup_staged and staged_src.exists():
+                    try:
+                        staged_src.unlink()
+                    except OSError:
+                        pass
 
-    def retrieve(self, artifact_id: str, destination: Union[str, Path]) -> Path:
+    def _resolve_artifact_from_manifest(
+        self,
+        manifest: PublicationManifest,
+        artifact_id: str,
+    ) -> Optional[StoredArtifact]:
+        """Resolve an artifact from manifest by canonical ID, prefix, or unversioned logical ID."""
+        # 1. Exact match
+        art = manifest.get_artifact(artifact_id)
+        if art is not None:
+            return art
+
+        # 2. Versioned ID prefix search: e.g. "proj/run/path@sha256_<hex>"
+        if "@sha256_" in artifact_id:
+            base_id, sha_prefix = artifact_id.split("@sha256_", 1)
+            matching = []
+            for a in manifest.list_artifacts():
+                a_base = a.artifact_id.split("@sha256_")[0]
+                if a_base == base_id and a.sha256.lower().startswith(sha_prefix.lower()):
+                    matching.append(a)
+            if matching:
+                matching.sort(key=lambda x: getattr(x, "created_at", "") or "", reverse=True)
+                return matching[0]
+            return None
+
+        # 3. Unversioned ID search: e.g. "proj/run/checkpoints/model.pt"
+        parts = artifact_id.split("/")
+        rel_path = "/".join(parts[2:]) if len(parts) > 2 else ""
+
+        matching = []
+        for a in manifest.list_artifacts():
+            a_base = a.artifact_id.split("@sha256_")[0]
+            if a_base == artifact_id or (rel_path and (a.metadata.get("logical_path") == rel_path or a.path == rel_path)):
+                matching.append(a)
+
+        if not matching:
+            return None
+
+        matching.sort(key=lambda x: getattr(x, "created_at", "") or "", reverse=True)
+
+        for c in matching:
+            if c.metadata.get("is_latest") is True or getattr(c, "is_latest", False) is True:
+                return c
+
+        return matching[0]
+
+    def retrieve(
+        self,
+        artifact_id: str,
+        destination: Union[str, Path],
+        expected_sha256: Optional[str] = None,
+    ) -> Path:
         """Download artifact from Google Drive by ID with bounded memory streaming and integrity check."""
+        req_sha = None
+        if "@sha256_" in artifact_id:
+            base_art_id, sha_suffix = artifact_id.split("@sha256_", 1)
+            req_sha = sha_suffix.lower()
+        else:
+            base_art_id = artifact_id
+
+        if expected_sha256 is None and req_sha is not None:
+            expected_sha256 = req_sha
+
         meta = self.get_metadata(artifact_id)
+
+        # Fallback to searching remote Drive folder if not in local PublicationManifest
+        if not meta or not meta.remote_file_id:
+            parts = base_art_id.split("/")
+            if len(parts) >= 3:
+                proj_id, r_id = parts[0], parts[1]
+                rel_p = "/".join(parts[2:])
+                fname = parts[-1]
+                sub_f = parts[2] if len(parts) > 3 else None
+                try:
+                    f_id = self.resolve_target_folder_id(proj_id, r_id, sub_f)
+                    remote_file = self._find_file_in_folder(fname, f_id, allow_revision_mismatch=True)
+                    if remote_file and remote_file.get("id"):
+                        remote_fid = remote_file["id"]
+                        rem_size = int(remote_file.get("size", 0)) if remote_file.get("size") else None
+                        rem_md5 = remote_file.get("md5Checksum")
+                        meta = StoredArtifact(
+                            artifact_id=artifact_id,
+                            storage_provider=self.provider_name,
+                            path=rel_p,
+                            size_bytes=rem_size or 0,
+                            sha256=expected_sha256 or "",
+                            project_id=proj_id,
+                            run_id=r_id,
+                            remote_file_id=remote_fid,
+                            md5=rem_md5,
+                        )
+                except Exception:
+                    pass
+
         if not meta or not meta.remote_file_id:
             raise ArtifactNotFoundError(f"Artifact '{artifact_id}' not found in Google Drive registry.")
 
@@ -1439,7 +1786,7 @@ class GoogleDriveArtifactStore:
                 )
                 if status != 200:
                     raise DriveTransferError(f"Failed to download Drive file '{meta.remote_file_id}' (HTTP {status})")
-                downloaded_sha256 = compute_file_sha256(tmp)
+                downloaded_sha256 = self.compute_sha256(tmp)
             else:
                 # Fallback streaming write with bounded buffer and incremental hash
                 status, headers, body = self._request_with_retry("GET", download_url)
@@ -1461,9 +1808,10 @@ class GoogleDriveArtifactStore:
                 downloaded_sha256 = hasher.hexdigest()
 
             # Verify integrity
-            if downloaded_sha256.lower() != meta.sha256.lower():
+            target_sha = expected_sha256 or meta.sha256
+            if target_sha and downloaded_sha256.lower() != target_sha.lower():
                 raise DriveIntegrityError(
-                    f"Retrieved Drive artifact hash mismatch: recorded {meta.sha256}, got {downloaded_sha256}"
+                    f"Retrieved Drive artifact hash mismatch: recorded {target_sha}, got {downloaded_sha256}"
                 )
             if meta.size_bytes and downloaded_bytes != meta.size_bytes:
                 raise DriveIntegrityError(
@@ -1488,22 +1836,36 @@ class GoogleDriveArtifactStore:
 
     def exists(self, artifact_id: str) -> bool:
         meta = self.get_metadata(artifact_id)
-        return meta is not None and meta.remote_file_id is not None
+        if meta is not None and meta.remote_file_id is not None:
+            return True
+        # If not in manifest, fallback to check remote Drive folder
+        parts = artifact_id.split("@sha256_")[0].split("/")
+        if len(parts) >= 3:
+            proj_id, r_id = parts[0], parts[1]
+            fname = parts[-1]
+            sub_f = parts[2] if len(parts) > 3 else None
+            try:
+                f_id = self.resolve_target_folder_id(proj_id, r_id, sub_f)
+                remote_file = self._find_file_in_folder(fname, f_id, allow_revision_mismatch=True)
+                return remote_file is not None and remote_file.get("id") is not None
+            except Exception:
+                return False
+        return False
 
     def get_metadata(self, artifact_id: str) -> Optional[StoredArtifact]:
-        parts = artifact_id.split("/")
+        parts = artifact_id.split("@sha256_")[0].split("/")
         if len(parts) < 3:
             return None
         project_id, run_id = parts[0], parts[1]
         m_key = (project_id, run_id)
-        if m_key in self._manifest_cache:
-            return self._manifest_cache[m_key].get_artifact(artifact_id)
 
         local_m = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
         if local_m.exists():
             manifest = PublicationManifest.load(local_m)
             self._manifest_cache[m_key] = manifest
-            return manifest.get_artifact(artifact_id)
+            return self._resolve_artifact_from_manifest(manifest, artifact_id)
+        elif m_key in self._manifest_cache:
+            return self._resolve_artifact_from_manifest(self._manifest_cache[m_key], artifact_id)
         return None
 
     def list_artifacts(
@@ -1513,13 +1875,13 @@ class GoogleDriveArtifactStore:
     ) -> List[StoredArtifact]:
         if run_id:
             m_key = (project_id, run_id)
-            if m_key in self._manifest_cache:
-                return self._manifest_cache[m_key].list_artifacts()
             local_m = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
             if local_m.exists():
                 manifest = PublicationManifest.load(local_m)
                 self._manifest_cache[m_key] = manifest
                 return manifest.list_artifacts()
+            elif m_key in self._manifest_cache:
+                return self._manifest_cache[m_key].list_artifacts()
             return []
 
         # All runs
