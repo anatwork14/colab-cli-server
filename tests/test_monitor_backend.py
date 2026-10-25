@@ -23,6 +23,7 @@ import hmac
 import io
 import json
 import os
+import re
 import shutil
 import ssl
 import subprocess
@@ -652,6 +653,185 @@ class TestMonitorBackend(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 urllib.request.urlopen(req3)
             self.assertEqual(ctx.exception.code, 401)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+    def test_get_root_strict_csp_and_per_response_cryptographic_nonce(self):
+        """GET / returns 200 OK with strict CSP (zero 'unsafe-inline'), matching script/style nonce, and distinct per-response nonces."""
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            registry=self.registry,
+            telemetry=self.telemetry,
+            collector=AccountUsageCollector(ledger_path=self.ledger_path),
+            auth_token=self.auth_token,
+        )
+        port = server.server_port
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            # 1. First request to GET /
+            req1 = urllib.request.Request(f"{base_url}/")
+            with urllib.request.urlopen(req1) as resp1:
+                self.assertEqual(resp1.status, 200)
+                csp1 = resp1.headers.get("Content-Security-Policy", "")
+                content_type1 = resp1.headers.get("Content-Type", "")
+                self.assertIn("text/html", content_type1)
+
+                # Strict CSP verification: no 'unsafe-inline' anywhere
+                self.assertNotIn("'unsafe-inline'", csp1)
+                self.assertIn("object-src 'none'", csp1)
+                self.assertIn("base-uri 'none'", csp1)
+                self.assertIn("frame-ancestors 'none'", csp1)
+
+                # Extract nonce from script-src
+                match1 = re.search(r"script-src\s+[^;]*'nonce-([A-Za-z0-9_-]+)'", csp1)
+                self.assertIsNotNone(match1, f"CSP header did not contain expected script-src nonce directive: {csp1}")
+                nonce1 = match1.group(1)
+                self.assertGreaterEqual(len(nonce1), 16)
+
+                # Verify style-src also contains the exact nonce
+                self.assertIn(f"'nonce-{nonce1}'", csp1)
+
+                # Verify HTML body contains <script nonce="..."> and <style nonce="..."> matching exact nonce
+                body1 = resp1.read().decode("utf-8")
+                self.assertIn(f'<script nonce="{nonce1}"', body1)
+                self.assertIn(f'<style nonce="{nonce1}"', body1)
+                self.assertNotIn("__CSP_NONCE__", body1)
+
+            # 2. Second request to GET /
+            req2 = urllib.request.Request(f"{base_url}/")
+            with urllib.request.urlopen(req2) as resp2:
+                self.assertEqual(resp2.status, 200)
+                csp2 = resp2.headers.get("Content-Security-Policy", "")
+
+                self.assertNotIn("'unsafe-inline'", csp2)
+                self.assertIn("object-src 'none'", csp2)
+                self.assertIn("base-uri 'none'", csp2)
+                self.assertIn("frame-ancestors 'none'", csp2)
+
+                match2 = re.search(r"script-src\s+[^;]*'nonce-([A-Za-z0-9_-]+)'", csp2)
+                self.assertIsNotNone(match2)
+                nonce2 = match2.group(1)
+
+                body2 = resp2.read().decode("utf-8")
+                self.assertIn(f'<script nonce="{nonce2}"', body2)
+                self.assertIn(f'<style nonce="{nonce2}"', body2)
+
+                # Two consecutive requests must generate distinct cryptographic nonces
+                self.assertNotEqual(nonce1, nonce2, f"Consecutive requests reused the same nonce: {nonce1}")
+
+            # 3. GET /index.html also serves strict CSP and per-response nonce
+            req3 = urllib.request.Request(f"{base_url}/index.html")
+            with urllib.request.urlopen(req3) as resp3:
+                self.assertEqual(resp3.status, 200)
+                csp3 = resp3.headers.get("Content-Security-Policy", "")
+                self.assertNotIn("'unsafe-inline'", csp3)
+                match3 = re.search(r"script-src\s+[^;]*'nonce-([A-Za-z0-9_-]+)'", csp3)
+                self.assertIsNotNone(match3)
+                nonce3 = match3.group(1)
+                self.assertNotEqual(nonce1, nonce3)
+                self.assertNotEqual(nonce2, nonce3)
+                body3 = resp3.read().decode("utf-8")
+                self.assertIn(f'<script nonce="{nonce3}"', body3)
+                self.assertIn(f'<style nonce="{nonce3}"', body3)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_static_assets_monitor_js_and_css(self):
+        """GET /monitor.js and /monitor.css return 200 OK with proper Content-Type and X-Content-Type-Options: nosniff."""
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            registry=self.registry,
+            telemetry=self.telemetry,
+            collector=AccountUsageCollector(ledger_path=self.ledger_path),
+            auth_token=self.auth_token,
+        )
+        port = server.server_port
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            # 1. GET /monitor.js
+            req_js = urllib.request.Request(f"{base_url}/monitor.js")
+            with urllib.request.urlopen(req_js) as resp_js:
+                self.assertEqual(resp_js.status, 200)
+                ct_js = resp_js.headers.get("Content-Type", "")
+                self.assertIn("application/javascript", ct_js)
+                self.assertIn("charset=utf-8", ct_js)
+                self.assertEqual(resp_js.headers.get("X-Content-Type-Options"), "nosniff")
+                self.assertEqual(resp_js.headers.get("X-Frame-Options"), "DENY")
+                csp_js = resp_js.headers.get("Content-Security-Policy", "")
+                self.assertNotIn("'unsafe-inline'", csp_js)
+                self.assertIn("object-src 'none'", csp_js)
+                js_content = resp_js.read().decode("utf-8")
+                self.assertGreater(len(js_content), 0)
+
+            # 2. GET /monitor.css
+            req_css = urllib.request.Request(f"{base_url}/monitor.css")
+            with urllib.request.urlopen(req_css) as resp_css:
+                self.assertEqual(resp_css.status, 200)
+                ct_css = resp_css.headers.get("Content-Type", "")
+                self.assertIn("text/css", ct_css)
+                self.assertIn("charset=utf-8", ct_css)
+                self.assertEqual(resp_css.headers.get("X-Content-Type-Options"), "nosniff")
+                self.assertEqual(resp_css.headers.get("X-Frame-Options"), "DENY")
+                csp_css = resp_css.headers.get("Content-Security-Policy", "")
+                self.assertNotIn("'unsafe-inline'", csp_css)
+                self.assertIn("object-src 'none'", csp_css)
+                css_content = resp_css.read().decode("utf-8")
+                self.assertGreater(len(css_content), 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_non_html_and_api_responses_strict_csp_without_unsafe_inline(self):
+        """API endpoints and SSE streams send strict CSP without 'unsafe-inline'."""
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            registry=self.registry,
+            telemetry=self.telemetry,
+            collector=AccountUsageCollector(ledger_path=self.ledger_path),
+            auth_token=self.auth_token,
+        )
+        port = server.server_port
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            # 1. JSON endpoint (/api/v1/summary)
+            req = urllib.request.Request(
+                f"{base_url}/api/v1/summary",
+                headers={"Authorization": f"Bearer {self.auth_token}"},
+            )
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+                csp = resp.headers.get("Content-Security-Policy", "")
+                self.assertNotIn("'unsafe-inline'", csp)
+                self.assertIn("script-src 'self'", csp)
+                self.assertIn("object-src 'none'", csp)
+                self.assertIn("base-uri 'none'", csp)
+                self.assertIn("frame-ancestors 'none'", csp)
+
+            # 2. CSV export endpoint
+            req_csv = urllib.request.Request(
+                f"{base_url}/api/v1/export/compute.csv",
+                headers={"Authorization": f"Bearer {self.auth_token}"},
+            )
+            with urllib.request.urlopen(req_csv) as resp_csv:
+                self.assertEqual(resp_csv.status, 200)
+                csp_csv = resp_csv.headers.get("Content-Security-Policy", "")
+                self.assertNotIn("'unsafe-inline'", csp_csv)
+                self.assertIn("object-src 'none'", csp_csv)
         finally:
             server.shutdown()
             server.server_close()
