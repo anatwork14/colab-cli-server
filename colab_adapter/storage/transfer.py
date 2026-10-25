@@ -6,9 +6,13 @@ Tracks resumable upload sessions, byte offsets, retries, and errors with atomic 
 """
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
 import logging
 import os
+import re
+import secrets
 import shutil
 import stat
 import threading
@@ -19,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 try:
     import fcntl
@@ -88,6 +92,10 @@ class TransferRecord:
     created_at: str = field(default_factory=_utc_now_iso)
     updated_at: str = field(default_factory=_utc_now_iso)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    owner_pid: Optional[int] = None
+    lease_token: Optional[str] = None
+    lease_expires_at: Optional[float] = None
+    fencing_epoch: int = 0
 
     def transition_to(self, new_status: TransferStatus, error_message: Optional[str] = None) -> None:
         """Enforce valid state transition."""
@@ -122,14 +130,35 @@ class TransferRecord:
             "target_rel_path", "size_bytes", "sha256", "status", "md5",
             "resumable_session_url", "bytes_transferred", "remote_file_id",
             "retry_count", "max_retries", "next_retry_at", "last_error",
-            "created_at", "updated_at", "metadata"
+            "created_at", "updated_at", "metadata",
+            "owner_pid", "lease_token", "lease_expires_at", "fencing_epoch",
         }
         filtered = {k: v for k, v in data.items() if k in valid}
         return cls(**filtered)
 
 
+def _is_pid_alive(pid: Optional[int]) -> bool:
+    """Check if process with given PID is currently running."""
+    if pid is None or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
 class TransferJournal:
     """Persistent, cross-process and thread-safe store for transfer records."""
+
+    _lock_registry: Dict[Tuple[str, str], threading.RLock] = {}
+    _lock_registry_lock = threading.Lock()
+    _local_state = threading.local()
+    _is_pid_alive = staticmethod(_is_pid_alive)
 
     def __init__(self, journal_path: Union[str, Path]):
         self.path = Path(journal_path).resolve()
@@ -296,4 +325,153 @@ class TransferJournal:
                     results.append(rec)
             results.sort(key=lambda r: (r.created_at, r.transfer_id))
             return results
+
+    @contextlib.contextmanager
+    def acquire_named_lock(self, lock_name: str, timeout: float = 30.0) -> Iterator[Path]:
+        """Cross-process and re-entrant thread lock for a named resource."""
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(lock_name))
+        locks_dir = self.path.parent / ".transfer_locks"
+        locks_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(str(locks_dir), 0o700)
+        except OSError:
+            pass
+
+        key = (str(locks_dir.resolve()), safe_id)
+        lock_path = locks_dir / f"{safe_id}.lock"
+
+        local_held = getattr(TransferJournal._local_state, "held_locks", None)
+        if local_held is None:
+            local_held = {}
+            TransferJournal._local_state.held_locks = local_held
+
+        if key in local_held and local_held[key]["depth"] > 0:
+            local_held[key]["depth"] += 1
+            try:
+                yield lock_path
+            finally:
+                local_held[key]["depth"] -= 1
+            return
+
+        start_time = time.monotonic()
+        with TransferJournal._lock_registry_lock:
+            if key not in TransferJournal._lock_registry:
+                TransferJournal._lock_registry[key] = threading.RLock()
+            rlock = TransferJournal._lock_registry[key]
+
+        remaining = timeout - (time.monotonic() - start_time)
+        if not rlock.acquire(timeout=max(0.0, remaining)):
+            raise TimeoutError(f"Timed out acquiring thread lock for '{lock_name}' after {timeout:.1f}s")
+
+        fd = None
+        flocked = False
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                os.chmod(str(lock_path), 0o600)
+            except OSError:
+                pass
+
+            poll_interval = 0.05
+            while True:
+                if fcntl is None:
+                    flocked = True
+                    break
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    flocked = True
+                    break
+                except (BlockingIOError, OSError) as e:
+                    if isinstance(e, BlockingIOError) or getattr(e, "errno", None) in (
+                        errno.EAGAIN,
+                        errno.EWOULDBLOCK,
+                        errno.EACCES,
+                    ):
+                        elapsed = time.monotonic() - start_time
+                        if elapsed >= timeout:
+                            raise TimeoutError(
+                                f"Timed out acquiring cross-process lock on {lock_path} for '{lock_name}' after {timeout:.1f}s"
+                            ) from e
+                        sleep_time = min(poll_interval, max(0.005, timeout - elapsed))
+                        time.sleep(sleep_time)
+                    else:
+                        raise
+
+            local_held[key] = {"depth": 1, "fd": fd}
+            try:
+                yield lock_path
+            finally:
+                local_held.pop(key, None)
+        finally:
+            if flocked and fcntl is not None and fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            rlock.release()
+
+    @contextlib.contextmanager
+    def acquire_artifact_lock(self, transfer_id: str, timeout: float = 30.0) -> Iterator[Path]:
+        """Cross-process and re-entrant exclusive lock for an individual artifact transfer."""
+        with self.acquire_named_lock(f"artifact-{transfer_id}", timeout=timeout) as p:
+            yield p
+
+    def claim_transfer_lease(
+        self,
+        transfer_id: str,
+        lease_duration_sec: float = 300.0,
+        expected_sha256: Optional[str] = None,
+    ) -> Tuple[bool, Optional[TransferRecord], str]:
+        """Atomically claim durable lease on a transfer record with fencing."""
+        with self._acquire_locks():
+            records = self._read_records()
+            raw = records.get(transfer_id)
+            rec = TransferRecord.from_dict(raw) if raw else None
+
+            # If already published with matching sha256, refuse claim
+            if rec is not None and rec.status in (TransferStatus.PUBLISHED, TransferStatus.PUBLISHED.value) and rec.remote_file_id:
+                if expected_sha256 is None or not rec.sha256 or rec.sha256.lower() == expected_sha256.lower():
+                    return (False, rec, "")
+
+            # Check if record exists and has an active lease held by another live process
+            now = time.time()
+            if rec is not None and rec.lease_token and rec.lease_expires_at and rec.lease_expires_at > now:
+                if _is_pid_alive(rec.owner_pid) and rec.owner_pid != os.getpid():
+                    return (False, rec, "")
+
+            lease_token = secrets.token_hex(12)
+            fencing_epoch = (rec.fencing_epoch if rec else 0) + 1
+
+            if rec is not None:
+                rec.owner_pid = os.getpid()
+                rec.lease_token = lease_token
+                rec.lease_expires_at = now + lease_duration_sec
+                rec.fencing_epoch = fencing_epoch
+                rec.updated_at = _utc_now_iso()
+                records[transfer_id] = rec.to_dict()
+                self._write_records(records)
+                return (True, rec, lease_token)
+            else:
+                return (True, None, lease_token)
+
+    def release_transfer_lease(self, transfer_id: str, lease_token: Optional[str] = None) -> None:
+        """Release active transfer lease under lock."""
+        with self._acquire_locks():
+            records = self._read_records()
+            raw = records.get(transfer_id)
+            if not raw:
+                return
+            rec = TransferRecord.from_dict(raw)
+            if lease_token is None or rec.lease_token == lease_token:
+                rec.lease_token = None
+                rec.lease_expires_at = None
+                rec.owner_pid = None
+                rec.updated_at = _utc_now_iso()
+                records[transfer_id] = rec.to_dict()
+                self._write_records(records)
 
