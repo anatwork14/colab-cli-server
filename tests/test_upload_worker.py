@@ -2,8 +2,12 @@
 
 Part of Colab V2 Cross-Device Workspaces & Google Drive (Issue #21).
 """
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -277,6 +281,294 @@ class TestUploadWorker(unittest.TestCase):
         # Journal record should reflect new size and status
         record = self.journal.get_transfer("mock_cloud-p1-r1-evolving_ckpt.pt")
         self.assertEqual(record.size_bytes, len(b"VERSION_2_UPDATED_LARGER_DATA"))
+
+    def test_acquire_artifact_lock_reentrancy_and_blocking_and_cleanup(self):
+        """acquire_artifact_lock is re-entrant within thread, blocks threads/processes, and cleans up."""
+        # 1. Re-entrancy within the same thread
+        with self.journal.acquire_artifact_lock("transfer_reentrant", timeout=5.0) as p1:
+            with self.journal.acquire_artifact_lock("transfer_reentrant", timeout=5.0) as p2:
+                with self.journal.acquire_artifact_lock("transfer_reentrant", timeout=5.0) as p3:
+                    self.assertEqual(p1, p2)
+                    self.assertEqual(p2, p3)
+                    self.assertTrue(p1.exists())
+                    # Permissions on lock file must be 0600
+                    mode = p1.stat().st_mode & 0o777
+                    self.assertEqual(mode, 0o600)
+
+        # Check cleanup of thread-local state
+        held = getattr(TransferJournal._local_state, "held_locks", {})
+        key = (str((self.journal.path.parent / ".transfer_locks").resolve()), "artifact-transfer_reentrant")
+        self.assertNotIn(key, held)
+
+        # 2. Blocks concurrent threads in the same process
+        thread_started = threading.Event()
+        thread_release = threading.Event()
+        thread_error: List[Exception] = []
+
+        def holding_thread():
+            try:
+                with self.journal.acquire_artifact_lock("transfer_thread_block", timeout=5.0):
+                    thread_started.set()
+                    thread_release.wait(timeout=5.0)
+            except Exception as ex:
+                thread_error.append(ex)
+
+        t = threading.Thread(target=holding_thread)
+        t.start()
+        self.assertTrue(thread_started.wait(timeout=3.0))
+
+        # Main thread attempts to acquire same lock; must time out
+        with self.assertRaises(TimeoutError):
+            with self.journal.acquire_artifact_lock("transfer_thread_block", timeout=0.2):
+                pass
+
+        # Release thread and join
+        thread_release.set()
+        t.join(timeout=3.0)
+        self.assertEqual(len(thread_error), 0)
+
+        # Main thread can now acquire without timeout
+        with self.journal.acquire_artifact_lock("transfer_thread_block", timeout=2.0) as p:
+            self.assertTrue(p.exists())
+
+        # 3. Blocks concurrent separate OS processes
+        child_code = (
+            "import sys, time\n"
+            "from colab_adapter.storage import TransferJournal\n"
+            "j = TransferJournal(sys.argv[1])\n"
+            "with j.acquire_artifact_lock('transfer_proc_block', timeout=5.0):\n"
+            "    sys.stdout.write('LOCKED\\n')\n"
+            "    sys.stdout.flush()\n"
+            "    sys.stdin.readline()\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child_code, str(self.journal_file)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            line = proc.stdout.readline().strip()
+            self.assertEqual(line, "LOCKED")
+
+            # Main process attempts to acquire; must time out due to cross-process flock
+            with self.assertRaises(TimeoutError):
+                with self.journal.acquire_artifact_lock("transfer_proc_block", timeout=0.2):
+                    pass
+
+            # Signal child process to release lock
+            proc.stdin.write("DONE\n")
+            proc.stdin.flush()
+            proc.wait(timeout=3.0)
+
+            # Main process can now acquire cleanly
+            with self.journal.acquire_artifact_lock("transfer_proc_block", timeout=2.0) as p:
+                self.assertTrue(p.exists())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream and not stream.closed:
+                    stream.close()
+
+    def test_claim_transfer_lease_and_fencing(self):
+        """claim_transfer_lease enforces live PID exclusion, detects PUBLISHED, and reclaims dead PIDs."""
+        # 1. Exclusion of duplicate claims across live PIDs
+        sub = subprocess.Popen(["sleep", "10"])
+        try:
+            rec_live = TransferRecord(
+                transfer_id="t_live",
+                project_id="p1",
+                run_id="r1",
+                artifact_id="p1/r1/ckpt.pt",
+                local_path=str(Path(self.test_dir) / "dummy.pt"),
+                target_rel_path="checkpoints/dummy.pt",
+                size_bytes=100,
+                sha256="hash123",
+                status=TransferStatus.UPLOADING.value,
+                owner_pid=sub.pid,
+                lease_token="live_token_123",
+                lease_expires_at=time.time() + 300.0,
+                fencing_epoch=1,
+            )
+            self.journal.record_transfer(rec_live)
+
+            claimed, existing, tok = self.journal.claim_transfer_lease("t_live")
+            self.assertFalse(claimed)
+            self.assertEqual(tok, "")
+            self.assertIsNotNone(existing)
+            self.assertEqual(existing.owner_pid, sub.pid)
+            self.assertEqual(existing.lease_token, "live_token_123")
+        finally:
+            sub.terminate()
+            sub.wait()
+
+        # 2. Detects already-PUBLISHED records with matching sha256
+        rec_pub = TransferRecord(
+            transfer_id="t_pub",
+            project_id="p1",
+            run_id="r1",
+            artifact_id="p1/r1/pub.pt",
+            local_path=str(Path(self.test_dir) / "pub.pt"),
+            target_rel_path="checkpoints/pub.pt",
+            size_bytes=200,
+            sha256="known_sha_abc",
+            status=TransferStatus.PUBLISHED.value,
+            remote_file_id="drive_file_id_xyz",
+        )
+        self.journal.record_transfer(rec_pub)
+
+        claimed, existing, tok = self.journal.claim_transfer_lease("t_pub", expected_sha256="known_sha_abc")
+        self.assertFalse(claimed)
+        self.assertEqual(tok, "")
+        self.assertIsNotNone(existing)
+        self.assertEqual(existing.status, TransferStatus.PUBLISHED.value)
+        self.assertEqual(existing.remote_file_id, "drive_file_id_xyz")
+
+        # 3. Immediately reclaims leases held by dead PIDs (owner_pid = 99999999)
+        rec_dead = TransferRecord(
+            transfer_id="t_dead",
+            project_id="p1",
+            run_id="r1",
+            artifact_id="p1/r1/dead.pt",
+            local_path=str(Path(self.test_dir) / "dead.pt"),
+            target_rel_path="checkpoints/dead.pt",
+            size_bytes=300,
+            sha256="dead_sha",
+            status=TransferStatus.UPLOADING.value,
+            owner_pid=99999999,
+            lease_token="stale_token_dead",
+            lease_expires_at=time.time() + 300.0,
+            fencing_epoch=2,
+        )
+        self.journal.record_transfer(rec_dead)
+
+        claimed, updated, tok = self.journal.claim_transfer_lease("t_dead")
+        self.assertTrue(claimed)
+        self.assertNotEqual(tok, "stale_token_dead")
+        self.assertEqual(updated.owner_pid, os.getpid())
+        self.assertEqual(updated.lease_token, tok)
+        self.assertEqual(updated.fencing_epoch, 3)
+
+        # Release lease and verify clearance in journal
+        self.journal.release_transfer_lease("t_dead", tok)
+        refreshed = self.journal.get_transfer("t_dead")
+        self.assertIsNone(refreshed.lease_token)
+        self.assertIsNone(refreshed.lease_expires_at)
+        self.assertIsNone(refreshed.owner_pid)
+
+    def test_two_workers_concurrent_upload_executes_publish_only_once(self):
+        """Two ArtifactUploadWorker instances running concurrently on the same artifact publish only once."""
+        store = MockStoreForWorker()
+        successes_1: List[StoredArtifact] = []
+        successes_2: List[StoredArtifact] = []
+
+        worker_1 = ArtifactUploadWorker(
+            store=store,
+            journal=self.journal,
+            max_workers=1,
+            on_success=lambda a: successes_1.append(a),
+        )
+        worker_2 = ArtifactUploadWorker(
+            store=store,
+            journal=self.journal,
+            max_workers=1,
+            on_success=lambda a: successes_2.append(a),
+        )
+
+        f = Path(self.test_dir) / "concurrent_ckpt.pt"
+        f.write_bytes(b"CONCURRENT_SHARED_PAYLOAD")
+
+        # Both workers enqueue the exact same artifact
+        worker_1.enqueue(f, project_id="p_shared", run_id="r_shared")
+        worker_2.enqueue(f, project_id="p_shared", run_id="r_shared")
+
+        worker_1.start()
+        worker_2.start()
+        self.addCleanup(worker_1.stop)
+        self.addCleanup(worker_2.stop)
+
+        self.assertTrue(worker_1.wait_for_completion(timeout=5.0))
+        self.assertTrue(worker_2.wait_for_completion(timeout=5.0))
+
+        # Under concurrency, store.publish must have been executed exactly ONCE
+        self.assertEqual(
+            len(store.published),
+            1,
+            f"Expected store.publish called exactly once, but got {len(store.published)}",
+        )
+        self.assertGreaterEqual(len(successes_1) + len(successes_2), 1)
+
+        # Journal record must be PUBLISHED
+        transfer_id = f"mock_cloud-p_shared-r_shared-concurrent_ckpt.pt"
+        record = self.journal.get_transfer(transfer_id)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.status, TransferStatus.PUBLISHED.value)
+        self.assertIsNotNone(record.remote_file_id)
+
+    def test_worker_recovery_skips_live_pid_lease_and_recovers_dead_pid(self):
+        """recover_from_journal skips records held by live PIDs and immediately recovers dead PIDs."""
+        sub = subprocess.Popen(["sleep", "10"])
+        try:
+            f_live = Path(self.test_dir) / "live_active.pt"
+            f_live.write_bytes(b"LIVE_ACTIVE")
+            rec_live = TransferRecord(
+                transfer_id="mock_cloud-p1-r1-live_active.pt",
+                project_id="p1",
+                run_id="r1",
+                artifact_id="p1/r1/live_active.pt",
+                local_path=str(f_live),
+                target_rel_path="checkpoints/live_active.pt",
+                size_bytes=f_live.stat().st_size,
+                sha256="sha_live",
+                status=TransferStatus.UPLOADING.value,
+                owner_pid=sub.pid,
+                lease_token="live_token_xyz",
+                lease_expires_at=time.time() + 300.0,
+            )
+            self.journal.record_transfer(rec_live)
+
+            f_dead = Path(self.test_dir) / "dead_abandoned.pt"
+            f_dead.write_bytes(b"DEAD_ABANDONED")
+            rec_dead = TransferRecord(
+                transfer_id="mock_cloud-p1-r1-dead_abandoned.pt",
+                project_id="p1",
+                run_id="r1",
+                artifact_id="p1/r1/dead_abandoned.pt",
+                local_path=str(f_dead),
+                target_rel_path="checkpoints/dead_abandoned.pt",
+                size_bytes=f_dead.stat().st_size,
+                sha256="sha_dead",
+                status=TransferStatus.UPLOADING.value,
+                owner_pid=99999999,
+                lease_token="dead_token_xyz",
+                lease_expires_at=time.time() + 300.0,
+            )
+            self.journal.record_transfer(rec_dead)
+
+            store = MockStoreForWorker()
+            worker = ArtifactUploadWorker(store=store, journal=self.journal, max_workers=1)
+
+            # Check queue inside worker: dead abandoned should be enqueued, live active should be skipped
+            with worker._lock:
+                queued = set(worker._queued_ids)
+
+            self.assertIn("mock_cloud-p1-r1-dead_abandoned.pt", queued)
+            self.assertNotIn("mock_cloud-p1-r1-live_active.pt", queued)
+
+            # Start worker and ensure dead abandoned is processed
+            worker.start()
+            self.addCleanup(worker.stop)
+            self.assertTrue(worker.wait_for_completion(timeout=3.0))
+
+            published_ids = [a.artifact_id for a in store.published]
+            self.assertIn("p1/r1/dead_abandoned.pt", published_ids)
+            self.assertNotIn("p1/r1/live_active.pt", published_ids)
+        finally:
+            sub.terminate()
+            sub.wait()
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ per-file retries with backoff, and strict isolation from training job execution 
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import random
 import threading
@@ -22,9 +23,11 @@ from ..errors import (
 from ..tracker import sanitize_text
 from .base import ArtifactStore, ArtifactType, StoredArtifact
 from .manifest import compute_file_md5, compute_file_sha256
-from .transfer import TransferJournal, TransferRecord, TransferStatus
+from .transfer import TransferJournal, TransferRecord, TransferStatus, _is_pid_alive
 
 logger = logging.getLogger(__name__)
+
+UploadTask = TransferRecord
 
 
 class ArtifactUploadWorker:
@@ -55,7 +58,7 @@ class ArtifactUploadWorker:
         self._lock = threading.Lock()
 
         # Load pending or interrupted transfers from persistent journal
-        self._recover_pending_transfers()
+        self.recover_from_journal()
 
     def _is_enqueued_or_active(self, transfer_id: str) -> bool:
         """Check whether transfer is queued, active, or in scheduled retries. Must hold self._lock."""
@@ -65,21 +68,40 @@ class ArtifactUploadWorker:
             or any(r.transfer_id == transfer_id for r in self._scheduled_retries)
         )
 
-    def _recover_pending_transfers(self) -> None:
-        """Scan persistent journal and re-enqueue any pending or in-flight transfers."""
+    def recover_from_journal(self) -> None:
+        """Scan persistent journal and recover pending transfers with lease fencing."""
         pending = self.journal.get_pending_transfers()
+        now = time.time()
         with self._lock:
             for record in pending:
-                # If it was interrupted while UPLOADING, transition back to RETRY_PENDING or UPLOAD_PENDING
+                # Skip records whose lease is actively held by another live PID
+                is_held_by_other_live_pid = bool(
+                    record.lease_token
+                    and record.lease_expires_at
+                    and record.lease_expires_at > now
+                    and _is_pid_alive(record.owner_pid)
+                    and record.owner_pid != os.getpid()
+                )
+                if is_held_by_other_live_pid:
+                    continue
+
+                # Immediately recover records whose owner_pid is dead or lease has expired
                 if record.status == TransferStatus.UPLOADING.value:
                     try:
                         record.transition_to(TransferStatus.RETRY_PENDING, error_message="Worker restarted during upload")
+                        record.lease_token = None
+                        record.lease_expires_at = None
+                        record.owner_pid = None
                         self.journal.record_transfer(record)
                     except Exception:
                         pass
                 if not self._is_enqueued_or_active(record.transfer_id):
                     self._queued_ids.add(record.transfer_id)
                     self._queue.put(record)
+
+    def _recover_pending_transfers(self) -> None:
+        """Alias for recover_from_journal."""
+        self.recover_from_journal()
 
     def start(self) -> None:
         """Start worker background threads."""
@@ -184,6 +206,109 @@ class ArtifactUploadWorker:
 
         return record
 
+    def _process_task(self, task: UploadTask) -> bool:
+        """Process an individual upload task with cross-process artifact locking and lease fencing."""
+        src_path = Path(task.local_path)
+        local_sha256: Optional[str] = None
+        if src_path.is_file():
+            local_sha256 = compute_file_sha256(src_path)
+            if task.sha256 and len(task.sha256) == 64 and local_sha256.lower() != task.sha256.lower():
+                raise ArtifactValidationError(
+                    f"Local artifact modified before publication: expected {task.sha256}, got {local_sha256}"
+                )
+
+        with self.journal.acquire_artifact_lock(task.transfer_id, timeout=60.0):
+            existing = self.journal.get_transfer(task.transfer_id)
+            if (
+                existing is not None
+                and existing.status in (TransferStatus.PUBLISHED, TransferStatus.PUBLISHED.value)
+                and existing.remote_file_id
+                and (not local_sha256 or not existing.sha256 or existing.sha256.lower() == local_sha256.lower())
+            ):
+                logger.info(
+                    "Artifact %s was already published by another worker/process; skipping upload.",
+                    task.transfer_id,
+                )
+                if self.on_success:
+                    stored = StoredArtifact(
+                        artifact_id=existing.artifact_id,
+                        storage_provider=self.store.provider_name,
+                        path=existing.local_path,
+                        size_bytes=existing.size_bytes,
+                        sha256=existing.sha256,
+                        project_id=existing.project_id,
+                        run_id=existing.run_id,
+                        artifact_type=existing.metadata.get("artifact_type", ArtifactType.CHECKPOINT.value) if existing.metadata else ArtifactType.CHECKPOINT.value,
+                        remote_file_id=existing.remote_file_id,
+                    )
+                    self.on_success(stored)
+                return True
+
+            claimed, existing_rec, lease_token = self.journal.claim_transfer_lease(
+                task.transfer_id,
+                expected_sha256=local_sha256,
+            )
+            if not claimed:
+                if existing_rec and existing_rec.status in (TransferStatus.PUBLISHED, TransferStatus.PUBLISHED.value):
+                    logger.info(
+                        "Artifact %s was already published by another worker/process; skipping upload.",
+                        task.transfer_id,
+                    )
+                    if self.on_success:
+                        stored = StoredArtifact(
+                            artifact_id=existing_rec.artifact_id,
+                            storage_provider=self.store.provider_name,
+                            path=existing_rec.local_path,
+                            size_bytes=existing_rec.size_bytes,
+                            sha256=existing_rec.sha256,
+                            project_id=existing_rec.project_id,
+                            run_id=existing_rec.run_id,
+                            artifact_type=existing_rec.metadata.get("artifact_type", ArtifactType.CHECKPOINT.value) if existing_rec.metadata else ArtifactType.CHECKPOINT.value,
+                            remote_file_id=existing_rec.remote_file_id,
+                        )
+                        self.on_success(stored)
+                    return True
+                logger.info(
+                    "Transfer %s lease held by another live process (pid %s)",
+                    task.transfer_id,
+                    getattr(existing_rec, "owner_pid", None),
+                )
+                return False
+
+            if not src_path.is_file():
+                raise ArtifactValidationError(f"Local artifact source file missing: {task.local_path}")
+
+            try:
+                stored = self.store.publish(
+                    source=task.local_path,
+                    project_id=task.project_id,
+                    run_id=task.run_id,
+                    artifact_type=task.metadata.get("artifact_type", ArtifactType.CHECKPOINT.value) if task.metadata else ArtifactType.CHECKPOINT.value,
+                    metadata=task.metadata,
+                    expected_sha256=local_sha256 or task.sha256,
+                )
+
+                # Ensure transfer record is transitioned to PUBLISHED if store did not do so
+                refreshed = self.journal.get_transfer(task.transfer_id)
+                if refreshed and refreshed.status != TransferStatus.PUBLISHED.value:
+                    if refreshed.status == TransferStatus.LOCAL_VERIFIED.value:
+                        refreshed.transition_to(TransferStatus.UPLOAD_PENDING)
+                    if refreshed.status == TransferStatus.UPLOAD_PENDING.value:
+                        refreshed.transition_to(TransferStatus.UPLOADING)
+                    if refreshed.status == TransferStatus.UPLOADING.value:
+                        refreshed.transition_to(TransferStatus.DRIVE_VERIFIED)
+                    if refreshed.status == TransferStatus.DRIVE_VERIFIED.value:
+                        refreshed.transition_to(TransferStatus.PUBLISHED)
+                    if stored.remote_file_id:
+                        refreshed.remote_file_id = stored.remote_file_id
+                    self.journal.record_transfer(refreshed)
+
+                if self.on_success:
+                    self.on_success(stored)
+                return True
+            finally:
+                self.journal.release_transfer_lease(task.transfer_id, lease_token)
+
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
             self._check_scheduled_retries()
@@ -200,44 +325,11 @@ class ArtifactUploadWorker:
                 self._active_transfers[record.transfer_id] = record
 
             try:
-                # Revalidate local source file integrity before publication
-                src_path = Path(record.local_path)
-                if not src_path.is_file():
-                    raise ArtifactValidationError(f"Local artifact source file missing: {record.local_path}")
-
-                current_sha256 = compute_file_sha256(src_path)
-                if record.sha256 and len(record.sha256) == 64 and current_sha256.lower() != record.sha256.lower():
-                    raise ArtifactValidationError(
-                        f"Local artifact modified before publication: expected {record.sha256}, got {current_sha256}"
-                    )
-
-                # Execute publication through store
-                stored = self.store.publish(
-                    source=record.local_path,
-                    project_id=record.project_id,
-                    run_id=record.run_id,
-                    artifact_type=record.metadata.get("artifact_type", ArtifactType.CHECKPOINT.value),
-                    metadata=record.metadata,
-                    expected_sha256=record.sha256,
-                )
-
-                # Ensure transfer record is transitioned to PUBLISHED if store did not do so
-                refreshed = self.journal.get_transfer(record.transfer_id)
-                if refreshed and refreshed.status != TransferStatus.PUBLISHED.value:
-                    if refreshed.status == TransferStatus.LOCAL_VERIFIED.value:
-                        refreshed.transition_to(TransferStatus.UPLOAD_PENDING)
-                    if refreshed.status == TransferStatus.UPLOAD_PENDING.value:
-                        refreshed.transition_to(TransferStatus.UPLOADING)
-                    if refreshed.status == TransferStatus.UPLOADING.value:
-                        refreshed.transition_to(TransferStatus.DRIVE_VERIFIED)
-                    if refreshed.status == TransferStatus.DRIVE_VERIFIED.value:
-                        refreshed.transition_to(TransferStatus.PUBLISHED)
-                    if stored.remote_file_id:
-                        refreshed.remote_file_id = stored.remote_file_id
-                    self.journal.record_transfer(refreshed)
-
-                if self.on_success:
-                    self.on_success(stored)
+                success = self._process_task(record)
+                if not success:
+                    with self._lock:
+                        record.next_retry_at = time.time() + 0.5
+                        self._scheduled_retries.append(record)
             except Exception as e:
                 err_str = sanitize_text(str(e))
                 logger.warning(f"Artifact upload failed for {record.artifact_id}: {err_str}")
