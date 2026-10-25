@@ -580,6 +580,30 @@ class GoogleDriveArtifactStore:
             return self._find_or_create_folder(subfolder, parent_id=run_folder_id)
         return run_folder_id
 
+    def _list_files_in_folder(self, filename: str, folder_id: str) -> List[Dict[str, Any]]:
+        """Query for all non-trashed files with matching name in folder."""
+        safe_name = filename.replace("'", "\\'")
+        query = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
+        encoded = urllib.parse.quote(query)
+        fields = "files(id,name,size,md5Checksum,appProperties,description,createdTime)"
+        url = f"https://www.googleapis.com/drive/v3/files?q={encoded}&fields={fields}"
+        try:
+            status, _, body = self._request_with_retry("GET", url)
+        except (DriveAuthenticationError, DriveQuotaExceededError):
+            raise
+        except Exception:
+            return []
+
+        if status != 200:
+            return []
+
+        try:
+            res = json.loads(body.decode("utf-8"))
+        except Exception:
+            return []
+
+        return res.get("files", [])
+
     def _find_file_in_folder(
         self,
         filename: str,
@@ -589,26 +613,7 @@ class GoogleDriveArtifactStore:
         allow_revision_mismatch: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Query for existing non-trashed file with matching name in folder to prevent duplicates."""
-        safe_name = filename.replace("'", "\\'")
-        query = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
-        encoded = urllib.parse.quote(query)
-        url = f"https://www.googleapis.com/drive/v3/files?q={encoded}&fields=files(id,name,size,md5Checksum)"
-        try:
-            status, _, body = self._request_with_retry("GET", url)
-        except (DriveAuthenticationError, DriveQuotaExceededError):
-            raise
-        except Exception:
-            return None
-
-        if status != 200:
-            return None
-
-        try:
-            res = json.loads(body.decode("utf-8"))
-        except Exception:
-            return None
-
-        files = res.get("files", [])
+        files = self._list_files_in_folder(filename, folder_id)
         if not files:
             return None
 
@@ -637,14 +642,17 @@ class GoogleDriveArtifactStore:
         parent_id: str,
         total_size: int,
         content_type: str = "application/octet-stream",
+        app_properties: Optional[Dict[str, str]] = None,
     ) -> str:
         """Initiate resumable upload session and return the upload URL."""
         token = self._ensure_token()
-        init_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,md5Checksum"
-        metadata = {
+        init_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,md5Checksum,appProperties"
+        metadata: Dict[str, Any] = {
             "name": filename,
             "parents": [parent_id],
         }
+        if app_properties:
+            metadata["appProperties"] = app_properties
         meta_bytes = json.dumps(metadata).encode("utf-8")
         hdrs = {
             "authorization": f"Bearer {token}",
@@ -774,6 +782,7 @@ class GoogleDriveArtifactStore:
         total_size: int,
         local_md5: str,
         transfer_record: TransferRecord,
+        app_properties: Optional[Dict[str, str]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], str, int]:
         """Recover from expired upload session (HTTP 404/410)."""
         transfer_record.resumable_session_url = None
@@ -809,7 +818,20 @@ class GoogleDriveArtifactStore:
             self.journal.record_transfer(transfer_record)
             return existing, "", total_size
 
-        new_session_url = self._initiate_resumable_upload(filename, target_folder_id, total_size)
+        if app_properties is None and transfer_record and transfer_record.sha256:
+            target_rel = transfer_record.target_rel_path or filename or ""
+            app_properties = {
+                "sha256": transfer_record.sha256.lower(),
+                "logical_path": target_rel,
+                "revision_id": f"sha256_{transfer_record.sha256.lower()}",
+                "project_id": transfer_record.project_id or "",
+                "run_id": transfer_record.run_id or "",
+                "is_latest": "true",
+            }
+
+        new_session_url = self._initiate_resumable_upload(
+            filename, target_folder_id, total_size, app_properties=app_properties
+        )
         transfer_record.resumable_session_url = new_session_url
         transfer_record.bytes_transferred = 0
         self.journal.record_transfer(transfer_record)
@@ -821,6 +843,7 @@ class GoogleDriveArtifactStore:
         target_folder_id: str,
         transfer_record: TransferRecord,
         filename: Optional[str] = None,
+        app_properties: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Perform chunked resumable upload with state updates in transfer journal."""
         src = Path(local_path).resolve()
@@ -835,6 +858,17 @@ class GoogleDriveArtifactStore:
         local_md5 = transfer_record.md5 or compute_file_md5(src)
         if not transfer_record.md5:
             transfer_record.md5 = local_md5
+
+        if app_properties is None and transfer_record and transfer_record.sha256:
+            target_rel = transfer_record.target_rel_path or filename or ""
+            app_properties = {
+                "sha256": transfer_record.sha256.lower(),
+                "logical_path": target_rel,
+                "revision_id": f"sha256_{transfer_record.sha256.lower()}",
+                "project_id": transfer_record.project_id or "",
+                "run_id": transfer_record.run_id or "",
+                "is_latest": "true",
+            }
 
         # Check if identical file already exists in target folder (idempotency)
         existing = self._find_file_in_folder(
@@ -869,7 +903,9 @@ class GoogleDriveArtifactStore:
 
         session_url = transfer_record.resumable_session_url
         if not session_url:
-            session_url = self._initiate_resumable_upload(filename, target_folder_id, total_size)
+            session_url = self._initiate_resumable_upload(
+                filename, target_folder_id, total_size, app_properties=app_properties
+            )
             transfer_record.resumable_session_url = session_url
             self.journal.record_transfer(transfer_record)
 
@@ -883,7 +919,7 @@ class GoogleDriveArtifactStore:
                 return completed_meta
             if synced_offset == -1:
                 existing_rec, session_url, uploaded_bytes = self._handle_expired_session(
-                    filename, target_folder_id, total_size, local_md5, transfer_record
+                    filename, target_folder_id, total_size, local_md5, transfer_record, app_properties=app_properties
                 )
                 if existing_rec:
                     return existing_rec
@@ -931,7 +967,7 @@ class GoogleDriveArtifactStore:
                             return final_res
                         if synced_offset == -1:
                             existing_rec, session_url, uploaded_bytes = self._handle_expired_session(
-                                filename, target_folder_id, total_size, local_md5, transfer_record
+                                filename, target_folder_id, total_size, local_md5, transfer_record, app_properties=app_properties
                             )
                             if existing_rec:
                                 return existing_rec
@@ -976,7 +1012,7 @@ class GoogleDriveArtifactStore:
                             if synced_offset < 0:
                                 # Expired session sentinel -1
                                 existing_rec, session_url, uploaded_bytes = self._handle_expired_session(
-                                    filename, target_folder_id, total_size, local_md5, transfer_record
+                                    filename, target_folder_id, total_size, local_md5, transfer_record, app_properties=app_properties
                                 )
                                 if existing_rec:
                                     return existing_rec
@@ -1016,7 +1052,7 @@ class GoogleDriveArtifactStore:
 
                     elif status in (404, 410):
                         existing_rec, session_url, uploaded_bytes = self._handle_expired_session(
-                            filename, target_folder_id, total_size, local_md5, transfer_record
+                            filename, target_folder_id, total_size, local_md5, transfer_record, app_properties=app_properties
                         )
                         if existing_rec:
                             return existing_rec
@@ -1068,7 +1104,7 @@ class GoogleDriveArtifactStore:
                             return final_res
                         if synced_offset == -1:
                             existing_rec, session_url, uploaded_bytes = self._handle_expired_session(
-                                filename, target_folder_id, total_size, local_md5, transfer_record
+                                filename, target_folder_id, total_size, local_md5, transfer_record, app_properties=app_properties
                             )
                             if existing_rec:
                                 return existing_rec
@@ -1154,6 +1190,161 @@ class GoogleDriveArtifactStore:
                 except OSError:
                     pass
 
+    def _save_manifest_with_backup(self, manifest: PublicationManifest, local_manifest_path: Path) -> None:
+        """Atomically persist manifest and sync 0600 backup."""
+        manifest.save(local_manifest_path)
+        try:
+            os.chmod(local_manifest_path, 0o600)
+        except OSError:
+            pass
+
+        bak_path = local_manifest_path.with_suffix(".json.bak")
+        bak_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_bak = bak_path.parent / f"{bak_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        payload = json.dumps(manifest.to_dict(), indent=2, sort_keys=True).encode("utf-8")
+        fd = os.open(str(tmp_bak), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                fd = None
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp_bak, 0o600)
+            os.replace(str(tmp_bak), str(bak_path))
+            os.chmod(bak_path, 0o600)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp_bak.exists():
+                try:
+                    tmp_bak.unlink()
+                except OSError:
+                    pass
+
+    def _load_or_recover_manifest(self, project_id: str, run_id: str) -> Optional[PublicationManifest]:
+        """Load manifest for project_id/run_id, recovering from .json.bak if corrupted or missing."""
+        m_key = (project_id, run_id)
+        local_m = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+        bak_m = local_m.with_suffix(".json.bak")
+
+        # 1. Try loading primary manifest
+        if local_m.exists():
+            try:
+                manifest = PublicationManifest.load(local_m)
+                self._manifest_cache[m_key] = manifest
+                return manifest
+            except Exception:
+                # Primary manifest corrupted, try backup
+                pass
+
+        # 2. Try recovering from backup
+        if bak_m.exists():
+            try:
+                manifest = PublicationManifest.load(bak_m)
+                self._save_manifest_with_backup(manifest, local_m)
+                self._manifest_cache[m_key] = manifest
+                return manifest
+            except Exception:
+                pass
+
+        # 3. Memory cache fallback
+        if m_key in self._manifest_cache:
+            return self._manifest_cache[m_key]
+
+        return None
+
+    def _is_trusted_staged_file(self, src: Path) -> bool:
+        """Verify that src is an untampered regular file inside a trusted staging directory."""
+        if src.is_symlink() or not src.is_file():
+            return False
+
+        try:
+            if not stat.S_ISREG(src.lstat().st_mode):
+                return False
+        except OSError:
+            return False
+
+        src_resolved = src.resolve()
+
+        staging_roots = [
+            (self.staging_dir / ".upload_staging").resolve(),
+        ]
+        if hasattr(self, "journal") and hasattr(self.journal, "path") and self.journal.path:
+            staging_roots.append((self.journal.path.parent / ".staged_uploads").resolve())
+
+        matched_root = None
+        for root in staging_roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            try:
+                rel = src_resolved.relative_to(root)
+                if rel != Path("."):
+                    matched_root = root
+                    break
+            except ValueError:
+                continue
+
+        if matched_root is None:
+            return False
+
+        try:
+            st = matched_root.stat()
+            if st.st_uid != os.getuid():
+                return False
+            if (st.st_mode & 0o777) != 0o700:
+                return False
+            if matched_root.is_symlink():
+                return False
+        except OSError:
+            return False
+
+        # Verify no parent directory between staging root and src is a symlink
+        curr = src_resolved.parent
+        while curr != matched_root and curr != curr.parent:
+            if curr.is_symlink():
+                return False
+            curr = curr.parent
+
+        curr_unresolved = src.parent
+        while curr_unresolved != curr_unresolved.parent:
+            if curr_unresolved.is_symlink():
+                return False
+            if curr_unresolved == matched_root:
+                break
+            curr_unresolved = curr_unresolved.parent
+
+        return True
+
+    def _stage_file(self, src: Path, tmp_staging: Path) -> Tuple[int, str]:
+        """Stream-copy source file into private 0600 staging file while calculating SHA256 and size."""
+        fd = os.open(str(tmp_staging), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        hasher = hashlib.sha256()
+        staged_size = 0
+        try:
+            with open(src, "rb") as f_src, os.fdopen(fd, "wb") as f_dst:
+                fd = None
+                chunk_sz = 64 * 1024
+                while True:
+                    chunk = f_src.read(chunk_sz)
+                    if not chunk:
+                        break
+                    f_dst.write(chunk)
+                    hasher.update(chunk)
+                    staged_size += len(chunk)
+                f_dst.flush()
+                os.fsync(f_dst.fileno())
+            os.chmod(tmp_staging, 0o600)
+            return staged_size, hasher.hexdigest()
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
     def publish(
         self,
         source: Union[str, Path],
@@ -1164,9 +1355,15 @@ class GoogleDriveArtifactStore:
         expected_sha256: Optional[str] = None,
     ) -> StoredArtifact:
         """Publish a local file to Google Drive through verified resumable upload."""
-        src = Path(source).resolve()
-        if not src.is_file():
-            raise ArtifactValidationError(f"Source file does not exist: {src}")
+        p_src = Path(source)
+        if p_src.is_symlink() or not p_src.is_file():
+            raise ArtifactValidationError(f"Source file must be a regular file, not a symlink or missing: {source}")
+        try:
+            if not stat.S_ISREG(p_src.lstat().st_mode):
+                raise ArtifactValidationError(f"Source file must be a regular file, not a special file: {source}")
+        except OSError as e:
+            raise ArtifactValidationError(f"Cannot stat source file: {e}") from e
+        src = p_src.resolve()
 
         # Step 1: Verify local SHA256 & MD5
         local_sha256 = self.compute_sha256(src)
@@ -1196,17 +1393,22 @@ class GoogleDriveArtifactStore:
 
         staged_src = src
         cleanup_staged = False
-        is_already_staged = (".upload_staging" in src.parts or ".staged_uploads" in src.parts)
+        is_already_staged = self._is_trusted_staged_file(p_src)
 
         with self._exclusive_lock(lock_name):
             # Snapshot src into immutable temporary staging file under lock
             if not is_already_staged:
                 staging_dir = self.staging_dir / ".upload_staging"
-                staging_dir.mkdir(parents=True, exist_ok=True)
+                if staging_dir.is_symlink():
+                    raise ArtifactTransferError(f"Staging directory cannot be a symlink: {staging_dir}")
+                staging_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.chmod(staging_dir, 0o700)
+
                 staging_target = staging_dir / f"{project_id}_{run_id}_{local_sha256[:16]}_{src.name}"
                 tmp_staging = staging_dir / f"{project_id}_{run_id}_{local_sha256[:16]}_{src.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+
                 try:
-                    shutil.copy2(src, tmp_staging)
+                    staged_size, staged_sha = self._stage_file(src, tmp_staging)
                 except Exception as e:
                     if tmp_staging.exists():
                         try:
@@ -1215,17 +1417,16 @@ class GoogleDriveArtifactStore:
                             pass
                     raise ArtifactTransferError(f"Failed to snapshot source file for staging: {e}") from e
 
-                # Verify that staged copy matches local_size and local_sha256
-                staged_size = tmp_staging.stat().st_size
-                staged_sha = self.compute_sha256(tmp_staging)
                 if staged_size != local_size or staged_sha.lower() != local_sha256.lower():
-                    try:
-                        tmp_staging.unlink()
-                    except OSError:
-                        pass
+                    if tmp_staging.exists():
+                        try:
+                            tmp_staging.unlink()
+                        except OSError:
+                            pass
                     raise ArtifactTransferError("Source file mutated during staging before upload")
 
                 os.replace(str(tmp_staging), str(staging_target))
+                os.chmod(staging_target, 0o600)
                 staged_src = staging_target
                 cleanup_staged = True
 
@@ -1237,12 +1438,10 @@ class GoogleDriveArtifactStore:
                 # 2. Load PublicationManifest under manifest lock
                 local_manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
                 with self._exclusive_lock(manifest_lock_name):
-                    if local_manifest_path.exists():
-                        manifest = PublicationManifest.load(local_manifest_path)
-                    elif m_key in self._manifest_cache:
-                        manifest = self._manifest_cache[m_key]
-                    else:
+                    manifest = self._load_or_recover_manifest(project_id, run_id)
+                    if manifest is None:
                         manifest = PublicationManifest(project_id=project_id, run_id=run_id)
+                    self._manifest_cache[m_key] = manifest
                     self._manifest_cache[m_key] = manifest
 
                 # 3. Check if exact revision is already in manifest with valid remote_file_id
@@ -1296,17 +1495,9 @@ class GoogleDriveArtifactStore:
                         metadata=meta_dict,
                     )
                     with self._exclusive_lock(manifest_lock_name):
-                        if local_manifest_path.exists():
-                            manifest = PublicationManifest.load(local_manifest_path)
-                        for k, art_dict in manifest.artifacts.items():
-                            if (
-                                art_dict.get("path") == rel_path
-                                or art_dict.get("metadata", {}).get("logical_path") == rel_path
-                                or k.split("@sha256_")[0] == logical_artifact_id
-                            ) and k != artifact_id:
-                                if "metadata" not in art_dict or not isinstance(art_dict["metadata"], dict):
-                                    art_dict["metadata"] = {}
-                                art_dict["metadata"]["is_latest"] = False
+                        manifest = self._load_or_recover_manifest(project_id, run_id)
+                        if manifest is None:
+                            manifest = PublicationManifest(project_id=project_id, run_id=run_id)
                         for k, art_dict in manifest.artifacts.items():
                             if (
                                 art_dict.get("path") == rel_path
@@ -1318,7 +1509,7 @@ class GoogleDriveArtifactStore:
                                 art_dict["metadata"]["is_latest"] = False
                         manifest.add_artifact(stored)
                         manifest.status = "PUBLISHED"
-                        manifest.save(local_manifest_path)
+                        self._save_manifest_with_backup(manifest, local_manifest_path)
                         self._manifest_cache[m_key] = manifest
                     return stored
 
@@ -1459,8 +1650,9 @@ class GoogleDriveArtifactStore:
                     )
 
                     with self._exclusive_lock(manifest_lock_name):
-                        if local_manifest_path.exists():
-                            manifest = PublicationManifest.load(local_manifest_path)
+                        manifest = self._load_or_recover_manifest(project_id, run_id)
+                        if manifest is None:
+                            manifest = PublicationManifest(project_id=project_id, run_id=run_id)
                         existing_art = manifest.get_artifact(artifact_id)
                         if existing_art and existing_art.storage_provider == "local":
                             stored = StoredArtifact(
@@ -1489,7 +1681,7 @@ class GoogleDriveArtifactStore:
                                 art_dict["metadata"]["is_latest"] = False
                         manifest.add_artifact(stored)
                         manifest.status = "PUBLISHED"
-                        manifest.save(local_manifest_path)
+                        self._save_manifest_with_backup(manifest, local_manifest_path)
                         self._manifest_cache[m_key] = manifest
 
                     return stored
@@ -1543,7 +1735,17 @@ class GoogleDriveArtifactStore:
                     record.transition_to(TransferStatus.UPLOADING)
                     self.journal.record_transfer(record)
 
-                drive_file_meta = self.upload_file_resumable(staged_src, target_folder_id, record)
+                drive_app_props = {
+                    "sha256": local_sha256.lower(),
+                    "logical_path": rel_path,
+                    "revision_id": f"sha256_{local_sha256.lower()}",
+                    "project_id": project_id,
+                    "run_id": run_id,
+                    "is_latest": "true",
+                }
+                drive_file_meta = self.upload_file_resumable(
+                    staged_src, target_folder_id, record, app_properties=drive_app_props
+                )
 
                 remote_id = drive_file_meta.get("id")
                 if not remote_id:
@@ -1618,11 +1820,8 @@ class GoogleDriveArtifactStore:
 
                 with self._exclusive_lock(manifest_lock_name):
                     local_manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
-                    if local_manifest_path.exists():
-                        manifest = PublicationManifest.load(local_manifest_path)
-                    elif m_key in self._manifest_cache:
-                        manifest = self._manifest_cache[m_key]
-                    else:
+                    manifest = self._load_or_recover_manifest(project_id, run_id)
+                    if manifest is None:
                         manifest = PublicationManifest(project_id=project_id, run_id=run_id)
 
                     existing_art = manifest.get_artifact(artifact_id)
@@ -1644,7 +1843,7 @@ class GoogleDriveArtifactStore:
 
                     manifest.add_artifact(stored)
                     manifest.status = "PUBLISHED"
-                    manifest.save(local_manifest_path)
+                    self._save_manifest_with_backup(manifest, local_manifest_path)
                     self._manifest_cache[m_key] = manifest
 
                 return stored
@@ -1719,85 +1918,68 @@ class GoogleDriveArtifactStore:
 
         return matching[0]
 
-    def retrieve(
+    def _download_and_verify(
         self,
-        artifact_id: str,
-        destination: Union[str, Path],
-        expected_sha256: Optional[str] = None,
-    ) -> Path:
-        """Download artifact from Google Drive by ID with bounded memory streaming and integrity check."""
-        req_sha = None
-        if "@sha256_" in artifact_id:
-            base_art_id, sha_suffix = artifact_id.split("@sha256_", 1)
-            req_sha = sha_suffix.lower()
-        else:
-            base_art_id = artifact_id
-
-        if expected_sha256 is None and req_sha is not None:
-            expected_sha256 = req_sha
-
-        meta = self.get_metadata(artifact_id)
-
-        # Fallback to searching remote Drive folder if not in local PublicationManifest
-        if not meta or not meta.remote_file_id:
-            parts = base_art_id.split("/")
-            if len(parts) >= 3:
-                proj_id, r_id = parts[0], parts[1]
-                rel_p = "/".join(parts[2:])
-                fname = parts[-1]
-                sub_f = parts[2] if len(parts) > 3 else None
-                try:
-                    f_id = self.resolve_target_folder_id(proj_id, r_id, sub_f)
-                    remote_file = self._find_file_in_folder(fname, f_id, allow_revision_mismatch=True)
-                    if remote_file and remote_file.get("id"):
-                        remote_fid = remote_file["id"]
-                        rem_size = int(remote_file.get("size", 0)) if remote_file.get("size") else None
-                        rem_md5 = remote_file.get("md5Checksum")
-                        meta = StoredArtifact(
-                            artifact_id=artifact_id,
-                            storage_provider=self.provider_name,
-                            path=rel_p,
-                            size_bytes=rem_size or 0,
-                            sha256=expected_sha256 or "",
-                            project_id=proj_id,
-                            run_id=r_id,
-                            remote_file_id=remote_fid,
-                            md5=rem_md5,
-                        )
-                except Exception:
-                    pass
-
-        if not meta or not meta.remote_file_id:
-            raise ArtifactNotFoundError(f"Artifact '{artifact_id}' not found in Google Drive registry.")
-
-        dest = Path(destination).resolve()
-        if dest.is_dir():
-            dest = dest / Path(meta.path).name
-
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        meta: StoredArtifact,
+        dest: Path,
+        target_sha: Optional[str] = None,
+        expected_full_sha: Optional[str] = None,
+        allow_unverified_recovery: bool = False,
+    ) -> None:
+        """Download remote Drive file to private 0600 temp file, verify size/md5/sha256, atomically replace dest."""
         tmp = dest.parent / f"{dest.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-
         download_url = f"https://www.googleapis.com/drive/v3/files/{meta.remote_file_id}?alt=media"
         downloaded_bytes = 0
         fd = None
 
         try:
-            # Check if http_client implements stream_download
             if hasattr(self.http_client, "stream_download"):
-                status, _, downloaded_bytes = self.http_client.stream_download(
-                    download_url, tmp, headers={"authorization": f"Bearer {self._ensure_token()}"}
-                )
+                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                os.close(fd)
+                fd = None
+
+                try:
+                    status, _, downloaded_bytes = self.http_client.stream_download(
+                        download_url, tmp, headers={"authorization": f"Bearer {self._ensure_token()}"}
+                    )
+                except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+                    raise
+                except Exception as de:
+                    raise DriveTransferError(
+                        f"Network failure downloading file '{meta.remote_file_id}': {_sanitize_drive_error(str(de), download_url)}"
+                    ) from de
+
                 if status != 200:
-                    raise DriveTransferError(f"Failed to download Drive file '{meta.remote_file_id}' (HTTP {status})")
-                downloaded_sha256 = self.compute_sha256(tmp)
-            else:
-                # Fallback streaming write with bounded buffer and incremental hash
-                status, headers, body = self._request_with_retry("GET", download_url)
-                if status != 200:
+                    if status == 401:
+                        raise DriveAuthenticationError(f"Unauthorized downloading file '{meta.remote_file_id}'")
+                    if status == 403:
+                        raise DriveQuotaExceededError(f"Access forbidden downloading file '{meta.remote_file_id}'")
                     raise DriveTransferError(f"Failed to download Drive file '{meta.remote_file_id}' (HTTP {status})")
 
-                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                if tmp.exists():
+                    os.chmod(tmp, 0o600)
+                downloaded_sha256 = self.compute_sha256(tmp)
+                downloaded_md5 = self._compute_md5(tmp)
+            else:
+                try:
+                    status, headers, body = self._request_with_retry("GET", download_url)
+                except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+                    raise
+                except Exception as de:
+                    raise DriveTransferError(
+                        f"Network failure downloading file '{meta.remote_file_id}': {_sanitize_drive_error(str(de), download_url)}"
+                    ) from de
+
+                if status != 200:
+                    if status == 401:
+                        raise DriveAuthenticationError(f"Unauthorized downloading file '{meta.remote_file_id}'")
+                    if status == 403:
+                        raise DriveQuotaExceededError(f"Access forbidden downloading file '{meta.remote_file_id}'")
+                    raise DriveTransferError(f"Failed to download Drive file '{meta.remote_file_id}' (HTTP {status})")
+
+                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
                 hasher = hashlib.sha256()
+                md5_hasher = hashlib.md5()
                 with os.fdopen(fd, "wb") as f:
                     fd = None
                     chunk_sz = 64 * 1024
@@ -1805,25 +1987,51 @@ class GoogleDriveArtifactStore:
                         chunk = body[i : i + chunk_sz]
                         f.write(chunk)
                         hasher.update(chunk)
+                        md5_hasher.update(chunk)
                         downloaded_bytes += len(chunk)
                     f.flush()
                     os.fsync(f.fileno())
+                os.chmod(tmp, 0o600)
                 downloaded_sha256 = hasher.hexdigest()
+                downloaded_md5 = md5_hasher.hexdigest()
 
-            # Verify integrity
-            target_sha = expected_sha256 or meta.sha256
-            if target_sha and downloaded_sha256.lower() != target_sha.lower():
+            # 1. Byte count integrity check
+            if meta.size_bytes is None:
+                raise DriveIntegrityError("Retrieved Drive artifact missing expected size_bytes.")
+            expected_bytes = int(meta.size_bytes)
+            if expected_bytes <= 0:
+                if downloaded_bytes != 0:
+                    raise DriveIntegrityError(
+                        f"Retrieved Drive artifact size mismatch: expected {expected_bytes}, got {downloaded_bytes}"
+                    )
+            elif downloaded_bytes != expected_bytes:
                 raise DriveIntegrityError(
-                    f"Retrieved Drive artifact hash mismatch: recorded {target_sha}, got {downloaded_sha256}"
+                    f"Retrieved Drive artifact size mismatch: expected {expected_bytes}, got {downloaded_bytes}"
                 )
-            if meta.size_bytes and downloaded_bytes != meta.size_bytes:
+
+            # 2. MD5 check if present
+            if meta.md5:
+                if downloaded_md5.lower() != meta.md5.lower():
+                    raise DriveIntegrityError(
+                        f"Retrieved Drive artifact MD5 mismatch: expected {meta.md5}, got {downloaded_md5}"
+                    )
+
+            # 3. SHA256 check
+            if target_sha:
+                if not downloaded_sha256.lower().startswith(target_sha.lower()):
+                    raise DriveIntegrityError(
+                        f"Retrieved Drive artifact hash mismatch: recorded {target_sha}, got {downloaded_sha256}"
+                    )
+                if expected_full_sha and downloaded_sha256.lower() != expected_full_sha.lower():
+                    raise DriveIntegrityError(
+                        f"Retrieved Drive artifact hash mismatch: expected {expected_full_sha}, got {downloaded_sha256}"
+                    )
+            elif not allow_unverified_recovery:
                 raise DriveIntegrityError(
-                    f"Retrieved Drive artifact size mismatch: expected {meta.size_bytes}, got {downloaded_bytes}"
+                    "Unverified Drive recovery refused: local manifest is missing and remote file lacks authoritative SHA256 metadata."
                 )
 
             os.replace(str(tmp), str(dest))
-            return dest
-
         except Exception:
             if fd is not None:
                 try:
@@ -1837,20 +2045,297 @@ class GoogleDriveArtifactStore:
                     pass
             raise
 
+    def retrieve(
+        self,
+        artifact_id: str,
+        destination: Union[str, Path],
+        expected_sha256: Optional[str] = None,
+        allow_unverified_recovery: bool = False,
+    ) -> Path:
+        """Download artifact from Google Drive by ID with bounded memory streaming and strict integrity check."""
+        req_sha: Optional[str] = None
+        if "@sha256_" in artifact_id:
+            base_art_id, sha_suffix = artifact_id.split("@sha256_", 1)
+            req_sha = sha_suffix.strip().lower()
+        else:
+            base_art_id = artifact_id
+
+        if expected_sha256 is not None:
+            target_sha = expected_sha256.strip().lower()
+            if req_sha is None:
+                req_sha = target_sha
+        elif req_sha is not None:
+            target_sha = req_sha
+        else:
+            target_sha = None
+
+        parts = base_art_id.split("/")
+        if len(parts) < 3:
+            raise ArtifactValidationError(f"Invalid artifact ID format: '{artifact_id}'")
+
+        proj_id, r_id = parts[0], parts[1]
+        rel_p = "/".join(parts[2:])
+        fname = parts[-1]
+        sub_f = parts[2] if len(parts) > 3 else None
+
+        dest = Path(destination).resolve()
+        if dest.is_dir():
+            dest = dest / fname
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        meta: Optional[StoredArtifact] = None
+
+        # -----------------------------------------------------------------
+        # Case A: Exact revision requested (@sha256_ or expected_sha256)
+        # -----------------------------------------------------------------
+        if req_sha is not None:
+            # 1. Try local manifest / backup / cache
+            meta = self.get_metadata(artifact_id)
+            if meta and meta.remote_file_id and meta.sha256 and meta.sha256.lower().startswith(req_sha):
+                target_sha = meta.sha256.lower()
+            else:
+                meta = None
+                if "@sha256_" not in artifact_id:
+                    meta_candidate = self.get_metadata(f"{base_art_id}@sha256_{req_sha}")
+                    if meta_candidate and meta_candidate.remote_file_id and meta_candidate.sha256 and meta_candidate.sha256.lower().startswith(req_sha):
+                        meta = meta_candidate
+                        target_sha = meta.sha256.lower()
+
+            # 2. Check journal if not found in manifest
+            if not meta or not meta.remote_file_id:
+                for rec in self.journal.list_transfers(project_id=proj_id, run_id=r_id):
+                    if rec.status in (TransferStatus.PUBLISHED.value, TransferStatus.DRIVE_VERIFIED.value):
+                        if rec.remote_file_id and rec.sha256 and rec.sha256.lower().startswith(req_sha):
+                            if rec.target_rel_path == rel_p or Path(rec.local_path).name == fname:
+                                meta = StoredArtifact(
+                                    artifact_id=f"{base_art_id}@sha256_{rec.sha256.lower()}",
+                                    storage_provider=self.provider_name,
+                                    path=rec.target_rel_path or rel_p,
+                                    size_bytes=rec.size_bytes,
+                                    sha256=rec.sha256.lower(),
+                                    project_id=proj_id,
+                                    run_id=r_id,
+                                    remote_file_id=rec.remote_file_id,
+                                    md5=rec.md5,
+                                    verified_at=rec.updated_at,
+                                )
+                                target_sha = rec.sha256.lower()
+                                break
+
+            # 3. If still not found in manifest/backup/journal, list candidate remote files in Drive folder
+            if not meta or not meta.remote_file_id:
+                try:
+                    f_id = self.resolve_target_folder_id(proj_id, r_id, sub_f)
+                except Exception as fe:
+                    raise ArtifactNotFoundError(f"Folder not found on Drive for '{artifact_id}': {fe}") from fe
+
+                candidates = self._list_files_in_folder(fname, f_id)
+                if not candidates:
+                    raise ArtifactNotFoundError(f"Artifact '{artifact_id}' not found in Google Drive registry.")
+
+                def _candidate_priority(c: Dict[str, Any]) -> int:
+                    props = c.get("appProperties") or {}
+                    c_sha = props.get("sha256", "").strip().lower()
+                    if c_sha and c_sha.startswith(req_sha):
+                        return 0
+                    return 1
+
+                sorted_candidates = sorted(candidates, key=_candidate_priority)
+
+                matched_any = False
+                for cand in sorted_candidates:
+                    c_fid = cand.get("id")
+                    if not c_fid:
+                        continue
+                    c_size = int(cand["size"]) if cand.get("size") is not None else None
+                    c_md5 = cand.get("md5Checksum")
+                    cand_meta = StoredArtifact(
+                        artifact_id=f"{base_art_id}@sha256_{req_sha}",
+                        storage_provider=self.provider_name,
+                        path=rel_p,
+                        size_bytes=c_size if c_size is not None else 0,
+                        sha256=req_sha,
+                        project_id=proj_id,
+                        run_id=r_id,
+                        remote_file_id=c_fid,
+                        md5=c_md5,
+                    )
+                    try:
+                        self._download_and_verify(
+                            cand_meta,
+                            dest,
+                            target_sha=req_sha,
+                            expected_full_sha=expected_sha256 if (expected_sha256 and len(expected_sha256) == 64) else None,
+                            allow_unverified_recovery=False,
+                        )
+                        matched_any = True
+                        return dest
+                    except DriveIntegrityError:
+                        continue
+                    except (DriveAuthenticationError, DriveQuotaExceededError, DriveTransferError):
+                        raise
+
+                if not matched_any:
+                    raise DriveIntegrityError(
+                        f"No remote candidate matched requested SHA256 '{req_sha}' for artifact '{artifact_id}'."
+                    )
+
+        # -----------------------------------------------------------------
+        # Case B: Latest revision requested (unversioned, req_sha is None)
+        # -----------------------------------------------------------------
+        else:
+            # 1. Resolve latest revision from manifest (or .bak backup)
+            meta = self.get_metadata(artifact_id)
+            if meta and meta.remote_file_id:
+                target_sha = meta.sha256
+
+            # 2. Check journal if manifest is missing/unrecoverable
+            if not meta or not meta.remote_file_id:
+                matching_transfers = [
+                    rec for rec in self.journal.list_transfers(project_id=proj_id, run_id=r_id)
+                    if rec.status in (TransferStatus.PUBLISHED.value, TransferStatus.DRIVE_VERIFIED.value)
+                    and rec.remote_file_id
+                    and (rec.target_rel_path == rel_p or Path(rec.local_path).name == fname)
+                ]
+                if len(matching_transfers) == 1 and matching_transfers[0].sha256:
+                    rec = matching_transfers[0]
+                    meta = StoredArtifact(
+                        artifact_id=f"{base_art_id}@sha256_{rec.sha256.lower()}",
+                        storage_provider=self.provider_name,
+                        path=rec.target_rel_path or rel_p,
+                        size_bytes=rec.size_bytes,
+                        sha256=rec.sha256.lower(),
+                        project_id=proj_id,
+                        run_id=r_id,
+                        remote_file_id=rec.remote_file_id,
+                        md5=rec.md5,
+                        verified_at=rec.updated_at,
+                    )
+                    target_sha = rec.sha256.lower()
+
+            # 3. Query Drive folder
+            if not meta or not meta.remote_file_id:
+                try:
+                    f_id = self.resolve_target_folder_id(proj_id, r_id, sub_f)
+                except Exception as fe:
+                    raise ArtifactNotFoundError(f"Folder not found on Drive for '{artifact_id}': {fe}") from fe
+
+                files = self._list_files_in_folder(fname, f_id)
+                if len(files) == 0:
+                    raise ArtifactNotFoundError(f"Artifact '{artifact_id}' not found in Google Drive registry.")
+                elif len(files) > 1:
+                    latest_candidates = [
+                        f for f in files
+                        if (f.get("appProperties") or {}).get("is_latest") == "true"
+                        and (f.get("appProperties") or {}).get("sha256")
+                    ]
+                    if len(latest_candidates) == 1:
+                        chosen = latest_candidates[0]
+                        app_props = chosen.get("appProperties") or {}
+                        chosen_sha = app_props["sha256"].strip().lower()
+                        meta = StoredArtifact(
+                            artifact_id=f"{base_art_id}@sha256_{chosen_sha}",
+                            storage_provider=self.provider_name,
+                            path=rel_p,
+                            size_bytes=int(chosen["size"]) if chosen.get("size") is not None else None,
+                            sha256=chosen_sha,
+                            project_id=proj_id,
+                            run_id=r_id,
+                            remote_file_id=chosen["id"],
+                            md5=chosen.get("md5Checksum"),
+                            verified_at=_utc_now_iso(),
+                        )
+                        target_sha = chosen_sha
+                    else:
+                        raise DriveIntegrityError(
+                            f"Ambiguous unversioned Drive recovery: multiple remote revisions exist for '{artifact_id}' and local manifest is missing."
+                        )
+                else:
+                    chosen = files[0]
+                    app_props = chosen.get("appProperties") or {}
+                    remote_sha = app_props.get("sha256", "").strip().lower()
+                    if remote_sha:
+                        target_sha = remote_sha
+                        meta = StoredArtifact(
+                            artifact_id=f"{base_art_id}@sha256_{remote_sha}",
+                            storage_provider=self.provider_name,
+                            path=rel_p,
+                            size_bytes=int(chosen["size"]) if chosen.get("size") is not None else None,
+                            sha256=remote_sha,
+                            project_id=proj_id,
+                            run_id=r_id,
+                            remote_file_id=chosen["id"],
+                            md5=chosen.get("md5Checksum"),
+                            verified_at=_utc_now_iso(),
+                        )
+                    else:
+                        if not allow_unverified_recovery:
+                            raise DriveIntegrityError(
+                                "Unverified Drive recovery refused: local manifest is missing and remote file lacks authoritative SHA256 metadata."
+                            )
+                        if not chosen.get("md5Checksum") or chosen.get("size") is None:
+                            raise DriveIntegrityError(
+                                "Unverified Drive recovery refused: remote file lacks md5Checksum or size."
+                            )
+                        meta = StoredArtifact(
+                            artifact_id=artifact_id,
+                            storage_provider=self.provider_name,
+                            path=rel_p,
+                            size_bytes=int(chosen["size"]),
+                            sha256="",
+                            project_id=proj_id,
+                            run_id=r_id,
+                            remote_file_id=chosen["id"],
+                            md5=chosen.get("md5Checksum"),
+                            verified_at=_utc_now_iso(),
+                        )
+                        target_sha = None
+
+        if not meta or not meta.remote_file_id:
+            raise ArtifactNotFoundError(f"Artifact '{artifact_id}' not found in Google Drive registry.")
+
+        # Download and strictly verify
+        self._download_and_verify(
+            meta,
+            dest,
+            target_sha=target_sha,
+            expected_full_sha=expected_sha256 if (expected_sha256 and len(expected_sha256) == 64) else None,
+            allow_unverified_recovery=allow_unverified_recovery,
+        )
+        return dest
+
     def exists(self, artifact_id: str) -> bool:
         meta = self.get_metadata(artifact_id)
         if meta is not None and meta.remote_file_id is not None:
             return True
-        # If not in manifest, fallback to check remote Drive folder
+        # Check journal
         parts = artifact_id.split("@sha256_")[0].split("/")
         if len(parts) >= 3:
             proj_id, r_id = parts[0], parts[1]
             fname = parts[-1]
+            rel_p = "/".join(parts[2:])
             sub_f = parts[2] if len(parts) > 3 else None
+            req_sha = artifact_id.split("@sha256_")[1].strip().lower() if "@sha256_" in artifact_id else None
+
+            for rec in self.journal.list_transfers(project_id=proj_id, run_id=r_id):
+                if rec.status in (TransferStatus.PUBLISHED.value, TransferStatus.DRIVE_VERIFIED.value):
+                    if rec.remote_file_id and (rec.target_rel_path == rel_p or Path(rec.local_path).name == fname):
+                        if req_sha is None or (rec.sha256 and rec.sha256.lower().startswith(req_sha)):
+                            return True
+
             try:
                 f_id = self.resolve_target_folder_id(proj_id, r_id, sub_f)
-                remote_file = self._find_file_in_folder(fname, f_id, allow_revision_mismatch=True)
-                return remote_file is not None and remote_file.get("id") is not None
+                files = self._list_files_in_folder(fname, f_id)
+                if not files:
+                    return False
+                if req_sha is not None:
+                    for f in files:
+                        c_sha = (f.get("appProperties") or {}).get("sha256", "").strip().lower()
+                        if c_sha and c_sha.startswith(req_sha):
+                            return True
+                    return False
+                return True
             except Exception:
                 return False
         return False
@@ -1860,15 +2345,9 @@ class GoogleDriveArtifactStore:
         if len(parts) < 3:
             return None
         project_id, run_id = parts[0], parts[1]
-        m_key = (project_id, run_id)
-
-        local_m = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
-        if local_m.exists():
-            manifest = PublicationManifest.load(local_m)
-            self._manifest_cache[m_key] = manifest
+        manifest = self._load_or_recover_manifest(project_id, run_id)
+        if manifest:
             return self._resolve_artifact_from_manifest(manifest, artifact_id)
-        elif m_key in self._manifest_cache:
-            return self._resolve_artifact_from_manifest(self._manifest_cache[m_key], artifact_id)
         return None
 
     def list_artifacts(
@@ -1877,14 +2356,9 @@ class GoogleDriveArtifactStore:
         run_id: Optional[str] = None,
     ) -> List[StoredArtifact]:
         if run_id:
-            m_key = (project_id, run_id)
-            local_m = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
-            if local_m.exists():
-                manifest = PublicationManifest.load(local_m)
-                self._manifest_cache[m_key] = manifest
+            manifest = self._load_or_recover_manifest(project_id, run_id)
+            if manifest:
                 return manifest.list_artifacts()
-            elif m_key in self._manifest_cache:
-                return self._manifest_cache[m_key].list_artifacts()
             return []
 
         # All runs
@@ -1892,7 +2366,8 @@ class GoogleDriveArtifactStore:
         proj_dir = self.staging_dir / "projects" / project_id / "runs"
         if proj_dir.is_dir():
             for r in proj_dir.iterdir():
-                if r.is_dir() and (r / "manifest.json").exists():
-                    manifest = PublicationManifest.load(r / "manifest.json")
-                    results.extend(manifest.list_artifacts())
+                if r.is_dir():
+                    manifest = self._load_or_recover_manifest(project_id, r.name)
+                    if manifest:
+                        results.extend(manifest.list_artifacts())
         return results
