@@ -507,3 +507,73 @@ If unexpected transfer issues occur in staging or production:
    ```
 4. **Preservation of Local Artifacts**:
    Rolling back the code never deletes local verified checkpoints (`./artifacts/projects/`) or uncommitted journal entries (`transfer_journal.json`), which remain available for manual recovery.
+
+## Drive Store Hardening: Pending Revisions, Locks and Rate Limits (PR #24, offline)
+
+This section describes `colab_adapter/storage/google_drive.py`, `drive_metadata.py` and `worker.py` at commit `108f052`. Everything here is verified only by offline tests with a mock Drive client. No live Google Drive or OAuth validation has been performed, and live validation requires explicit owner approval.
+
+### 1. Shared per-manifest lock
+
+- The Drive store takes the same lock as the local store: `<run_dir>/.locks/manifest.lock`, where `<run_dir>` is the local run directory that holds the manifest. The two stores therefore serialise on one lock when they merge into one manifest. Details are in ARCHITECTURE_V2 section 14.
+- The Drive store calls the lock with a 60-second timeout. A timeout raises `JournalLockError`.
+
+### 2. Base marker captured at intent
+
+- When a transfer is first recorded, the store reads the current remote head for the logical path and stores its full SHA-256 as the base marker. If there is no head, the marker is the literal `none`. The marker is kept in the transfer journal (`TransferRecord.base_sha256`) and written to the remote file as the property `base_sha256`. It is captured once per transfer, not on each attempt.
+- A legacy journal record that has no marker is captured only if it has not started uploading (no remote file id, no resumable session, zero bytes sent). Any other legacy record keeps `None`, which the rules below treat as a legacy case.
+- The marker is validated before any remote write. It must be `none` or a full 64-hex digest.
+
+### 3. Pending revision disposition
+
+An uploaded revision starts as `pending`. It is promoted to latest only after the decision below says so. `pending_disposition()` is a pure function of an observed snapshot:
+
+| Disposition | When it applies | Effect |
+| --- | --- | --- |
+| `PROMOTE` | The pending revision is the genuine successor of the current head (the head's SHA equals the base marker). Or the head is missing, the base marker names the pending revision as its successor (interrupted coordination), or the base is `none` and nothing else exists for the path. | The current head is demoted (`is_latest=false`, `next_sha256` set to the pending digest), then the pending revision is promoted (`is_latest=true`). |
+| `ALREADY_LATEST` | The head is already this content. | No write. |
+| `STALE` | The head moved on since the upload was intended (base marker does not match the head). | Pending stays pending. It is not promoted and it is not demoted. It is still retrievable by its exact versioned id, with full-hash verification. |
+| `FAIL_CLOSED` | The remote state cannot be explained, for example the latest names a different successor, or a legacy pending revision conflicts with the latest. | Raises `DriveIntegrityError`. Nothing is guessed. |
+
+Legacy rules (records or remote files without a base marker):
+- With a current head: the pending revision is promoted only if the head already names it as successor. Otherwise the result is `FAIL_CLOSED`.
+- With no head: the pending revision is promoted only if no other non-pending revision exists for the path. Otherwise the result is `FAIL_CLOSED`.
+
+The disposition is decided at the time of settlement, using the head re-read at that moment. It is not taken from the state at upload start.
+
+### 4. Crash during coordination
+
+- Demotion of the old head is written before the promotion. A crash between the two leaves no latest. The next recovery finds the base revision whose SHA equals the base marker and whose successor is the pending digest, and promotes the pending revision (`PROMOTE`).
+- A crash after promotion but before the manifest is saved is repaired when the publish is replayed. The replay re-reads remote state and classifies it again.
+- Recovery never trusts the remote properties as content proof. Content is verified by hashing downloaded bytes.
+
+### 5. Limitation: no compare-and-swap on Drive
+
+Google Drive offers no compare-and-swap for file properties. The stale and promote checks are therefore a read followed by a write. **The guarantee holds only if every writer to the Drive folder goes through this host's per-manifest lock.** A writer outside this host, or a writer that bypasses the lock, can still race between the read and the write. This is a documented limit, not a verified property of Drive.
+
+### 6. Terminal integrity errors in the upload worker
+
+- `DriveIntegrityError` is a subclass of `ArtifactValidationError`. In the upload worker, any `ArtifactValidationError` raised from a publish sets the transfer to `UPLOAD_FAILED` at once and is not retried.
+- Other exceptions use bounded retries (`RETRY_PENDING`), up to the record's `max_retries`, and then `UPLOAD_FAILED`.
+
+### 7. Drive rate-limit and quota behaviour
+
+Classification of an HTTP 403 looks at `error.errors[].reason` in the JSON body. If the body is not JSON, a substring check is used. If both quota and rate reasons are present, quota wins.
+
+| Class | Reasons | Behaviour |
+| --- | --- | --- |
+| Quota | `dailyLimitExceeded`, `quotaExceeded`, `storageQuotaExceeded` | `DriveQuotaExceededError`. Never retried, because retrying cannot help. |
+| Rate | `rateLimitExceeded`, `userRateLimitExceeded`, `sharingRateLimitExceeded` | Bounded retry with backoff. When the retry budget is exhausted the store raises `DriveQuotaExceededError` with a message that says the rate-limit budget was exhausted. |
+| Auth or other | Any other reason, or no recognised marker | `DriveAuthenticationError`. Never retried. |
+
+Other status handling:
+- HTTP 401 refreshes the access token and retries while the budget lasts. When the budget runs out it raises `DriveAuthenticationError`.
+- HTTP 429 and 5xx (500, 502, 503, 504) are retried with bounded backoff. When the budget runs out they raise `DriveTransferError`.
+- Retry-After is honoured in two forms, delta-seconds and HTTP-date. Negative, NaN, infinite and past values are ignored, and the store falls back to jittered exponential backoff. Every wait is capped at 60 seconds, whichever source it came from.
+
+Note: a rate-limit 403 that exhausts its budget surfaces as `DriveQuotaExceededError`, not as a separate rate-limit error type. Callers that need to tell them apart must read the message text.
+
+### 8. Drive read-path validation
+
+- Drive publish validates `project_id`, `run_id`, the artifact type and the file name before any remote call.
+- Drive `get_metadata()` and `retrieve()` validate the project and run segments of an artifact id before any manifest read, path construction or network call. A versioned retrieval requires a full 64-hex digest.
+- Drive property values are checked by `validate_drive_properties()` before every remote write. Oversized or non-string values are rejected locally.

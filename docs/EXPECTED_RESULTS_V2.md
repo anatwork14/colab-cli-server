@@ -236,3 +236,51 @@ These procedures are **strictly manual and require explicit operator authorizati
 7. **Client Disconnect & Teardown Audit**:
    Close client connection, stop monitor server, and verify server logs contain zero exposed tokens or secrets.
 
+## 11. PR #24 Offline Verification Evidence and Known Limitations
+
+Scope: commit `108f052` (branch of PR #24). The evidence below is offline only, using temporary directories and a mock Drive client. Nothing here is live Colab, Google Drive or OAuth validation, and no result in this section is a production or live-verified claim.
+
+**Offline test evidence**
+
+- Test command: `python3 -m unittest discover -s tests -v`
+- Result: `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>` tests run, `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>` passed, `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>` skipped, `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>` failed.
+- Python versions: `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>`.
+- Browser test (`tests/test_browser_xss_and_cross_process_qa.py`, requires `COLAB_REQUIRE_BROWSER_TESTS=1`): `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>`.
+
+**Test modules added or changed in PR #24**
+
+| Area | Module |
+| --- | --- |
+| Local exact revision and alias | `tests/test_local_exact_revision.py`, `tests/test_local_alias_consistency.py` |
+| Local cross-process behaviour | `tests/test_local_cross_process.py` |
+| Shared manifest lock | `tests/test_shared_manifest_lock.py` |
+| Drive pending promotion and disposition | `tests/test_drive_pending_promotion.py` |
+| Drive rate-limit retry | `tests/test_drive_rate_limit_retry.py` |
+| Storage input validation | `tests/test_storage_input_validation.py` |
+| Monitor project isolation and review follow-ups | `tests/test_monitor_project_isolation.py`, `tests/test_monitor_review_followups.py` |
+| PR #24 review follow-ups | `tests/test_review_followups_pr24.py` |
+
+Mock support changed in `tests/drive_api_mock.py`.
+
+**Evidence status**
+
+- Offline mock tests: `<TEST_COUNTS_TO_BE_FILLED_BY_INTEGRATOR>` (placeholder).
+- Live Google Drive: not run. Live validation requires explicit owner approval.
+- Live Colab: not run. Live validation requires explicit owner approval.
+- Live OAuth: not run. Live validation requires explicit owner approval.
+- Python 3.13: not run on this host.
+- Real headless Chromium: not run on this host for this change.
+
+**Known limitations**
+
+1. Monitor hashing: unmanifested local files are hashed per request, up to 8 MiB each.
+2. Monitor SSE: `/api/v1/events/stream` is unfiltered when `?project=` is omitted.
+3. No live Drive or Colab validation has been performed for any PR #24 behaviour.
+4. Python 3.13 and real Chromium were not run on this host.
+5. Explicit rollback is not implemented. Republishing an older revision never moves the head.
+6. Drive has no compare-and-swap. The stale and promote guarantee holds only if every writer to the folder goes through this host's per-manifest lock.
+7. A rate-limit 403 that exhausts its retry budget is reported as `DriveQuotaExceededError`.
+8. A hard kill can leave a temporary `.tmp` file behind in the local store.
+
+Live validation of Google Drive, Colab and OAuth remains blocked until the owner gives explicit approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
+

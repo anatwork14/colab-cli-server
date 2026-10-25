@@ -319,3 +319,37 @@ In the event of an operational issue or security regression in production or sta
    ```
 4. **Session Isolation**:
    Because `MonitorServer` is strictly read-only and unmanaged sessions are safeguarded by `ManagedSessionRegistry`, stopping the dashboard has zero impact on active Colab runtimes.
+
+## 8. Project-Scoped Monitoring Identity (PR #24, offline)
+
+Implemented in `colab_adapter/monitor/server.py` and `colab_adapter/telemetry.py` at commit `108f052`. Offline tests only; the dashboard has not been validated against a live Colab account.
+
+**Run identity.** A run is identified by a RunKey `(project_id, run_id)`. The key comes from telemetry events (`project_id`, `run_id`) and from the on-disk layout `projects/<project>/runs/<run>`. A bare `run_id` is never treated as unique.
+
+**Selectors**
+
+- `?project=<id>` narrows `/api/v1/summary`, `/api/v1/runs`, `/api/v1/runs/<run_id>` and `/api/v1/events/stream`. An invalid selector returns HTTP 400.
+- Without `?project=`, `/api/v1/runs/<run_id>` resolves the run only if exactly one project owns that `run_id`. If several projects own it, the server returns HTTP 409 with `error: "ambiguous_run"` and the list of candidate projects. If none owns it, it returns HTTP 404.
+- Legacy telemetry events with no `project_id` never make a named-project run ambiguous. They resolve only when no named project owns the run.
+
+**Telemetry filtering.** `TelemetryEmitter.get_events(project_id=...)` matches the project exactly. Records without a `project_id` never match a named project. They appear only when no project filter is given.
+
+**Filesystem safety.** The run scanner skips symlinked project directories, runs directories and run directories, so one project cannot alias another. It skips symlinked `manifest.json` files and symlinked artifact files. It excludes the internal directories `.revisions`, `.upload_staging`, `.staged_uploads`, `.transfer_locks` and `.locks` from artifact listings.
+
+**Artifact ids.** Artifact ids shown by the monitor are always prefixed `<project>/<run>/`, so the same logical path in two projects is two distinct entries.
+
+**Account-wide versus per-run counters**
+
+- Balance, consumption rate, active assignments and managed running counts are account-wide. The summary labels them with `managed_counts_scope: "account"`, and it echoes the applied filter in `project_filter`.
+- Only the run counts are narrowed by `?project=`. With a filter, `total_runs` is the number of unique RunKeys in that project. Without a filter it is the larger of the unique RunKey count and the managed-session registry count.
+- Managed sessions carry no project id, so per-project billing is not derived.
+
+**`is_runtime_active`** is conservative. It is `true` only when the managed session with that id is in `READY`, `RUNNING` or `ACTIVE` state and exactly one RunKey carries that `run_id`. Otherwise it is `false`, even if a session is running.
+
+**Hashing cost.** For unmanifested local files the monitor computes SHA-256 per request, up to 8 MiB (`_LOCAL_HASH_MAX_BYTES`). Larger files are listed with their size only and no hash.
+
+**Known limits**
+
+- Hashing is repeated on every request, up to 8 MiB per file. This is a known cost, not a cache.
+- The SSE stream (`/api/v1/events/stream`) is unfiltered when `?project=` is omitted, so it carries events from every project. Clients that need isolation must pass `?project=`.
+- No live Colab or Drive data has been validated through this path.

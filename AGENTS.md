@@ -84,3 +84,17 @@ V2 adds project workspace workflows (`python3 -m colab_adapter.cli project ...`)
 - **Reproducible Real-Browser Security Verification**: Dashboard changes must maintain zero `.innerHTML` / inline handler usage, per-response cryptographic CSP nonces, and pass `COLAB_REQUIRE_BROWSER_TESTS=1 python3 -m unittest tests/test_browser_xss_and_cross_process_qa.py -v` in headless Chromium.
 - **Testing Demarcation**: All functionality is verified offline with deterministic mock clients (`OFFLINE_RELEASE_READY`). Real Google Drive and Colab environments have never been exercised in this worktree or automated tests; live OAuth credentials and cloud writes are not authorized without explicit operator consent (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 
+### V2 storage & monitor invariants (PR #24, offline)
+
+See [docs/ARTIFACT_RECOVERY.md](docs/ARTIFACT_RECOVERY.md), [docs/GOOGLE_DRIVE_ARTIFACTS.md](docs/GOOGLE_DRIVE_ARTIFACTS.md), [docs/ARCHITECTURE_V2.md](docs/ARCHITECTURE_V2.md) sections 14–15, and [docs/MONITORING_DASHBOARD_V2.md](docs/MONITORING_DASHBOARD_V2.md) section 8.
+
+- **Exact revisions**: a versioned id must carry a full 64-hex sha256. Resolve it only from the manifest or `.revisions/<full sha>/` (legacy `<sha16>/` is read-only). Never fall back to the mutable alias.
+- **Manifest is authoritative**: the `checkpoints/<name>` alias is a cache of the head. Reconcile it only under the manifest lock. Replaying a historical revision never moves the head or the alias. If the manifest is lost while revisions exist, fail closed.
+- **One lock per manifest**: `<run_dir>/.locks/manifest.lock` is shared by the local and Drive stores (thread RLock plus `fcntl.flock`, 0700 directory and 0600 file, bounded timeout raising `JournalLockError`). Do not add a second lock for the same manifest.
+- **Drive pending revisions**: capture `base_sha256` once at intent and keep it in the journal. Promote only on `PROMOTE` or `ALREADY_LATEST`. A `STALE` revision stays pending and retrievable. Legacy records without a base follow the legacy rules and fail closed when ambiguous. `DriveIntegrityError` is terminal in the upload worker.
+- **Drive has no compare-and-swap**: the stale and promote guarantee holds only if every writer to the folder goes through this host's locks. Do not describe it as holding for external writers.
+- **Validation before side effects**: validate ids, file names, logical paths and artifact types (`storage/validation.py`) before any path, lock, staging directory or remote call. Ids are ASCII. File names are NFC with no separators or control/format characters. Staging names are hashed. Re-validate journal-read ids. Drive read paths validate too.
+- **Drive 403 classification**: quota reasons are never retried. Rate reasons get bounded retries. Retry-After is capped at 60 s. Other 403s are auth errors and are never retried.
+- **Monitor identity**: runs are keyed by `(project_id, run_id)`. Use `?project=`. A bare run id that matches several projects returns 409 `ambiguous_run`. Skip symlinks and exclude `.locks`. Label account-wide counters as account-wide. `is_runtime_active` is conservative.
+- **Offline only**: do not describe mock or offline results as live Colab, Drive or OAuth validation, and never claim `PRODUCTION_READY` or `LIVE_VERIFIED`.
+

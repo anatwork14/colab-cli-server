@@ -280,3 +280,57 @@ If an issue occurs during artifact recovery or migration:
    ```
 4. **Data Safety**:
    Local checkpoints and source snapshots stored under `./artifacts/` are never purged or altered by rollback operations.
+
+## Local Store: Exact-Revision and Latest-Alias Semantics (PR #24, offline)
+
+This section describes `colab_adapter/storage/local.py` at commit `108f052`. All evidence is offline (temporary directories and mock clients). No live Colab or Google Drive run has been validated against this behaviour.
+
+### Layout per run
+
+```
+projects/<project>/runs/<run>/
+  manifest.json (+ manifest.json.bak)                 authoritative publication manifest
+  .locks/manifest.lock                                per-manifest lock (see ARCHITECTURE_V2 section 14)
+  checkpoints/<name>                                  mutable alias: cache of the manifest head only
+  checkpoints/.revisions/<64-hex full sha256>/<name>  immutable revision file (all new writes)
+  checkpoints/.revisions/<16-hex prefix>/<name>       legacy revision directory (read-only support)
+```
+
+### 1. Local exact-revision guarantee
+
+- A versioned id (`<project>/<run>/<logical_path>@sha256_<digest>`) must carry a full 64-character lowercase hex digest. Any other length or case is rejected with `ArtifactValidationError` before the filesystem is touched.
+- Historical lookup resolves the immutable file from the manifest entry or from `.revisions/<full sha>/`, and falls back to the legacy `.revisions/<sha[:16]>/` directory only for reads. The location check requires a regular, non-symlink file.
+- Content is verified against the full SHA-256, not the 16-character prefix:
+  - When there is no manifest entry, the file is accepted only if its full SHA-256 equals the requested digest (metadata `recovered_from: revisions_dir`).
+  - When there is a manifest entry, the lookup checks existence and type only. `retrieve()` then compares the copied bytes against the recorded size and full SHA-256 before the atomic rename into the destination.
+  - Inside a verified lookup, a file mismatch in the full-sha directory raises `ArtifactValidationError` as corruption. A mismatch in the legacy prefix directory is skipped, because it is a different revision that shares the prefix.
+- A versioned lookup never falls back to the mutable alias `checkpoints/<name>`. If the exact revision cannot be found, the lookup returns nothing.
+- New revisions are written only to `.revisions/<full sha>/`. Directories are created with mode 0700 and files with 0600. The content is staged in a private temporary file and hash-checked before it is linked into place. An existing file with different content is never overwritten. Legacy prefix directories are never written to.
+
+### 2. Latest-alias semantics
+
+- `manifest.json` is authoritative. Its `latest_by_path` map is the only source of the head.
+- The alias `checkpoints/<name>` is a recoverable cache: a verified copy of the head revision. It is rewritten only while the manifest lock is held, by staging a verified copy and atomically replacing the alias.
+- Unversioned reads resolve the head from the manifest, verify the head revision file, and repair the alias under the lock if its content does not match. A missing head revision file raises `ArtifactNotFoundError`. The alias is never used in its place.
+- Publishing a new revision runs under one locked read-modify-write: install the immutable revision, add it to the manifest, save the manifest, then reconcile the alias. A crash between the manifest save and the alias write is repaired on the next publish or unversioned read.
+- Replay of a historical revision (a publish whose digest is already in the manifest but is not the head) verifies the immutable file and returns the record with `is_latest=False`. It leaves the manifest and the alias untouched, so the head never moves.
+- Republishing the current head is idempotent. It re-verifies the immutable file and repairs only the alias.
+- Manifest loss fails closed. If `manifest.json` and `manifest.json.bak` are both missing while `.revisions/` exists under the run directory, `checkpoints/` or `outputs/`, reads and writes raise `StorageError`. The alias is not used to rebuild the manifest. The legacy plain-file lookup is used only when there is neither a manifest nor any `.revisions/` directory.
+- Explicit rollback is not implemented. Republishing or retrieving an older revision does not change the head.
+
+### 3. Crash recovery (local store)
+
+| Crash point | State left on disk | Recovery |
+| --- | --- | --- |
+| During revision staging | Private temporary file; no final revision file | The temporary file is never linked into place. The next publish of the same content installs it again. |
+| After revision install, before manifest save | Immutable revision file present, no manifest entry | A versioned lookup can still return it after full-hash verification. The next publish of the same content re-verifies and reuses it. |
+| After manifest save, before alias write | Manifest head is new, alias is stale | The next publish of the same content, or the next unversioned read, repairs the alias under the lock. |
+| During alias write | Alias is either the old or the new verified content (`os.replace` is atomic) | Same repair path as above. |
+| Lock holder killed | OS releases the `flock` automatically | The next writer acquires the lock. |
+
+A hard kill can leave a temporary `.tmp` file behind, because cleanup runs in a `finally` block. This was not checked against every read path in this review.
+
+### 4. Related limits
+
+- Rollback of the code never deletes local revision files; no code path in this section deletes revisions.
+- Verification is offline only. The behaviour above is not evidence of live Colab or Drive behaviour.

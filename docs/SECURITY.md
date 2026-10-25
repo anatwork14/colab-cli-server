@@ -31,3 +31,16 @@ Only install the real `google-colab-cli` from the official package or Google Git
 ## Responsible disclosure
 
 If you discover a vulnerability involving Google's CLI or Colab backend, follow Google's official vulnerability reporting process. For this wrapper, open a private maintainer contact channel first rather than publishing exploit details or tokens in a public issue.
+
+## Storage hardening controls (PR #24, offline)
+
+These controls are implemented in `colab_adapter/storage/` and are verified only by offline tests. They do not replace the approval gates above.
+
+- **Input validation before side effects.** Project, run, file-name, logical-path and artifact-type inputs are checked against the rules in `colab_adapter/storage/validation.py` before any path, lock, staging directory, journal record or remote request is derived from them. Ids are ASCII. File names are NFC Unicode with no separators, control or format characters. The upload worker re-validates ids read from the transfer journal, which is not trusted as input.
+- **Lock files.** The per-manifest lock is `<run_dir>/.locks/manifest.lock`. The directory is mode 0700 and the file is mode 0600. Symlinked lock paths are refused.
+- **Staging.** Staging directories use hashed names (`stg-<40 hex>`), so raw ids never form a path. Symlinked staging roots and directories are refused, and the resolved path must stay inside the staging root.
+- **Errors.** Untrusted values in validation errors are escaped with `ascii()` and truncated. Drive property error messages show key names and sizes, never values.
+- **Drive quota versus auth.** Drive 403 responses are classified by reason. Quota and auth errors are never retried. Rate-limit errors are retried with a 60-second cap on each wait.
+- **Monitor.** The monitor remains read-only. Its selectors are validated and its listings skip symlinks and internal directories. See `docs/MONITORING_DASHBOARD_V2.md` section 8.
+
+Limit: the Drive store has no compare-and-swap. Its guarantees hold only when every writer to the folder uses this host's locks (see `docs/GOOGLE_DRIVE_ARTIFACTS.md`, "Drive Store Hardening", section 5).

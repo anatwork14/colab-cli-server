@@ -375,3 +375,45 @@ If an operational anomaly or regression is detected in staging or deployment:
 4. **Session Protection**:
    Existing unmanaged Colab sessions remain completely unaffected by rollback, as the adapter never terminates sessions outside `ManagedSessionRegistry`.
 
+## 14. Per-Manifest Locking (PR #24, offline)
+
+Implemented in `colab_adapter/storage/locking.py`.
+
+- **Lock identity.** The lock is keyed by the manifest path. For a manifest at `<run_dir>/manifest.json` the lock file is always `<run_dir>/.locks/manifest.lock`. The local store and the Drive store derive the same path for the same run, so both contend on one lock.
+- **Permissions.** `.locks/` is created with mode 0700 and the lock file with mode 0600. Symlinked lock directories and lock files are refused (`O_NOFOLLOW` plus `lstat`). A lock path that is not a regular file is refused.
+- **Thread level.** One `threading.RLock` per lock key serialises threads in one process.
+- **Re-entrancy.** A reference count per key lets the owning thread nest the context manager. The OS-level `flock` is taken once, on the 0 to 1 transition, and released on the 1 to 0 transition. This is needed because `flock` is per open file description.
+- **Process level.** `fcntl.flock(LOCK_EX | LOCK_NB)` is polled until the deadline. The kernel releases it if the holder dies. On non-POSIX hosts (where `fcntl` is unavailable) only the thread-level lock applies. `CROSS_PROCESS_SUPPORTED` reports which mode is active.
+- **Bounded wait.** Every acquisition waits at most `timeout` seconds (default 60 s for both stores). On timeout it raises `JournalLockError`, a `StorageError` subclass, so callers fail rather than hang.
+- **Scope.** The lock serialises manifest read-modify-write cycles and alias reconciliation on one host. It does not coordinate with writers on other hosts, and it does not protect Google Drive from writers that bypass it (see GOOGLE_DRIVE_ARTIFACTS section 5).
+
+Test coverage for this section is offline and uses temporary directories: `tests/test_shared_manifest_lock.py`, `tests/test_local_cross_process.py`.
+
+## 15. Input Validation Boundaries (PR #24, offline)
+
+Implemented in `colab_adapter/storage/validation.py`. Validators are pure functions and never touch the filesystem.
+
+**Rule set**
+
+- **Project and run ids.** ASCII only. Pattern `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`, checked with `re.fullmatch`, so a trailing newline is rejected. `..` is rejected.
+- **File names.** Unicode is allowed. The name must be 1 to 255 UTF-8 bytes, must not be `.` or `..`, must not start with `.` (reserved for store metadata), must contain no `/` or `\`, must contain no characters in the Unicode categories Cc, Cf, Zl or Zp, and must be NFC-normalised.
+- **Logical paths.** 1 to 512 characters. Not absolute. No empty segments. Every segment must pass the file-name rule.
+- **Artifact types.** Fixed set: `checkpoint`, `log`, `metrics`, `source_snapshot`, `manifest`, `environment`, `output`.
+- **Error text.** Untrusted values are shown with `ascii()` and truncated to 200 characters, so control characters cannot reach logs.
+
+**Where validation runs**
+
+- Local publish validates project, run and type before the source file is checked, hashed, or any directory is created.
+- The upload worker validates before the source is touched, before any lock path, staging directory, journal record or remote call is derived from the input.
+- The worker re-validates ids read back from the journal before using them to build a lock path or a remote request. Journal content is not trusted.
+- Drive publish and Drive read paths (`get_metadata`, `retrieve`) validate the project and run segments of the artifact id before any manifest read or network call.
+- The project name in a project manifest is validated at load time as the storage id `proj-<name>`. An unusable name fails in `ManifestValidationError` at load, not at publish.
+- Monitor selectors (`?project=`, run ids in paths) use a bounded ASCII pattern and reject `..`. An invalid selector returns HTTP 400.
+
+**Staging names**
+
+- Staging directories are named `stg-<40 hex>`, where the hex is the first 40 characters of `sha256(project \0 run \0 sha256)`. Raw ids are never joined into a path, so distinct (project, run) pairs cannot collide.
+- A symlinked staging root or staging directory is refused. The resolved staging directory must stay inside the resolved staging root.
+
+Test coverage is offline: `tests/test_storage_input_validation.py`, `tests/test_drive_pending_promotion.py`, `tests/test_review_followups_pr24.py`.
+
