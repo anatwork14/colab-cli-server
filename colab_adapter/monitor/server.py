@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import secrets
 import ssl
 import threading
 import time
@@ -35,13 +36,31 @@ from .schemas import HealthStatus, MonitoringSummary, RunSummary, _iso_now
 try:
     from .ui import DASHBOARD_HTML as _EMBEDDED_HTML_DASHBOARD
 except ImportError:
+    _EMBEDDED_HTML_DASHBOARD = None
+
+try:
+    from .ui import render_dashboard_html as _render_dashboard_html
+except (ImportError, AttributeError):
+    _render_dashboard_html = None
+
+try:
+    from .ui import get_dashboard_js as _get_dashboard_js
+except (ImportError, AttributeError):
+    _get_dashboard_js = None
+
+try:
+    from .ui import get_dashboard_css as _get_dashboard_css
+except (ImportError, AttributeError):
+    _get_dashboard_css = None
+
+if _EMBEDDED_HTML_DASHBOARD is None:
     _EMBEDDED_HTML_DASHBOARD = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Colab Monitor — V2 Remote GPU Workspaces</title>
-  <style>
+  <style nonce="__CSP_NONCE__">
     :root {
       --bg: #0d1117;
       --card-bg: #161b22;
@@ -221,7 +240,7 @@ except ImportError:
   </div>
 
 
-  <script>
+  <script nonce="__CSP_NONCE__">
     let token = sessionStorage.getItem('colab_monitor_token') || '';
 
     function getHeaders() {
@@ -276,12 +295,80 @@ except ImportError:
 """
 
 
+def _inject_csp_nonce(html_str: str, csp_nonce: str) -> str:
+    """Inject cryptographic CSP nonce into HTML script and style tags."""
+    if "__CSP_NONCE__" in html_str:
+        html_str = html_str.replace("__CSP_NONCE__", csp_nonce)
+
+    def _replace_script(m: re.Match) -> str:
+        tag = m.group(0)
+        if "nonce=" in tag:
+            return tag
+        return f'<script nonce="{csp_nonce}"' + tag[7:]
+
+    html_str = re.sub(r"<script(\s[^>]*)?>", _replace_script, html_str, flags=re.IGNORECASE)
+
+    def _replace_style(m: re.Match) -> str:
+        tag = m.group(0)
+        if "nonce=" in tag:
+            return tag
+        return f'<style nonce="{csp_nonce}"' + tag[6:]
+
+    html_str = re.sub(r"<style(\s[^>]*)?>", _replace_style, html_str, flags=re.IGNORECASE)
+    return html_str
+
+
+def _extract_css_from_html(html: str) -> str:
+    """Extract raw CSS rules from <style> blocks in HTML."""
+    styles = re.findall(r"<style[^>]*>(.*?)</style>", html, flags=re.DOTALL | re.IGNORECASE)
+    if styles:
+        return "\n".join(s.strip() for s in styles)
+    return ""
+
+
+def _extract_js_from_html(html: str) -> str:
+    """Extract raw JavaScript code from <script> blocks in HTML."""
+    scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, flags=re.DOTALL | re.IGNORECASE)
+    if scripts:
+        return "\n".join(s.strip() for s in scripts)
+    return ""
+
+
+def _sanitize_path_or_url(url_path: str) -> str:
+    """Redact sensitive query parameters (?token=..., ?access_token=...) from URLs/paths."""
+    return re.sub(
+        r"([?&](?:token|access_token|key|secret|auth|bearer)=)[^&]+",
+        r"\1[REDACTED]",
+        url_path,
+        flags=re.IGNORECASE,
+    )
+
+
 class MonitorRequestHandler(BaseHTTPRequestHandler):
     """Handles read-only authenticated HTTP requests for the monitor."""
 
     server: "MonitorServer"
 
-    def _send_cors_and_security_headers(self) -> None:
+    def _send_security_headers(self, csp_nonce: Optional[str] = None) -> None:
+        """Send defense-in-depth security headers with strict CSP and zero 'unsafe-inline'."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        if csp_nonce:
+            self.send_header(
+                "Content-Security-Policy",
+                f"default-src 'self'; script-src 'self' 'nonce-{csp_nonce}'; style-src 'self' 'nonce-{csp_nonce}'; "
+                f"img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            )
+        else:
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'self'; style-src 'self'; "
+                "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            )
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+
+    def _send_cors_and_security_headers(self, csp_nonce: Optional[str] = None) -> None:
         """Enforce strict CORS and defense-in-depth security headers."""
         origin = self.headers.get("Origin")
         allowed = getattr(self.server, "allowed_origins", None) or [
@@ -289,17 +376,13 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             "http://127.0.0.1:8080",
         ]
 
-        if origin and origin in allowed:
+        if origin and origin != "*" and origin in allowed and "*" not in origin:
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Headers", "Authorization, X-API-Token, Content-Type")
             self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
 
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self._send_security_headers(csp_nonce=csp_nonce)
 
     def _is_authenticated(self, query_params: Dict[str, List[str]]) -> bool:
         """Validate credentials from Authorization header, X-API-Token, or trusted gateway."""
@@ -370,9 +453,41 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self._send_cors_and_security_headers()
+        self._send_cors_and_security_headers(csp_nonce=None)
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_html(
+        self,
+        body: Union[str, bytes],
+        csp_nonce: Optional[str] = None,
+        status: int = 200,
+    ) -> None:
+        encoded = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self._send_cors_and_security_headers(csp_nonce=csp_nonce)
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_js(self, body: Union[str, bytes], status: int = 200) -> None:
+        encoded = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(status)
+        self.send_header("Content-Type", "application/javascript; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self._send_cors_and_security_headers(csp_nonce=None)
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_css(self, body: Union[str, bytes], status: int = 200) -> None:
+        encoded = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(status)
+        self.send_header("Content-Type", "text/css; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self._send_cors_and_security_headers(csp_nonce=None)
+        self.end_headers()
+        self.wfile.write(encoded)
 
     def _send_401(self) -> None:
         self._send_json(
@@ -389,7 +504,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
-        self._send_cors_and_security_headers()
+        self._send_cors_and_security_headers(csp_nonce=None)
         self.end_headers()
 
     def do_POST(self) -> None:
@@ -408,14 +523,64 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
         # Serve static HTML/JS dashboard without token prompt on root if public, or check auth
         if path in ("/", "/index.html"):
-            dashboard_content = getattr(self.server, "dashboard_html", _EMBEDDED_HTML_DASHBOARD)
-            body = dashboard_content.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self._send_cors_and_security_headers()
-            self.end_headers()
-            self.wfile.write(body)
+            csp_nonce = secrets.token_urlsafe(18)
+            raw_html: Optional[str] = None
+
+            # If a custom dashboard_html was passed to MonitorServer, respect it
+            custom_html = getattr(self.server, "dashboard_html", None)
+            if custom_html and custom_html != _EMBEDDED_HTML_DASHBOARD:
+                raw_html = custom_html
+            elif _render_dashboard_html is not None:
+                try:
+                    raw_html = _render_dashboard_html(csp_nonce=csp_nonce)
+                except TypeError:
+                    try:
+                        raw_html = _render_dashboard_html()
+                    except Exception:
+                        raw_html = getattr(self.server, "dashboard_html", _EMBEDDED_HTML_DASHBOARD)
+                except Exception:
+                    raw_html = getattr(self.server, "dashboard_html", _EMBEDDED_HTML_DASHBOARD)
+            else:
+                raw_html = getattr(self.server, "dashboard_html", _EMBEDDED_HTML_DASHBOARD)
+
+            final_html = _inject_csp_nonce(raw_html, csp_nonce)
+            self._send_html(final_html, csp_nonce=csp_nonce)
+            return
+
+        elif path == "/monitor.js":
+            js_content = ""
+            if _get_dashboard_js is not None:
+                try:
+                    js_content = _get_dashboard_js()
+                except Exception:
+                    js_content = ""
+            if not js_content:
+                dashboard_content = getattr(self.server, "dashboard_html", None)
+                if not dashboard_content and _render_dashboard_html is not None:
+                    try:
+                        dashboard_content = _render_dashboard_html()
+                    except Exception:
+                        dashboard_content = _EMBEDDED_HTML_DASHBOARD
+                js_content = _extract_js_from_html(dashboard_content or _EMBEDDED_HTML_DASHBOARD)
+            self._send_js(js_content)
+            return
+
+        elif path == "/monitor.css":
+            css_content = ""
+            if _get_dashboard_css is not None:
+                try:
+                    css_content = _get_dashboard_css()
+                except Exception:
+                    css_content = ""
+            if not css_content:
+                dashboard_content = getattr(self.server, "dashboard_html", None)
+                if not dashboard_content and _render_dashboard_html is not None:
+                    try:
+                        dashboard_content = _render_dashboard_html()
+                    except Exception:
+                        dashboard_content = _EMBEDDED_HTML_DASHBOARD
+                css_content = _extract_css_from_html(dashboard_content or _EMBEDDED_HTML_DASHBOARD)
+            self._send_css(css_content)
             return
 
         # All API endpoints require authentication (Q26)
@@ -704,7 +869,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
-        self._send_cors_and_security_headers()
+        self._send_cors_and_security_headers(csp_nonce=None)
         self.end_headers()
 
         events = self.server.telemetry.get_events()
@@ -749,7 +914,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/csv; charset=utf-8")
         self.send_header("Content-Disposition", "attachment; filename=\"colab_compute_usage.csv\"")
         self.send_header("Content-Length", str(len(csv_bytes)))
-        self._send_cors_and_security_headers()
+        self._send_cors_and_security_headers(csp_nonce=None)
         self.end_headers()
         self.wfile.write(csv_bytes)
 
