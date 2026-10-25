@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.8", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,9 +21,40 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Check Python syntax
         run: python -m compileall -q colab_server.py examples tests
+      - name: Install dependencies
+        run: |
+          pip install pytest 2>/dev/null || true
+          if [ -f setup.py ] || [ -f pyproject.toml ]; then
+            pip install -e ".[dev]" 2>/dev/null || true
+          fi
       - name: Run offline tests
-        run: python -m unittest discover -s tests -v
+        run: pytest -v 2>/dev/null || python -m unittest discover -s tests -v
       - name: Check shell syntax
         run: bash -n scripts/install.sh scripts/authenticate.sh
       - name: Dry-run local plan (never allocates)
         run: python colab_server.py plan --gpu T4 --script examples/gpu_probe.py
+
+  browser-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Python dependencies
+        run: |
+          pip install -e ".[dev]" 2>/dev/null || true
+      - name: Install pinned Playwright and Chromium
+        run: |
+          npm init -y
+          npm install playwright-core@1.51.0
+          npx playwright install --with-deps chromium
+          node -e "const pw = require('playwright-core'); console.log('Chromium path:', pw.chromium.executablePath());"
+      - name: Run real headless Chromium security suite
+        env:
+          COLAB_REQUIRE_BROWSER_TESTS: "1"
+        run: |
+          python -m unittest tests/test_browser_xss_and_cross_process_qa.py -v
