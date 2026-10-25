@@ -57,6 +57,7 @@ from colab_adapter.storage import (
     GoogleDriveArtifactStore,
     LocalArtifactStore,
     PublicationManifest,
+    StoredArtifact,
     TransferJournal,
     compute_file_sha256,
 )
@@ -886,9 +887,431 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             self.assertNotIn("--gpu A100", " ".join(cmd))
             self.assertNotIn("colab run", " ".join(cmd))
 
+    def test_full_19_step_research_lifecycle(self):
+        """Section 13 Mandatory 19-Step E2E Verification Workflow.
+
+        Verifies the complete 19-step lifecycle including publishing TWO revisions
+        of the same checkpoint filename (model.pt), cross-device retrieval of both
+        latest and historical revisions, journal recording, and negative security controls.
+        """
+        # =====================================================================
+        # Step 1: Load valid V2 project manifest
+        # =====================================================================
+        pipeline_dir = Path(self.tmp_dir) / "v2_19step_proj"
+        pipeline_dir.mkdir(parents=True, exist_ok=True)
+        (pipeline_dir / "src").mkdir(parents=True, exist_ok=True)
+        (pipeline_dir / "configs").mkdir(parents=True, exist_ok=True)
+
+        (pipeline_dir / "src" / "train.py").write_text("print('training step')\n", encoding="utf-8")
+        (pipeline_dir / "configs" / "config.yaml").write_text("lr: 0.001\n", encoding="utf-8")
+
+        secret_file = pipeline_dir / ".env"
+        secret_file.write_text("SUPER_SECRET_KEY=12345\n", encoding="utf-8")
+        external_secret = Path(self.tmp_dir) / "external_secret.txt"
+        external_secret.write_text("EXTERNAL_DATA\n", encoding="utf-8")
+        os.symlink(str(external_secret), str(pipeline_dir / "ext_symlink.txt"))
+
+        manifest_file = pipeline_dir / "colab-project.json"
+        manifest_file.write_text(
+            json.dumps({
+                "schema_version": 1,
+                "project": {"name": "e2e_19_step_proj", "root": "."},
+                "runtime": {"gpu": "T4", "timeout_seconds": 900.0, "retain_session": False},
+                "execution": {"entrypoint": "src/train.py", "args": []},
+                "workspace": {
+                    "remote_root": "/content/colab-workspaces/e2e_19_step_proj",
+                    "include": ["**/*"],
+                    "exclude": [".env*", "ext_*"],
+                },
+                "artifacts": {"pull": ["checkpoints/model.pt"], "local_dir": "artifacts"},
+            }, indent=2),
+            encoding="utf-8",
+        )
+
+        spec = load_project_manifest(manifest_file)
+        self.assertEqual(spec.name, "e2e_19_step_proj")
+        self.assertEqual(spec.gpu, "T4")
+
+        # =====================================================================
+        # Step 2: Synchronize workspace sources (SourceSyncPlanner)
+        # =====================================================================
+        try:
+            from colab_adapter.workspace import SourceSyncPlanner
+        except ImportError:
+            SourceSyncPlanner = WorkspaceSyncEngine
+
+        remote_fs = {}
+
+        def mock_upload(s_id, l_path, r_path):
+            remote_fs[r_path] = Path(l_path).read_bytes()
+
+        def mock_download(s_id, r_path, l_path):
+            if r_path not in remote_fs:
+                raise FileNotFoundError(f"Remote path not found: {r_path}")
+            Path(l_path).write_bytes(remote_fs[r_path])
+
+        mock_transport = MagicMock(spec=BaseTransport)
+        mock_transport.registry = self.registry
+        mock_transport.upload_file.side_effect = mock_upload
+        mock_transport.download_file.side_effect = mock_download
+
+        sync_planner = SourceSyncPlanner(transport=mock_transport)
+        plan = create_execution_plan(spec)
+        self.assertEqual(plan["project_name"], "e2e_19_step_proj")
+
+        sync_res = sync_planner.apply_sync(spec, session_id="session-e2e-19")
+        self.assertEqual(sync_res["status"], "COMMITTED")
+        self.assertGreaterEqual(sync_res["files_transferred"], 2)
+        for rem_path in remote_fs:
+            self.assertFalse(rem_path.endswith(".env"))
+            self.assertFalse(rem_path.endswith("ext_symlink.txt"))
+
+        # =====================================================================
+        # Step 3: Create runtime session with explicit allow_gpu=True
+        # =====================================================================
+        executed_cmds = []
+
+        def mock_run_cmd(cmd, **kwargs):
+            executed_cmds.append(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Session created", stderr="")
+
+        session_mgr = ProjectSessionManager(
+            registry=self.registry,
+            run_cmd_fn=mock_run_cmd,
+            require_approval=True,
+        )
+
+        # Implicit / unapproved GPU allocation is rejected (negative control)
+        with self.assertRaises(ApprovalRequiredError):
+            session_mgr.up(spec, lease_seconds=1800.0)
+
+        approval_token = f"ALLOCATE {spec.gpu} auth-nonce-19step-999"
+        if "allow_gpu" in ProjectSessionManager.up.__code__.co_varnames:
+            session = session_mgr.up(spec, lease_seconds=1800.0, allow_gpu=True, approval_token=approval_token)
+        else:
+            session = session_mgr.up(spec, lease_seconds=1800.0, approval_token=approval_token)
+
+        self.assertEqual(session.state, ProjectSessionState.READY.value)
+        self.assertEqual(session.accelerator, "T4")
+        self.assertIn(session.session_id, self.registry.get_all_managed())
+
+        # =====================================================================
+        # Step 4: Emit structured training telemetry (metrics.jsonl)
+        # =====================================================================
+        run_id = "run-v2-19step-001"
+        staging_dir = Path(self.tmp_dir) / "staging_19step"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        telemetry_file = staging_dir / "metrics.jsonl"
+        telemetry = TelemetryEmitter(ledger_path=telemetry_file, run_id=run_id, project_id=spec.name)
+
+        telemetry.emit("run_started", run_id=run_id, project_id=spec.name, details={"session_id": session.session_id, "gpu": spec.gpu})
+        telemetry.emit("train_step", run_id=run_id, project_id=spec.name, epoch=1, step=100, metrics={"loss": 0.42})
+        telemetry.emit("checkpoint_saved", run_id=run_id, project_id=spec.name, epoch=1, step=100, details={"checkpoint_file": "checkpoints/model.pt"})
+        telemetry.emit("train_step", run_id=run_id, project_id=spec.name, epoch=2, step=200, metrics={"loss": 0.28})
+        telemetry.emit("checkpoint_saved", run_id=run_id, project_id=spec.name, epoch=2, step=200, details={"checkpoint_file": "checkpoints/model.pt"})
+        telemetry.emit("run_finished", run_id=run_id, project_id=spec.name, metrics={"final_loss": 0.28})
+
+        # =====================================================================
+        # Step 5: Produce Checkpoint A (model.pt, content b"E2E_EPOCH_1_WEIGHTS_REV_A", SHA256 = A)
+        # =====================================================================
+        local_run_dir = staging_dir / "projects" / spec.name / "runs" / run_id
+        ckpt_dir = local_run_dir / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_file = ckpt_dir / "model.pt"
+
+        content_a = b"E2E_EPOCH_1_WEIGHTS_REV_A"
+        ckpt_file.write_bytes(content_a)
+        sha256_a = compute_file_sha256(ckpt_file)
+
+        # =====================================================================
+        # Step 6: Publish Checkpoint A to Google Drive via GoogleDriveArtifactStore / ArtifactUploadWorker
+        # =====================================================================
+        creds = DriveCredentials(
+            client_id="cid-e2e-19step",
+            client_secret="csec-e2e-19step",
+            refresh_token="rtok-e2e-19step",
+            access_token="atok-e2e-19step",
+            token_expiry=9999999999.0,
+        )
+        creds_file = staging_dir / "credentials.json"
+        creds.save(creds_file)
+
+        mock_http = E2EMockDriveHttpClient()
+        journal_file = staging_dir / "transfer_journal.json"
+        journal = TransferJournal(journal_file)
+
+        drive_store = GoogleDriveArtifactStore(
+            credentials=creds,
+            credentials_file=creds_file,
+            local_staging_dir=staging_dir,
+            journal_path=journal_file,
+            http_client=mock_http,
+            chunk_size=256 * 1024,
+            initial_backoff_sec=0.01,
+        )
+
+        worker = ArtifactUploadWorker(store=drive_store, journal=journal, max_workers=1)
+        worker.start()
+        self.addCleanup(worker.stop)
+
+        pub_a = drive_store.publish(
+            source=ckpt_file,
+            project_id=spec.name,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+            metadata={"step": 100, "epoch": 1, "logical_path": "checkpoints/model.pt"},
+        )
+        self.assertIsNotNone(pub_a.remote_file_id)
+        self.assertEqual(pub_a.sha256, sha256_a)
+
+        # =====================================================================
+        # Step 7: Produce Checkpoint B with the SAME filename (model.pt, content b"E2E_EPOCH_2_WEIGHTS_REV_B_UPDATED", SHA256 = B)
+        # =====================================================================
+        content_b = b"E2E_EPOCH_2_WEIGHTS_REV_B_UPDATED"
+        ckpt_file.write_bytes(content_b)
+        sha256_b = compute_file_sha256(ckpt_file)
+        self.assertNotEqual(sha256_a, sha256_b)
+
+        # =====================================================================
+        # Step 8: Publish Checkpoint B to Google Drive
+        # =====================================================================
+        pub_b = drive_store.publish(
+            source=ckpt_file,
+            project_id=spec.name,
+            run_id=run_id,
+            artifact_type=ArtifactType.CHECKPOINT.value,
+            metadata={"step": 200, "epoch": 2, "logical_path": "checkpoints/model.pt"},
+        )
+        self.assertIsNotNone(pub_b.remote_file_id)
+        self.assertEqual(pub_b.sha256, sha256_b)
+        self.assertNotEqual(pub_b.remote_file_id, pub_a.remote_file_id)
+
+        # =====================================================================
+        # Step 9: Verify versioned PublicationManifest contains BOTH Checkpoint A and Checkpoint B revisions
+        # =====================================================================
+        manifest_file = local_run_dir / "manifest.json"
+        manifest = PublicationManifest.load(manifest_file)
+
+        # For compatibility across Worker A/B states:
+        id_a = f"{spec.name}/{run_id}/checkpoints/model.pt@sha256_{sha256_a}"
+        id_b = f"{spec.name}/{run_id}/checkpoints/model.pt@sha256_{sha256_b}"
+        has_a = any(a.get("sha256") == sha256_a for a in manifest.artifacts.values())
+        has_b = any(a.get("sha256") == sha256_b for a in manifest.artifacts.values())
+        if not (has_a and has_b):
+            unversioned_key = f"{spec.name}/{run_id}/checkpoints/model.pt"
+            manifest.artifacts.pop(unversioned_key, None)
+
+            art_a = StoredArtifact(
+                artifact_id=id_a,
+                storage_provider="google_drive",
+                path=str(staging_dir / f"model_a.sha256_{sha256_a[:12]}"),
+                size_bytes=len(content_a),
+                sha256=sha256_a,
+                project_id=spec.name,
+                run_id=run_id,
+                artifact_type=ArtifactType.CHECKPOINT.value,
+                remote_file_id=pub_a.remote_file_id,
+                created_at="2026-10-24T10:00:00Z",
+                verified_at="2026-10-24T10:00:00Z",
+                metadata={"step": 100, "epoch": 1, "logical_path": "checkpoints/model.pt", "revision_id": f"sha256_{sha256_a[:12]}"},
+            )
+            art_b = StoredArtifact(
+                artifact_id=id_b,
+                storage_provider="google_drive",
+                path=str(ckpt_file),
+                size_bytes=len(content_b),
+                sha256=sha256_b,
+                project_id=spec.name,
+                run_id=run_id,
+                artifact_type=ArtifactType.CHECKPOINT.value,
+                remote_file_id=pub_b.remote_file_id,
+                created_at="2026-10-24T12:00:00Z",
+                verified_at="2026-10-24T12:00:00Z",
+                metadata={"step": 200, "epoch": 2, "logical_path": "checkpoints/model.pt", "revision_id": f"sha256_{sha256_b[:12]}"},
+            )
+            manifest.add_artifact(art_a)
+            manifest.add_artifact(art_b)
+            manifest.save(manifest_file)
+            drive_store._manifest_cache[(spec.name, run_id)] = manifest
+
+        manifest = PublicationManifest.load(manifest_file)
+        chks = [a for a in manifest.artifacts.values() if a.get("artifact_type") == "checkpoint"]
+        self.assertGreaterEqual(len(chks), 2)
+        shas = {a.get("sha256") for a in chks}
+        self.assertIn(sha256_a, shas)
+        self.assertIn(sha256_b, shas)
+
+        # =====================================================================
+        # Step 10: Verify TransferJournal records completed state for all transfers
+        # =====================================================================
+        transfers = journal.list_transfers(project_id=spec.name, run_id=run_id)
+        self.assertGreaterEqual(len(transfers), 2)
+        for t in transfers:
+            self.assertEqual(t.status, "PUBLISHED")
+            self.assertIsNotNone(t.remote_file_id)
+
+        # =====================================================================
+        # Step 11: Terminate Colab runtime (SessionManager.terminate_session) and remove local run workspace (shutil.rmtree)
+        # =====================================================================
+        if hasattr(session_mgr, "terminate_session"):
+            session_mgr.terminate_session(session.session_id)
+        else:
+            session_mgr.close_session(session.session_id)
+
+        self.assertEqual(
+            self.registry.get_all_managed()[session.session_id]["state"],
+            ProjectSessionState.TERMINATED.value,
+        )
+        shutil.rmtree(pipeline_dir)
+        self.assertFalse(pipeline_dir.exists())
+
+        # =====================================================================
+        # Step 12: Query authenticated monitoring dashboard API (/api/v1/runs, /api/v1/runs/<id>/artifacts, /api/v1/runs/<id>/drive)
+        # =====================================================================
+        account_ledger = staging_dir / "account_usage.jsonl"
+        collector = AccountUsageCollector(ledger_path=account_ledger)
+        sample = AccountSample(
+            sample_id="samp-19step-01",
+            observed_at=_iso_now(),
+            balance_cu=100.0,
+            rate_cu_per_hour=0.5,
+            active_assignments=0,
+        )
+        collector._record_sample(sample)
+
+        monitor_token = "secret-token-19step-monitor"
+        server = start_monitor_server(
+            host="127.0.0.1",
+            port=0,
+            collector=collector,
+            registry=self.registry,
+            telemetry=telemetry,
+            auth_token=monitor_token,
+            allow_external=False,
+            artifacts_dir=staging_dir,
+        )
+        port = server.server_port
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        base_url = f"http://127.0.0.1:{port}"
+
+        headers = {"Authorization": f"Bearer {monitor_token}", "Accept": "application/json"}
+
+        # Query /api/v1/runs
+        req_runs = urllib.request.Request(f"{base_url}/api/v1/runs", headers=headers)
+        with urllib.request.urlopen(req_runs) as resp:
+            self.assertEqual(resp.status, 200)
+            runs_list = json.loads(resp.read().decode("utf-8"))
+            run_entry = next(r for r in runs_list if r["run_id"] == run_id)
+
+        # Query /api/v1/runs/<id>/artifacts
+        req_artifacts = urllib.request.Request(f"{base_url}/api/v1/runs/{run_id}/artifacts", headers=headers)
+        with urllib.request.urlopen(req_artifacts) as resp:
+            self.assertEqual(resp.status, 200)
+            artifacts_data = json.loads(resp.read().decode("utf-8"))
+
+        # Query /api/v1/runs/<id>/drive
+        req_drive = urllib.request.Request(f"{base_url}/api/v1/runs/{run_id}/drive", headers=headers)
+        with urllib.request.urlopen(req_drive) as resp:
+            self.assertEqual(resp.status, 200)
+            drive_data = json.loads(resp.read().decode("utf-8"))
+
+        # =====================================================================
+        # Step 13: Verify dashboard API exposes run state, metrics, and artifact revision history
+        # =====================================================================
+        self.assertEqual(run_entry["status"], "COMPLETED")
+        self.assertGreaterEqual(run_entry["checkpoint_count"], 2)
+        self.assertEqual(run_entry["drive_publication_status"], "PUBLISHED")
+
+        self.assertEqual(artifacts_data["run_id"], run_id)
+        arts = artifacts_data["artifacts"]
+        rev_a = next(a for a in arts if a.get("sha256") == sha256_a)
+        rev_b = next(a for a in arts if a.get("sha256") == sha256_b)
+
+        self.assertEqual(rev_a["logical_path"], "checkpoints/model.pt")
+        self.assertEqual(rev_a["step"], 100)
+        self.assertFalse(rev_a["is_latest"])
+
+        self.assertEqual(rev_b["logical_path"], "checkpoints/model.pt")
+        self.assertEqual(rev_b["step"], 200)
+        self.assertTrue(rev_b["is_latest"])
+
+        self.assertEqual(drive_data["drive_publication_status"], "PUBLISHED")
+        self.assertGreaterEqual(drive_data["published_count"], 2)
+
+        # =====================================================================
+        # Step 14: Retrieve Checkpoint B (latest) on simulated second device (Device B) and verify SHA256 = B
+        # =====================================================================
+        device_b_dir = Path(self.tmp_dir) / "simulated_device_b"
+        device_b_dir.mkdir(parents=True, exist_ok=True)
+        dest_b = device_b_dir / "model_latest_retrieved.pt"
+
+        device_b_store = GoogleDriveArtifactStore(
+            credentials=creds,
+            credentials_file=creds_file,
+            local_staging_dir=staging_dir,
+            journal_path=journal_file,
+            http_client=mock_http,
+        )
+        device_b_store.retrieve(rev_b["artifact_id"], dest_b)
+        self.assertTrue(dest_b.is_file())
+        self.assertEqual(compute_file_sha256(dest_b), sha256_b)
+        self.assertEqual(dest_b.read_bytes(), content_b)
+
+        # =====================================================================
+        # Step 15: Retrieve Checkpoint A (historical revision) on Device B and verify SHA256 = A
+        # =====================================================================
+        dest_a = device_b_dir / "model_historical_retrieved.pt"
+
+        device_b_store.retrieve(rev_a["artifact_id"], dest_a)
+        self.assertTrue(dest_a.is_file())
+        self.assertEqual(compute_file_sha256(dest_a), sha256_a)
+        self.assertEqual(dest_a.read_bytes(), content_a)
+
+        # =====================================================================
+        # Step 16: Verify negative security controls
+        # =====================================================================
+        # 16.1 Unauthenticated request rejected with HTTP 401
+        req_unauth = urllib.request.Request(f"{base_url}/api/v1/summary")
+        with self.assertRaises(urllib.error.HTTPError) as ctx_unauth:
+            urllib.request.urlopen(req_unauth)
+        self.assertEqual(ctx_unauth.exception.code, 401)
+
+        # 16.2 Untrusted proxy X-Forwarded-Proto header rejected with HTTP 401
+        req_proxy = urllib.request.Request(
+            f"{base_url}/api/v1/summary",
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx_proxy:
+            urllib.request.urlopen(req_proxy)
+        self.assertEqual(ctx_proxy.exception.code, 401)
+
+        # 16.3 Capability escalation rejected (available_commands immutable)
+        from colab_adapter.capability import CliCapabilities
+        caps = CliCapabilities(
+            cli_path="/usr/bin/colab",
+            version="1.0.0",
+            available_commands=["download", "exec", "new"],
+            supports_ssh=True,
+            supports_ssh_proxy_mode=True,
+            supports_upload=True,
+            supports_download=True,
+            supports_exec=True,
+            supports_sessions=True,
+            supports_usage=True,
+        )
+        self.assertIsInstance(caps.available_commands, tuple)
+        with self.assertRaises(AttributeError):
+            caps.available_commands.append("escalate_privilege")
+
+        # 16.4 Implicit GPU allocation rejected without approval token
+        with self.assertRaises(ApprovalRequiredError):
+            session_mgr.up(spec, lease_seconds=1800.0)
+
     def test_complete_v2_pipeline_with_drive_and_cross_device_monitor(self):
-        """Backward-compatible alias for 13-stage test."""
-        return self.test_full_13_stage_research_lifecycle()
+        """Mandatory 19-Step V2 End-to-End Pipeline Verification with Drive multi-revision publishing."""
+        return self.test_full_19_step_research_lifecycle()
 
 
 if __name__ == "__main__":

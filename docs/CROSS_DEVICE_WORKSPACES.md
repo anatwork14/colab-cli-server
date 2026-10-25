@@ -91,6 +91,33 @@ When multiple local processes (e.g., concurrent training jobs, background upload
 
 ---
 
+## Cross-Device Artifact Revision Retrieval & PublicationManifest V2
+
+When secondary workstations (e.g. MacBook, Windows PC) attach to an active or historical run via the Workspace Broker or query `/api/v1/runs/<run_id>/artifacts`:
+
+### 1. Canonical Revision Keying
+- Every checkpoint revision published to Google Drive is indexed by its immutable canonical ID:
+  `<project_id>/<run_id>/<logical_path>@sha256_<full_sha256>`
+- When multiple training epochs overwrite the same filename (e.g., `model.pt`), each distinct revision retains its own permanent remote file ID and SHA256 checksum.
+
+### 2. PublicationManifest V2 Schema
+- Manifests on disk follow schema version 2 (`manifest_version: 2`).
+- The `latest_by_path` index allows secondary devices to resolve the current active checkpoint for any logical path without inspecting every revision.
+- `migration_notes` records all automated schema transformations from older V1 structures.
+
+### 3. Retrieving Latest vs. Specific Historical Revisions
+- **Latest Checkpoint**: Querying the unversioned logical path (`checkpoints/model.pt`) uses `latest_by_path` to download the newest verified weights (e.g., Checkpoint B).
+- **Historical Revision**: Supplying the versioned artifact ID (`checkpoints/model.pt@sha256_<hash>`) downloads the exact historical weights from that earlier epoch (e.g., Checkpoint A), accompanied by complete SHA256 verification.
+
+### 4. Cross-Process Locking & Staging Protection
+- Concurrent background upload processes and broker readers synchronize using `.manifest.lock` via `fcntl.flock`.
+- Staged uploads use private temporary files (`*.sha256_*`), ensuring secondary clients never download partially committed artifacts.
+
+### 5. Real-Browser CI Security Testing
+- Headless browser verification (Playwright/Chromium) in CI tests multi-client attachment, ensuring `#artifacts-table` displays `LATEST` and `HISTORICAL` badges cleanly without inline event handlers or innerHTML vulnerabilities.
+
+---
+
 ## Dashboard XSS & CSP Security Architecture
 
 For browser clients accessing the embedded monitoring UI through the broker:

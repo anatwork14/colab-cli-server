@@ -753,18 +753,19 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                             run = runs_map[r_id]
                             if not run.get("start_time"):
                                 run["start_time"] = m_data.get("created_at")
-                            artifacts_dict = m_data.get("artifacts", {})
-                            for a_val in artifacts_dict.values():
-                                a_type = a_val.get("artifact_type")
-                                if a_type == "checkpoint":
-                                    run["checkpoint_count"] = max(run["checkpoint_count"], 1)
-                                    run["latest_checkpoint_name"] = Path(a_val.get("path", "")).name
-                                    run["latest_checkpoint_sha256"] = a_val.get("sha256")
-                                if a_val.get("storage_provider") == "google_drive" or a_val.get("remote_file_id"):
-                                    run["drive_publication_status"] = "PUBLISHED"
-                                    run["drive_file_id"] = a_val.get("remote_file_id")
-                                if a_type == "source_snapshot":
-                                    run["source_snapshot_available"] = True
+                            run_arts = self._collect_run_artifacts_and_drive(r_id, manifest_data=m_data, run_dir=r_dir)
+                            chk_arts = [a for a in run_arts if a.get("artifact_type") == "checkpoint" or a.get("category") == "checkpoint"]
+                            if chk_arts:
+                                run["checkpoint_count"] = max(run.get("checkpoint_count", 0), len(chk_arts))
+                                latest_chk = next((a for a in chk_arts if a.get("is_latest")), chk_arts[-1])
+                                run["latest_checkpoint_name"] = Path(latest_chk.get("logical_path") or latest_chk.get("path", "")).name
+                                run["latest_checkpoint_sha256"] = latest_chk.get("sha256")
+                            drive_arts = [a for a in run_arts if a.get("storage_provider") == "google_drive" or a.get("remote_file_id") or a.get("remote_available")]
+                            if drive_arts:
+                                run["drive_publication_status"] = "PUBLISHED"
+                                run["drive_file_id"] = drive_arts[-1].get("remote_file_id")
+                            if any(a.get("artifact_type") == "source_snapshot" for a in run_arts):
+                                run["source_snapshot_available"] = True
                         except Exception:
                             pass
 
@@ -780,6 +781,182 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 run["source_snapshot_available"] = False
 
         self._send_json(list(runs_map.values()))
+
+    def _collect_run_artifacts_and_drive(
+        self,
+        run_id: str,
+        manifest_data: Optional[Dict[str, Any]] = None,
+        run_dir: Optional[Path] = None,
+    ) -> List[Dict[str, Any]]:
+        """Collect and normalize run artifacts and historical revisions with drive status."""
+        artifacts_root = getattr(self.server, "artifacts_dir", Path("./artifacts").resolve())
+        if manifest_data is None or run_dir is None:
+            proj_base = artifacts_root / "projects"
+            if proj_base.is_dir():
+                for p_dir in proj_base.iterdir():
+                    candidate_dir = p_dir / "runs" / run_id
+                    candidate_m = candidate_dir / "manifest.json"
+                    if candidate_m.is_file():
+                        if manifest_data is None:
+                            try:
+                                with open(candidate_m, "r", encoding="utf-8") as mf:
+                                    manifest_data = json.load(mf)
+                            except Exception:
+                                pass
+                        if run_dir is None:
+                            run_dir = candidate_dir
+                        break
+                    elif candidate_dir.is_dir() and run_dir is None:
+                        run_dir = candidate_dir
+
+        raw_artifacts: Dict[str, Dict[str, Any]] = manifest_data.get("artifacts", {}) if manifest_data else {}
+        latest_by_path: Dict[str, Any] = manifest_data.get("latest_by_path", {}) if manifest_data else {}
+
+        parsed_artifacts: List[Dict[str, Any]] = []
+
+        for art_key, raw_dict in raw_artifacts.items():
+            a = dict(raw_dict)
+            artifact_id = a.get("artifact_id") or art_key
+            a["artifact_id"] = artifact_id
+            sha256 = a.get("sha256") or ""
+            a["sha256"] = sha256
+
+            # Derive logical_path
+            logical_path = a.get("logical_path") or (a.get("metadata") or {}).get("logical_path")
+            if not logical_path and artifact_id:
+                base_id = artifact_id.split("@sha256_")[0]
+                parts = base_id.split("/", 2)
+                logical_path = parts[-1] if len(parts) == 3 else base_id
+            if not logical_path and a.get("path"):
+                logical_path = Path(a["path"]).name
+            a["logical_path"] = logical_path or ""
+
+            # Derive revision_id
+            revision_id = a.get("revision_id") or (a.get("metadata") or {}).get("revision_id")
+            if not revision_id:
+                revision_id = f"sha256_{sha256[:12]}" if sha256 else "unversioned"
+            a["revision_id"] = revision_id
+
+            # Step: if not present, set to None - never fabricate or guess!
+            step_val = (a.get("metadata") or {}).get("step")
+            if step_val is None:
+                step_val = a.get("step")
+            a["step"] = step_val
+
+            # Timestamps
+            a["created_at"] = a.get("created_at")
+            a["verified_at"] = a.get("verified_at")
+
+            # Remote availability
+            a["remote_available"] = bool(a.get("remote_file_id"))
+
+            # Category / type
+            if not a.get("category"):
+                a["category"] = a.get("artifact_type") or "checkpoint"
+
+            parsed_artifacts.append(a)
+
+        # Deduplicate manifest entries by (logical_path, sha256) preferring versioned artifact IDs
+        deduped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for a in parsed_artifacts:
+            key = (a["logical_path"], a["sha256"])
+            if key in deduped:
+                if "@sha256_" in a.get("artifact_id", "") and "@sha256_" not in deduped[key].get("artifact_id", ""):
+                    deduped[key] = a
+            else:
+                deduped[key] = a
+        parsed_artifacts = list(deduped.values())
+
+        # Derive is_latest for each logical_path group
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for a in parsed_artifacts:
+            groups.setdefault(a["logical_path"], []).append(a)
+
+        for l_path, items in groups.items():
+            matched_by_manifest = False
+            if l_path in latest_by_path:
+                target = latest_by_path[l_path]
+                target_id = target if isinstance(target, str) else (target.get("artifact_id") or target.get("sha256"))
+                for item in items:
+                    if item.get("artifact_id") == target_id or item.get("sha256") == target_id:
+                        item["is_latest"] = True
+                        matched_by_manifest = True
+                    else:
+                        item["is_latest"] = False
+            if not matched_by_manifest:
+                def _sort_key(it):
+                    c_at = it.get("created_at") or ""
+                    s = it.get("step")
+                    step_num = s if isinstance(s, int) else -1
+                    return (c_at, step_num, it.get("artifact_id") or "")
+
+                sorted_items = sorted(items, key=_sort_key)
+                for i, item in enumerate(sorted_items):
+                    item["is_latest"] = (i == len(sorted_items) - 1)
+
+        # Merge with local files found on disk in run_dir (avoiding duplicates and staged files)
+        if run_dir and Path(run_dir).is_dir():
+            run_path = Path(run_dir).resolve()
+            known_shas = {a["sha256"] for a in parsed_artifacts if a.get("sha256")}
+            known_paths = set()
+            for a in parsed_artifacts:
+                p_str = a.get("path")
+                if p_str and not p_str.startswith("http"):
+                    try:
+                        known_paths.add(Path(p_str).resolve())
+                    except Exception:
+                        pass
+
+            for root, _, files in os.walk(run_path):
+                for fname in files:
+                    if fname == "manifest.json" or fname.endswith(".tmp") or ".tmp." in fname:
+                        continue
+                    if ".sha256_" in fname:
+                        continue  # Skip internal revision-staged files
+                    fpath = Path(root) / fname
+                    try:
+                        resolved_fpath = fpath.resolve()
+                        if resolved_fpath in known_paths:
+                            continue
+                        hasher = hashlib.sha256()
+                        with open(fpath, "rb") as f:
+                            for chunk in iter(lambda: f.read(65536), b""):
+                                hasher.update(chunk)
+                        f_sha = hasher.hexdigest()
+                        if f_sha in known_shas:
+                            continue
+
+                        f_size = fpath.stat().st_size
+                        rel = str(fpath.relative_to(run_path))
+                        local_art = {
+                            "artifact_id": f"{run_id}/{rel}",
+                            "logical_path": rel,
+                            "revision_id": f"sha256_{f_sha[:12]}",
+                            "is_latest": True,
+                            "step": None,
+                            "size_bytes": f_size,
+                            "sha256": f_sha,
+                            "storage_provider": "local",
+                            "remote_file_id": None,
+                            "remote_available": False,
+                            "created_at": _iso_now(),
+                            "verified_at": None,
+                            "artifact_type": "checkpoint" if "checkpoint" in rel else "output",
+                            "category": "checkpoint" if "checkpoint" in rel else "output",
+                        }
+                        parsed_artifacts.append(local_art)
+                    except Exception:
+                        pass
+
+        # Sort the returned artifacts list chronologically
+        def _global_sort(a):
+            c_at = a.get("created_at") or ""
+            s = a.get("step")
+            s_num = s if isinstance(s, int) else -1
+            return (c_at, s_num, a.get("logical_path") or "", a.get("artifact_id") or "")
+
+        parsed_artifacts.sort(key=_global_sort)
+        return parsed_artifacts
 
     def _handle_run_detail(self, path: str) -> None:
         parts = path.strip("/").split("/")
@@ -799,23 +976,31 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
         artifacts_root = getattr(self.server, "artifacts_dir", Path("./artifacts").resolve())
         manifest_data: Optional[Dict[str, Any]] = None
+        target_run_dir: Optional[Path] = None
         proj_base = artifacts_root / "projects"
         if proj_base.is_dir():
             for p_dir in proj_base.iterdir():
-                m_candidate = p_dir / "runs" / run_id / "manifest.json"
+                candidate_dir = p_dir / "runs" / run_id
+                m_candidate = candidate_dir / "manifest.json"
                 if m_candidate.is_file():
                     try:
                         with open(m_candidate, "r", encoding="utf-8") as mf:
                             manifest_data = json.load(mf)
+                        target_run_dir = candidate_dir
                         break
                     except Exception:
                         pass
+                elif candidate_dir.is_dir() and target_run_dir is None:
+                    target_run_dir = candidate_dir
+
+        artifacts_list = self._collect_run_artifacts_and_drive(run_id, manifest_data=manifest_data, run_dir=target_run_dir)
+        drive_artifacts = [a for a in artifacts_list if a.get("storage_provider") == "google_drive" or a.get("remote_file_id") or a.get("remote_available")]
+        status_str = "PUBLISHED" if drive_artifacts else ("PENDING" if artifacts_list else "DISABLED")
 
         if len(parts) == 4:
-            if not events and not manifest_data:
+            if not events and not manifest_data and not artifacts_list:
                 self._send_json({"error": "Run not found", "run_id": run_id}, status=404)
                 return
-            artifacts_list = list(manifest_data.get("artifacts", {}).values()) if manifest_data else []
             self._send_json({
                 "run_id": run_id,
                 "event_count": len(events),
@@ -824,12 +1009,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 "events": events,
             })
         elif len(parts) == 5 and parts[4] == "artifacts":
-            artifacts_list = list(manifest_data.get("artifacts", {}).values()) if manifest_data else []
             self._send_json({"run_id": run_id, "artifacts": artifacts_list})
         elif len(parts) == 5 and parts[4] == "drive":
-            artifacts_list = list(manifest_data.get("artifacts", {}).values()) if manifest_data else []
-            drive_artifacts = [a for a in artifacts_list if a.get("storage_provider") == "google_drive" or a.get("remote_file_id")]
-            status_str = "PUBLISHED" if drive_artifacts else ("PENDING" if artifacts_list else "DISABLED")
             self._send_json({
                 "run_id": run_id,
                 "drive_publication_status": status_str,

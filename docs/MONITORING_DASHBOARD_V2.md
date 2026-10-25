@@ -97,11 +97,22 @@ Provides granular inspection for the selected `run_id`:
 - **Loss & Evaluation Metrics**:
   - Plots `loss` and `val_loss`/`eval_loss` over steps using inline SVG.
   - **Honest GPU Utilization Indicator**: Displays `GPU Utilization: X%` only when explicitly emitted in telemetry; otherwise renders `GPU utilization: not measured`.
-- **Execution Logs & Failures Viewer**:
+- **Execution Logs & Failures Viewer (`#logs-box` / `#log-console`)**:
   - Redacted monospace log tail from `/api/v1/runs/{run_id}/logs`.
   - Prominent runtime error callout banner for failure events.
-- **Checkpoints & Google Drive Artifacts Table**:
-  - Lists all stored artifacts with `artifact_id`, `artifact_type`, human-formatted file sizes (`KiB`, `MiB`, `GiB`), truncated SHA-256 digests with copy-to-clipboard tooltips, `storage_provider` (`google_drive` vs `local`), remote Google Drive file IDs, and verification timestamps.
+- **Checkpoints & Google Drive Artifacts Table (`#artifacts-table`)**:
+  - Displays every published checkpoint and artifact revision with clear distinction between latest and historical states.
+  - Columns:
+    1. **Artifact**: Logical path or filename (`a.logical_path || a.rel_path || a.name`) accompanied by an explicit status badge: `LATEST` (green badge, when `is_latest: true`) or `HISTORICAL` (neutral badge, when `is_latest: false`).
+    2. **Revision ID**: Canonical revision hash (`sha256_<12_char_hex>`).
+    3. **Step**: Training step emitted with the checkpoint, or explicit `unavailable` (never guessed or fabricated).
+    4. **Category**: Artifact category (`checkpoint`, `source_snapshot`, `output`).
+    5. **Size**: Human-formatted byte count (`KiB`, `MiB`, `GiB`).
+    6. **Integrity & Remote Status**: Verification indicator (`VERIFIED` / `DRIVE` / `LOCAL`) and truncated SHA-256 digest with copy-to-clipboard tooltip.
+    7. **Timestamp**: ISO UTC verification or creation timestamp.
+  - Supports `PublicationManifest` V2 schema (`manifest_version: 2`, `latest_by_path`, and `migration_notes`) with automatic migration from V1.
+  - Backed by `/api/v1/runs/{run_id}/artifacts` and `/api/v1/runs/{run_id}/drive`.
+  - Constructed strictly with safe DOM APIs (`document.createElement()`, `.textContent`, `.replaceChildren()`) with zero `.innerHTML` and zero inline event handlers. Verified by real-browser headless Chromium tests in CI.
 
 ---
 

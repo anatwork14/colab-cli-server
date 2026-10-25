@@ -234,6 +234,36 @@ Concurrent processes running on the same host (e.g. parallel background upload w
    - Single-host cross-process atomicity is strictly guaranteed via local filesystem `fcntl.flock` locks and durable journal leases.
    - Multi-host distributed writers sharing an NFS/SMB share without a distributed lock coordinator (e.g., etcd, ZooKeeper, or Redis) are explicitly out of scope for local workspace journals.
 
+### Checkpoint Revision History & PublicationManifest V2 Schema
+
+To support iterative checkpointing where consecutive training epochs or evaluation steps overwrite the same logical filename (e.g., `checkpoints/model.pt`), Colab V2 enforces content-addressed revision tracking:
+
+1. **Canonical Revision Identity (`@sha256_<full_sha256>`)**:
+   - Every artifact revision is assigned a globally unique, immutable identifier:
+     `<project_id>/<run_id>/<logical_path>@sha256_<full_sha256>`
+     (e.g., `vision_v2/run-01/checkpoints/model.pt@sha256_3b4f5d133bb7c9c693999b2620703353cba10983fc4aa8162ac1e456fdffa766`).
+   - The logical path (`checkpoints/model.pt`) and revision ID (`sha256_<12_char_hex>`) are tracked alongside physical storage keys.
+
+2. **PublicationManifest V2 Schema (`manifest_version: 2`)**:
+   - `manifest_version`: Integer schema version set to `2`.
+   - `artifacts`: Map of canonical versioned IDs to `StoredArtifact` metadata dicts.
+   - `latest_by_path`: Dictionary mapping each `logical_path` to its latest active `artifact_id`.
+   - `migration_notes`: Chronological audit list recording schema upgrades and index conversions.
+
+3. **Automatic V1 to V2 Migration**:
+   - When loading legacy V1 manifests with unversioned keys (`<project_id>/<run_id>/<path>`), `PublicationManifest.load()` automatically parses existing entries, generates `@sha256_<full_sha256>` keys, populates `latest_by_path`, sets `manifest_version = 2`, and records a migration note without requiring manual data intervention.
+
+4. **Retrieving Latest vs. Specific Historical Revisions**:
+   - **Latest Revision**: Clients querying by logical path or unversioned name resolve through `latest_by_path`, retrieving the newest verified weights (e.g. Epoch 2 / Checkpoint B).
+   - **Historical Revision**: Clients requesting specific historical revisions supply the full canonical versioned ID (`...@sha256_<hash>`), retrieving earlier states (e.g. Epoch 1 / Checkpoint A) with multi-tier SHA256 integrity validation.
+
+5. **Cross-Process Staging Protection**:
+   - While an upload is in progress, files are staged under isolated temporary filenames (e.g. `model.pt.sha256_<short_sha>`) under `fcntl.flock` protection.
+   - In-progress writes never overwrite existing on-disk revisions until remote and local verification succeed.
+
+6. **Reproducible Real-Browser CI Security Testing**:
+   - Dashboard UI rendering is validated using headless browser tests (Playwright/Chromium) verifying that both `LATEST` and `HISTORICAL` badges render cleanly in `#artifacts-table`, with zero `.innerHTML` usage, zero inline event handlers, and strict CSP nonce enforcement.
+
 ---
 
 ## 13. Verification Scope, PR Stack Status & Operational Rollback

@@ -72,15 +72,27 @@ python3 -m colab_adapter.cli project status
 curl -H "Authorization: Bearer <TOKEN>" http://localhost:8080/api/v1/runs/<run_id>
 ```
 
-### Step 2: Retrieve Latest Verified Checkpoint
+### Step 2: Retrieve Latest or Historical Checkpoint
 If the checkpoint is stored in Google Drive:
+
+#### Option A: Retrieve the Latest Checkpoint
+Querying by logical path automatically resolves the newest revision via `latest_by_path`:
 ```python
 from colab_adapter.storage import GoogleDriveArtifactStore
 
 store = GoogleDriveArtifactStore(credentials_file="~/.config/colab-cli-server/drive_token.json")
 store.retrieve(
-    artifact_id="<project-id>/<run-id>/checkpoints/step_1000.pt",
-    destination="./resumed_step_1000.pt",
+    artifact_id="<project-id>/<run-id>/checkpoints/model.pt",
+    destination="./resumed_model_latest.pt",
+)
+```
+
+#### Option B: Retrieve a Specific Historical Revision
+To roll back to an earlier training epoch or perform ablation against historical weights, specify the canonical versioned ID:
+```python
+store.retrieve(
+    artifact_id="<project-id>/<run-id>/checkpoints/model.pt@sha256_1111111111111111111111111111111111111111111111111111111111111111",
+    destination="./resumed_model_epoch1.pt",
 )
 ```
 
@@ -123,6 +135,32 @@ During experiment execution, checkpoint recovery, and disaster recovery resumpti
 ### 4. Scope Boundary
 - **Single-Host Guarantee**: Atomicity and lease guarantees are guaranteed on a single host via the local POSIX filesystem (`fcntl.flock`).
 - **Distributed Multi-Host Writers Out of Scope**: Multi-host distributed writers sharing an uncoordinated network file system (NFS/SMB) without an external distributed lock service (e.g. etcd, ZooKeeper, or Consul) are explicitly out of scope for the local workspace journal.
+
+---
+
+## Multi-Revision Recovery & PublicationManifest V2 Schema
+
+In distributed and multi-epoch research, models evolve across steps and epochs while reusing base filenames like `model.pt`. Colab V2 prevents historical overwrites and enables exact historical recovery:
+
+### 1. Canonical Revision Keying
+Every published checkpoint revision is assigned an immutable canonical ID:
+`<project_id>/<run_id>/<logical_path>@sha256_<full_sha256>`
+
+### 2. PublicationManifest V2 Structure
+The run's `manifest.json` tracks all historical revisions under `manifest_version: 2`:
+- `artifacts`: Maps versioned IDs to complete metadata (`size_bytes`, `sha256`, `remote_file_id`, `step`, `verified_at`).
+- `latest_by_path`: Maps logical paths (`checkpoints/model.pt`) to the newest versioned artifact ID.
+- `migration_notes`: Records automatic schema upgrade events.
+
+### 3. Transparent V1 -> V2 Migration
+When loading legacy V1 manifests, `PublicationManifest.load()` automatically generates versioned `@sha256_` keys, populates `latest_by_path`, updates `manifest_version` to `2`, and appends to `migration_notes`.
+
+### 4. Cross-Process Locking & Staging Protection
+- Concurrent writes acquire `.manifest.lock` via `fcntl.flock`.
+- Staged revisions write to isolated `*.sha256_*` temporary files before verification, ensuring broken or incomplete uploads never corrupt the recoverable checkpoint history.
+
+### 5. Browser-Verified Recovery UI
+In the Monitoring Dashboard, the Checkpoints & Google Drive Artifacts table displays every revision with explicit `LATEST` vs `HISTORICAL` badges, revision IDs, steps, and SHA256 integrity verification. Real-browser headless tests guarantee secure rendering without XSS or inline script risks.
 
 ---
 
