@@ -920,11 +920,16 @@ class TestMandatoryHeadlessBrowserSecurity(unittest.TestCase):
             await finalTargetRow.click();
           }}
 
-          // Wait for target run's artifact revisions to finish rendering
-          await page.waitForFunction(
-            () => (document.getElementById("artifacts-table")?.textContent || "").includes("aaaa"),
-            {{ timeout: 7000 }}
-          );
+          // Wait for target run's artifact revisions to finish rendering via CDP page.evaluate
+          // (avoiding page.waitForFunction which uses eval() and is blocked by our strict CSP!)
+          for (let attempt = 0; attempt < 50; attempt++) {{
+            const ready = await page.evaluate(() => {{
+              const txt = document.getElementById("artifacts-table")?.textContent || "";
+              return txt.includes("aaaa") && txt.includes("bbbb");
+            }});
+            if (ready) break;
+            await page.waitForTimeout(100);
+          }}
 
           // Switch tabs if present ([data-tab="artifacts"], [data-tab="drive"], [data-tab="logs"])
           for (const tabName of ["artifacts", "drive", "logs"]) {{
