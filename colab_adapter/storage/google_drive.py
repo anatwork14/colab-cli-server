@@ -50,6 +50,13 @@ from ..errors import (
     StorageError,
 )
 from .base import ArtifactStore, ArtifactType, StoredArtifact, _utc_now_iso
+from .drive_metadata import (
+    STATE_HISTORICAL,
+    STATE_LATEST,
+    STATE_PENDING,
+    build_revision_properties,
+    revision_state,
+)
 from .manifest import PublicationManifest, compute_file_md5, compute_file_sha256
 from .transfer import TransferJournal, TransferRecord, TransferStatus
 
@@ -1598,6 +1605,19 @@ class GoogleDriveArtifactStore:
                 except OSError:
                     pass
 
+    # -------------------------------------------------------------------------
+    # STUB for Worker A until merged: _remote_revision_state
+    # -------------------------------------------------------------------------
+    def _remote_revision_state(self, remote_id: str) -> Tuple[str, Dict[str, str]]:
+        """Query remote file appProperties and determine revision state."""
+        url = f"https://www.googleapis.com/drive/v3/files/{remote_id}?fields=id,name,appProperties"
+        status, _, body = self._request_with_retry("GET", url)
+        if status != 200:
+            raise DriveTransferError(f"Failed to fetch remote revision state for {remote_id} (HTTP {status})")
+        data = json.loads(body.decode("utf-8"))
+        props = dict(data.get("appProperties") or {})
+        return revision_state(props), props
+
     def publish(
         self,
         source: Union[str, Path],
@@ -1729,20 +1749,51 @@ class GoogleDriveArtifactStore:
 
                 if record is not None and record.status == TransferStatus.PUBLISHED.value and record.remote_file_id:
                     target_folder_id = self.resolve_target_folder_id(project_id, run_id, subfolder)
-                    self._coordinate_remote_latest_revision(
-                        src.name,
-                        target_folder_id,
-                        record.remote_file_id,
-                        local_sha256,
-                        rel_path,
-                        project_id,
-                        run_id,
-                        artifact_id,
-                    )
+                    # Replay: remote lookup for revision state (fail closed on failure)
+                    state, remote_props = self._remote_revision_state(record.remote_file_id)
+                    if state == STATE_HISTORICAL:
+                        is_latest_publish = False
+                    elif state == STATE_LATEST:
+                        # Reconcile if another remote file is also marked latest (inconsistent remote state)
+                        other_files = self._list_files_in_folder(src.name, target_folder_id)
+                        has_conflicting_latest = any(
+                            f.get("id") != record.remote_file_id and (f.get("appProperties") or {}).get("is_latest") == "true"
+                            for f in other_files
+                        )
+                        if has_conflicting_latest:
+                            self._coordinate_remote_latest_revision(
+                                src.name,
+                                target_folder_id,
+                                record.remote_file_id,
+                                local_sha256,
+                                rel_path,
+                                project_id,
+                                run_id,
+                                artifact_id,
+                            )
+                        is_latest_publish = True
+                    elif state == STATE_PENDING:
+                        # Interrupted transaction: coordinate then add latest
+                        self._coordinate_remote_latest_revision(
+                            src.name,
+                            target_folder_id,
+                            record.remote_file_id,
+                            local_sha256,
+                            rel_path,
+                            project_id,
+                            run_id,
+                            artifact_id,
+                        )
+                        is_latest_publish = True
+                    else:
+                        raise DriveTransferError(
+                            f"Remote file '{record.remote_file_id}' has unrecognized revision state: {state}"
+                        )
+
                     meta_dict = dict(metadata or {})
                     meta_dict["logical_path"] = rel_path
                     meta_dict["revision_id"] = f"sha256_{local_sha256.lower()}"
-                    meta_dict["is_latest"] = True
+                    meta_dict["is_latest"] = is_latest_publish
 
                     stored = StoredArtifact(
                         artifact_id=artifact_id,
@@ -1757,20 +1808,12 @@ class GoogleDriveArtifactStore:
                         md5=local_md5,
                         verified_at=_utc_now_iso(),
                         metadata=meta_dict,
+                        is_latest=is_latest_publish,
                     )
                     with self._exclusive_lock(manifest_lock_name):
                         manifest = self._load_or_recover_manifest(project_id, run_id)
                         if manifest is None:
                             manifest = PublicationManifest(project_id=project_id, run_id=run_id)
-                        for k, art_dict in manifest.artifacts.items():
-                            if (
-                                art_dict.get("path") == rel_path
-                                or art_dict.get("metadata", {}).get("logical_path") == rel_path
-                                or k.split("@sha256_")[0] == logical_artifact_id
-                            ) and k != artifact_id:
-                                if "metadata" not in art_dict or not isinstance(art_dict["metadata"], dict):
-                                    art_dict["metadata"] = {}
-                                art_dict["metadata"]["is_latest"] = False
                         manifest.add_artifact(stored)
                         manifest.status = "PUBLISHED"
                         self._save_manifest_with_backup(manifest, local_manifest_path)
@@ -1868,16 +1911,49 @@ class GoogleDriveArtifactStore:
 
                 if existing_file:
                     remote_id = existing_file.get("id")
-                    self._coordinate_remote_latest_revision(
-                        src.name,
-                        target_folder_id,
-                        remote_id,
-                        local_sha256,
-                        rel_path,
-                        project_id,
-                        run_id,
-                        artifact_id,
-                    )
+                    if not remote_id:
+                        raise DriveIntegrityError("Drive existing file found but has no ID.")
+
+                    state, remote_props = self._remote_revision_state(remote_id)
+                    if state == STATE_HISTORICAL:
+                        is_latest_publish = False
+                    elif state == STATE_LATEST:
+                        # Reconcile if another remote file is also marked latest (inconsistent remote state)
+                        other_files = self._list_files_in_folder(src.name, target_folder_id)
+                        has_conflicting_latest = any(
+                            f.get("id") != remote_id and (f.get("appProperties") or {}).get("is_latest") == "true"
+                            for f in other_files
+                        )
+                        if has_conflicting_latest:
+                            self._coordinate_remote_latest_revision(
+                                src.name,
+                                target_folder_id,
+                                remote_id,
+                                local_sha256,
+                                rel_path,
+                                project_id,
+                                run_id,
+                                artifact_id,
+                            )
+                        is_latest_publish = True
+                    elif state == STATE_PENDING:
+                        # Interrupted publish: coordinate (promote) then add latest
+                        self._coordinate_remote_latest_revision(
+                            src.name,
+                            target_folder_id,
+                            remote_id,
+                            local_sha256,
+                            rel_path,
+                            project_id,
+                            run_id,
+                            artifact_id,
+                        )
+                        is_latest_publish = True
+                    else:
+                        raise DriveTransferError(
+                            f"Remote file '{remote_id}' has unrecognized revision state: {state}"
+                        )
+
                     if record is None or record.transfer_id != transfer_id:
                         record = TransferRecord(
                             transfer_id=transfer_id,
@@ -1906,7 +1982,7 @@ class GoogleDriveArtifactStore:
                     meta_dict = dict(metadata or {})
                     meta_dict["logical_path"] = rel_path
                     meta_dict["revision_id"] = f"sha256_{local_sha256.lower()}"
-                    meta_dict["is_latest"] = True
+                    meta_dict["is_latest"] = is_latest_publish
 
                     stored = StoredArtifact(
                         artifact_id=artifact_id,
@@ -1921,6 +1997,7 @@ class GoogleDriveArtifactStore:
                         md5=local_md5,
                         verified_at=_utc_now_iso(),
                         metadata=meta_dict,
+                        is_latest=is_latest_publish,
                     )
 
                     with self._exclusive_lock(manifest_lock_name):
@@ -1942,17 +2019,9 @@ class GoogleDriveArtifactStore:
                                 md5=local_md5,
                                 verified_at=_utc_now_iso(),
                                 metadata={**existing_art.metadata, **meta_dict},
+                                is_latest=is_latest_publish,
                             )
 
-                        for k, art_dict in manifest.artifacts.items():
-                            if (
-                                art_dict.get("path") == rel_path
-                                or art_dict.get("metadata", {}).get("logical_path") == rel_path
-                                or k.split("@sha256_")[0] == logical_artifact_id
-                            ) and k != artifact_id:
-                                if "metadata" not in art_dict or not isinstance(art_dict["metadata"], dict):
-                                    art_dict["metadata"] = {}
-                                art_dict["metadata"]["is_latest"] = False
                         manifest.add_artifact(stored)
                         manifest.status = "PUBLISHED"
                         self._save_manifest_with_backup(manifest, local_manifest_path)
@@ -2126,16 +2195,6 @@ class GoogleDriveArtifactStore:
                             metadata={**existing_art.metadata, **meta_dict},
                         )
 
-                    for k, art_dict in manifest.artifacts.items():
-                        if (
-                            art_dict.get("path") == rel_path
-                            or art_dict.get("metadata", {}).get("logical_path") == rel_path
-                            or k.split("@sha256_")[0] == logical_artifact_id
-                        ) and k != artifact_id:
-                            if "metadata" not in art_dict or not isinstance(art_dict["metadata"], dict):
-                                art_dict["metadata"] = {}
-                            art_dict["metadata"]["is_latest"] = False
-
                     manifest.add_artifact(stored)
                     manifest.status = "PUBLISHED"
                     self._save_manifest_with_backup(manifest, local_manifest_path)
@@ -2211,7 +2270,7 @@ class GoogleDriveArtifactStore:
             if c.metadata.get("is_latest") is True or getattr(c, "is_latest", False) is True:
                 return c
 
-        return matching[0]
+        return None
 
     def _download_and_verify(
         self,
@@ -2497,19 +2556,21 @@ class GoogleDriveArtifactStore:
                 ]
                 if len(matching_transfers) == 1 and matching_transfers[0].sha256:
                     rec = matching_transfers[0]
-                    meta = StoredArtifact(
-                        artifact_id=f"{base_art_id}@sha256_{rec.sha256.lower()}",
-                        storage_provider=self.provider_name,
-                        path=rec.target_rel_path or rel_p,
-                        size_bytes=rec.size_bytes,
-                        sha256=rec.sha256.lower(),
-                        project_id=proj_id,
-                        run_id=r_id,
-                        remote_file_id=rec.remote_file_id,
-                        md5=rec.md5,
-                        verified_at=rec.updated_at,
-                    )
-                    target_sha = rec.sha256.lower()
+                    state, _ = self._remote_revision_state(rec.remote_file_id)
+                    if state == STATE_LATEST:
+                        meta = StoredArtifact(
+                            artifact_id=f"{base_art_id}@sha256_{rec.sha256.lower()}",
+                            storage_provider=self.provider_name,
+                            path=rec.target_rel_path or rel_p,
+                            size_bytes=rec.size_bytes,
+                            sha256=rec.sha256.lower(),
+                            project_id=proj_id,
+                            run_id=r_id,
+                            remote_file_id=rec.remote_file_id,
+                            md5=rec.md5,
+                            verified_at=rec.updated_at,
+                        )
+                        target_sha = rec.sha256.lower()
 
             # 3. Query Drive folder
             if not meta or not meta.remote_file_id:
