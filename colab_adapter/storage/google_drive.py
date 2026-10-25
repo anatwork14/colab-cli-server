@@ -86,7 +86,7 @@ from .validation import (
     validate_run_id,
 )
 from .manifest import PublicationManifest, compute_file_md5, compute_file_sha256
-from .transfer import TransferJournal, TransferRecord, TransferStatus
+from .transfer import TransferJournal, TransferRecord, TransferStatus, safe_lock_filename
 
 ArtifactTransferError = DriveTransferError
 
@@ -535,7 +535,7 @@ class GoogleDriveArtifactStore:
                 yield
             return
 
-        safe_lock_name = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", lock_name)
+        safe_lock_name = safe_lock_filename(lock_name)
         locks_dir = self.journal.path.parent / ".transfer_locks"
         locks_dir.mkdir(parents=True, exist_ok=True)
         try:

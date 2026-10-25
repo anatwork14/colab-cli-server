@@ -472,7 +472,7 @@ These procedures are **strictly manual and require explicit operator authorizati
 **Prerequisites**: Two machines or loopback test environments with SSH or TLS certificates.
 
 1. **Secure Monitoring Server Startup**:
-   Start server: `python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8443 --auth-token "<MONITOR_AUTH_TOKEN>"`.
+   Start server: `COLAB_MONITOR_TOKEN="$(cat /path/to/private/monitor.token)" python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8443`.
 2. **Secure Client Tunnel / TLS Connection**:
    Establish SSH port-forwarding from secondary device (`ssh -NL 8443:127.0.0.1:8443 user@server`) or access TLS endpoint.
 3. **Negative Control (Unauthenticated Access Rejection)**:

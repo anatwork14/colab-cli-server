@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "workload": "live-smoke",
+  "hash_algorithm": "sha256",
+  "note": "Hashes of the files shipped to the remote workspace; this manifest itself is not hashed.",
+  "files": [
+    {
+      "path": "gpu_probe.py",
+      "size": 3035,
+      "sha256": "949dea8ca0da112487d87a0bfe2dd74fd34efd09cd4f34c46e000c81cd644208"
+    },
+    {
+      "path": "train_tiny.py",
+      "size": 9727,
+      "sha256": "00ea7d3db763f6c3f95d827d69683d6d2d4731896b3f1849982604dc86503409"
+    }
+  ]
+}

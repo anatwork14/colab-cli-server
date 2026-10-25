@@ -179,7 +179,7 @@ A step-by-step operator guide using real, supported CLI commands (`python3 colab
 11. **Initial Workspace Incremental Sync**: Transfer sources to the remote runtime: `python3 -m colab_adapter.cli project sync --manifest ./research-project/colab-project.json --session-id <session-id> --json`.
 12. **Remote Training Execution**: Run training with live logs: `python3 -m colab_adapter.cli project exec "python3 train.py --epochs 10 --batch-size 32" --session-id <session-id> --json`.
 13. **Incremental Code Hot-Updates**: Update local code and sync only changed files: `python3 -m colab_adapter.cli project sync --manifest ./research-project/colab-project.json --session-id <session-id> --json`.
-14. **Cross-Device Monitoring Server Launch**: Start read-only dashboard: `python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080 --auth-token "<SECRET_TOKEN>"`.
+14. **Cross-Device Monitoring Server Launch**: Start read-only dashboard: `COLAB_MONITOR_TOKEN="$(cat /path/to/private/monitor.token)" python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080`.
 15. **Google Drive Credential Setup (0600 Permissions)**: Configure `~/.config/colab-cli/drive_credentials.json` with permissions `chmod 0600 ~/.config/colab-cli/drive_credentials.json`.
 16. **Multi-Revision Checkpoint Publishing**: Checkpoints (`model.pt`) published at steps 100..500 are stored under canonical `@sha256_<HASH>` identities in `PublicationManifest` v2.
 17. **Historical Revision Recovery**: Retrieve a specific historical checkpoint (Revision A) or the latest checkpoint (Revision E) by canonical revision ID with SHA256 verification.

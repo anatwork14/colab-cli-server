@@ -371,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
         scheme = "https" if (args.require_tls or args.tls_certfile) else "http"
         print(f"Starting Colab Training & Compute Monitor on {scheme}://{args.host}:{args.port}")
         if token:
-            print(f"Authentication active. Token: {token[:4]}****")
+            print("Authentication active (bearer token configured).")
         elif args.trusted_proxy:
             print("Trusted reverse-proxy authentication active.")
         else:
