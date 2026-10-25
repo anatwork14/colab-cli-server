@@ -127,6 +127,7 @@ class StoredArtifact:
     logical_path: Optional[str] = None
     revision_id: Optional[str] = None
     is_latest: bool = True
+    superseded_by: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.logical_path is None:
@@ -146,9 +147,13 @@ class StoredArtifact:
             "artifact_id", "storage_provider", "path", "size_bytes",
             "sha256", "project_id", "run_id", "artifact_type",
             "remote_file_id", "md5", "created_at", "verified_at", "metadata",
-            "logical_path", "revision_id", "is_latest"
+            "logical_path", "revision_id", "is_latest", "superseded_by"
         }
         filtered = {k: v for k, v in data.items() if k in valid}
+        if filtered.get("superseded_by") is None and isinstance(filtered.get("metadata"), dict):
+            filtered["superseded_by"] = filtered["metadata"].get("superseded_by")
+        if filtered.get("superseded_by") is not None:
+            filtered["superseded_by"] = str(filtered["superseded_by"])
         return cls(**filtered)
 
 

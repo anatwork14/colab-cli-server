@@ -45,41 +45,8 @@ def compute_file_md5(file_path: Union[str, Path], chunk_size: int = 65536) -> st
     return hasher.hexdigest()
 
 
-class RevisionRef(str):
-    """String representing an artifact revision that compares equal to both its full artifact ID and revision ID."""
-
-    def __new__(cls, value: str, latest: Optional[str] = None):
-        obj = super().__new__(cls, value)
-        obj._latest = latest
-        return obj
-
-    def __eq__(self, other: Any) -> bool:
-        if super().__eq__(other):
-            return True
-        if isinstance(other, str):
-            for target in (str(self), getattr(self, "_latest", None)):
-                if not target:
-                    continue
-                if target == other:
-                    return True
-                s_sha = target.split("@")[-1] if "@" in target else target
-                o_sha = other.split("@")[-1] if "@" in other else other
-                if s_sha == o_sha or s_sha == f"sha256_{o_sha}" or f"sha256_{s_sha}" == o_sha:
-                    return True
-        return False
-
-    def __hash__(self) -> int:
-        return super().__hash__()
-
-
 def _build_stored_artifact(art_dict: Dict[str, Any]) -> StoredArtifact:
-    art = StoredArtifact.from_dict(art_dict)
-    if "superseded_by" in art_dict:
-        try:
-            object.__setattr__(art, "superseded_by", art_dict["superseded_by"])
-        except Exception:
-            pass
-    return art
+    return StoredArtifact.from_dict(art_dict)
 
 
 @dataclass
@@ -135,27 +102,37 @@ class PublicationManifest:
             ):
                 raise ArtifactValidationError(f"Conflicting content for immutable artifact revision {rev_id}")
 
-        # Prior revisions for the same logical_path:
-        # iterate over existing entries in self.artifacts.values() whose logical_path matches logical_path and key != rev_id
-        # set their ["is_latest"] = False and mark superseded_by
-        for k, v in self.artifacts.items():
-            if k != rev_id:
-                v_lp = v.get("logical_path")
-                if not v_lp:
-                    _, _, v_lp, _ = parse_artifact_id(v.get("artifact_id", k))
-                v_lp = (v_lp or "").split("@sha256_")[0].lstrip("/")
-                v_prefix = f"{v.get('project_id', '')}/{v.get('run_id', '')}/"
-                if v.get('project_id') and v.get('run_id') and v_lp.startswith(v_prefix):
-                    v_lp = v_lp[len(v_prefix):].lstrip("/")
-                if v_lp == logical_path:
-                    v["is_latest"] = False
-                    prior_succ = v.get("superseded_by")
-                    succ_str = str(prior_succ) if prior_succ else rev_id
-                    v["superseded_by"] = RevisionRef(succ_str, latest=rev_id)
-                    v.setdefault("metadata", {})["superseded_by"] = v["superseded_by"]
+        # Check if we are updating an already-superseded revision
+        existing = self.artifacts.get(rev_id, {})
+        is_updating_superseded = bool(
+            (existing and (existing.get("superseded_by") or existing.get("is_latest") is False))
+            or (artifact.superseded_by or artifact.is_latest is False)
+        )
+
+        if not is_updating_superseded:
+            # Prior revisions for the same logical_path:
+            # iterate over existing entries in self.artifacts.values() whose logical_path matches logical_path and key != rev_id
+            # set their ["is_latest"] = False and mark superseded_by
+            for k, v in self.artifacts.items():
+                if k != rev_id:
+                    v_lp = v.get("logical_path")
+                    if not v_lp:
+                        _, _, v_lp, _ = parse_artifact_id(v.get("artifact_id", k))
+                    v_lp = (v_lp or "").split("@sha256_")[0].lstrip("/")
+                    v_prefix = f"{v.get('project_id', '')}/{v.get('run_id', '')}/"
+                    if v.get('project_id') and v.get('run_id') and v_lp.startswith(v_prefix):
+                        v_lp = v_lp[len(v_prefix):].lstrip("/")
+                    if v_lp == logical_path:
+                        v["is_latest"] = False
+                        v.setdefault("metadata", {})["is_latest"] = False
+                        if not v.get("superseded_by"):
+                            v["superseded_by"] = str(rev_id)
+                        else:
+                            v["superseded_by"] = str(v["superseded_by"])
+                        v.setdefault("metadata", {})["superseded_by"] = v["superseded_by"]
+                        v.setdefault("metadata", {})["latest_revision_id"] = str(rev_id)
 
         # Construct updated StoredArtifact
-        existing = self.artifacts.get(rev_id, {})
         remote_file_id = artifact.remote_file_id if artifact.remote_file_id is not None else existing.get("remote_file_id")
         merged_metadata = dict(existing.get("metadata", {}))
         if artifact.metadata:
@@ -168,6 +145,17 @@ class PublicationManifest:
         verified_at = artifact.verified_at or existing.get("verified_at")
         storage_provider = artifact.storage_provider or existing.get("storage_provider", "local")
         artifact_type = artifact.artifact_type or existing.get("artifact_type", "checkpoint")
+
+        superseded_by_val: Optional[str] = None
+        if existing and existing.get("superseded_by"):
+            superseded_by_val = str(existing["superseded_by"])
+        elif artifact.superseded_by:
+            superseded_by_val = str(artifact.superseded_by)
+
+        is_latest_val = False if superseded_by_val else (not is_updating_superseded)
+        if superseded_by_val is not None:
+            merged_metadata["superseded_by"] = superseded_by_val
+        merged_metadata["is_latest"] = is_latest_val
 
         updated = StoredArtifact(
             artifact_id=rev_id,
@@ -185,11 +173,13 @@ class PublicationManifest:
             metadata=merged_metadata,
             logical_path=logical_path,
             revision_id=rev_str,
-            is_latest=True,
+            is_latest=is_latest_val,
+            superseded_by=superseded_by_val,
         )
 
         self.artifacts[rev_id] = updated.to_dict()
-        self.latest_by_path[logical_path] = RevisionRef(rev_id)
+        if is_latest_val:
+            self.latest_by_path[logical_path] = str(rev_id)
         self.updated_at = _utc_now_iso()
         return updated
 
@@ -265,11 +255,30 @@ class PublicationManifest:
         prefix = f"{self.project_id}/{self.run_id}/"
         if self.project_id and self.run_id and clean_lp.startswith(prefix):
             clean_lp = clean_lp[len(prefix):].lstrip("/")
-        if clean_lp in self.latest_by_path:
-            rev_id = self.latest_by_path[clean_lp]
-            if rev_id in self.artifacts:
-                return _build_stored_artifact(self.artifacts[rev_id])
-        return self.get_artifact(logical_path)
+        rev_id = self.latest_by_path.get(clean_lp) or self.latest_by_path.get(logical_path)
+        if rev_id and rev_id in self.artifacts:
+            return _build_stored_artifact(self.artifacts[rev_id])
+        return self.get_artifact(clean_lp) or self.get_artifact(logical_path)
+
+    def get_latest_revision_id(self, logical_path: str) -> Optional[str]:
+        """Returns art.revision_id (i.e. 'sha256_<full_sha256>') for the latest artifact at logical_path, or None."""
+        art = self.get_latest_artifact(logical_path)
+        if art is not None:
+            if art.revision_id:
+                return art.revision_id
+            if art.sha256:
+                return f"sha256_{art.sha256.strip().lower()}"
+        return None
+
+    def get_latest_sha256(self, logical_path: str) -> Optional[str]:
+        """Returns art.sha256 (i.e. '<full_sha256>') for the latest artifact at logical_path, or None."""
+        art = self.get_latest_artifact(logical_path)
+        if art is not None:
+            if art.sha256:
+                return art.sha256.strip().lower()
+            if art.revision_id and art.revision_id.startswith("sha256_"):
+                return art.revision_id[len("sha256_"):].strip().lower()
+        return None
 
     def list_revisions(self, logical_path: Optional[str] = None) -> List[StoredArtifact]:
         """Returns all revisions (filtered by logical_path if provided), sorted chronologically."""
@@ -335,7 +344,7 @@ class PublicationManifest:
 
         if needs_migration:
             migrated_artifacts: Dict[str, Dict[str, Any]] = {}
-            latest_by_path: Dict[str, str] = dict(data.get("latest_by_path", {}))
+            latest_by_path: Dict[str, str] = {str(k): str(v) for k, v in data.get("latest_by_path", {}).items()}
             migration_notes: List[str] = list(data.get("migration_notes", []))
             project_id = data.get("project_id", "")
             run_id = data.get("run_id", "")
@@ -368,19 +377,22 @@ class PublicationManifest:
                 for existing_k, existing_d in migrated_artifacts.items():
                     if existing_k != new_key and existing_d.get("logical_path") == log_path:
                         existing_d["is_latest"] = False
-                        prior_succ = existing_d.get("superseded_by")
-                        succ_str = str(prior_succ) if prior_succ else new_key
-                        existing_d["superseded_by"] = RevisionRef(succ_str, latest=new_key)
+                        existing_d.setdefault("metadata", {})["is_latest"] = False
+                        if not existing_d.get("superseded_by"):
+                            existing_d["superseded_by"] = str(new_key)
+                        else:
+                            existing_d["superseded_by"] = str(existing_d["superseded_by"])
                         existing_d.setdefault("metadata", {})["superseded_by"] = existing_d["superseded_by"]
+                        existing_d.setdefault("metadata", {})["latest_revision_id"] = str(new_key)
 
-                art_dict["artifact_id"] = new_key
-                art_dict["logical_path"] = log_path
+                art_dict["artifact_id"] = str(new_key)
+                art_dict["logical_path"] = str(log_path)
                 if sha:
                     art_dict["revision_id"] = f"sha256_{sha.strip().lower()}"
                 art_dict["is_latest"] = True
 
-                migrated_artifacts[new_key] = art_dict
-                latest_by_path[log_path] = RevisionRef(new_key)
+                migrated_artifacts[str(new_key)] = art_dict
+                latest_by_path[str(log_path)] = str(new_key)
 
             migration_note = "Migrated v1 unversioned artifact records to v2 immutable revision IDs; pre-migration overwritten historical revisions cannot be fabricated."
             if migration_note not in migration_notes:
@@ -394,24 +406,29 @@ class PublicationManifest:
             return cls(**filtered)
 
         filtered = {k: v for k, v in data.items() if k in valid}
+        raw_arts = dict(filtered.get("artifacts", {}))
+        clean_arts: Dict[str, Dict[str, Any]] = {}
+        for k, v in raw_arts.items():
+            d = dict(v)
+            if "superseded_by" in d and d["superseded_by"]:
+                d["superseded_by"] = str(d["superseded_by"])
+                d.setdefault("metadata", {})["superseded_by"] = d["superseded_by"]
+            clean_arts[str(k)] = d
+        filtered["artifacts"] = clean_arts
+
         if not filtered.get("latest_by_path"):
             lbp: Dict[str, str] = {}
-            for k, art_dict in filtered.get("artifacts", {}).items():
+            for k, art_dict in clean_arts.items():
                 lp = art_dict.get("logical_path")
                 if not lp:
                     _, _, lp, _ = parse_artifact_id(art_dict.get("artifact_id", k))
                 if lp and art_dict.get("is_latest", True):
-                    lbp[lp] = RevisionRef(k)
+                    lbp[str(lp)] = str(k)
             filtered["latest_by_path"] = lbp
         else:
             filtered["latest_by_path"] = {
-                k: RevisionRef(v) for k, v in filtered["latest_by_path"].items()
+                str(k): str(v) for k, v in filtered["latest_by_path"].items()
             }
-
-        for art_dict in filtered.get("artifacts", {}).values():
-            if "superseded_by" in art_dict and art_dict["superseded_by"]:
-                art_dict["superseded_by"] = RevisionRef(art_dict["superseded_by"])
-                art_dict.setdefault("metadata", {})["superseded_by"] = art_dict["superseded_by"]
 
         return cls(**filtered)
 
