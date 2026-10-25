@@ -264,8 +264,11 @@ class PublicationManifest:
                 if art_dict.get("is_latest") is True:
                     return _build_stored_artifact(art_dict)
 
-        # Fallback: scan self.artifacts.values() for matching logical_path
-        candidates = []
+        # Scan for matching logical paths. An exact logical-path match always wins over a
+        # bare-name match; a name match is only used when it resolves to exactly one logical path.
+        clean_req = artifact_id.split("@sha256_")[0].lstrip("/")
+        exact: List[Dict[str, Any]] = []
+        by_name: List[Dict[str, Any]] = []
         for art_dict in self.artifacts.values():
             art_lp = art_dict.get("logical_path")
             if not art_lp:
@@ -280,29 +283,28 @@ class PublicationManifest:
                 art_dict.get("run_id", self.run_id),
                 art_lp,
             )
-            clean_req = artifact_id.split("@sha256_")[0].lstrip("/")
+            if art_lp == clean_lp or full_logical == clean_req:
+                exact.append((art_lp, art_dict))
+            elif Path(art_lp).name == clean_lp or Path(full_logical).name == clean_lp:
+                by_name.append((art_lp, art_dict))
 
-            matches_path = (
-                art_lp == clean_lp
-                or Path(art_lp).name == clean_lp
-                or full_logical == clean_req
-                or Path(full_logical).name == clean_lp
-            )
-
-            if matches_path:
-                art_sha = art_dict.get("sha256", "").strip().lower()
-                if sha_suffix is not None:
-                    if art_sha == sha_suffix.strip().lower():
-                        return _build_stored_artifact(art_dict)
-                else:
-                    candidates.append(art_dict)
-
-        if candidates:
-            latest_candidate = next((c for c in candidates if c.get("is_latest") is True), None)
-            if latest_candidate:
-                return _build_stored_artifact(latest_candidate)
+        matches = exact if exact else by_name
+        if not matches:
+            return None
+        if len({lp for lp, _ in matches}) > 1:
+            # Ambiguous name-only request (e.g. checkpoints/model.pt vs outputs/model.pt): refuse to guess.
             return None
 
+        if sha_suffix is not None:
+            wanted = sha_suffix.strip().lower()
+            for _, art_dict in matches:
+                if str(art_dict.get("sha256", "")).strip().lower() == wanted:
+                    return _build_stored_artifact(art_dict)
+            return None
+
+        latest_candidates = [d for _, d in matches if d.get("is_latest") is True]
+        if len(latest_candidates) == 1:
+            return _build_stored_artifact(latest_candidates[0])
         return None
 
     def get_latest_artifact(self, logical_path: str) -> Optional[StoredArtifact]:

@@ -1569,8 +1569,9 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
                 artifact_type=ArtifactType.CHECKPOINT.value,
                 metadata={"step": step, "epoch": epoch, "logical_path": "checkpoints/model.pt"},
             )
-            # Verify revision directory is preserved under .revisions/<sha16>/model.pt
-            rev_staged_path = local_run_dir / "checkpoints" / ".revisions" / sha[:16] / "model.pt"
+            # Verify revision directory is preserved under .revisions/<full sha256>/model.pt
+            # (B7: new revisions are written under the full 64-hex directory; sha16 is read-only legacy)
+            rev_staged_path = local_run_dir / "checkpoints" / ".revisions" / sha / "model.pt"
             self.assertTrue(rev_staged_path.is_file())
             self.assertEqual(compute_file_sha256(rev_staged_path), sha)
 
