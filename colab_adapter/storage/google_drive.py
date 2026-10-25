@@ -826,7 +826,7 @@ class GoogleDriveArtifactStore:
                 "revision_id": f"sha256_{transfer_record.sha256.lower()}",
                 "project_id": transfer_record.project_id or "",
                 "run_id": transfer_record.run_id or "",
-                "is_latest": "true",
+                "is_latest": "false",
             }
 
         new_session_url = self._initiate_resumable_upload(
@@ -867,7 +867,7 @@ class GoogleDriveArtifactStore:
                 "revision_id": f"sha256_{transfer_record.sha256.lower()}",
                 "project_id": transfer_record.project_id or "",
                 "run_id": transfer_record.run_id or "",
-                "is_latest": "true",
+                "is_latest": "false",
             }
 
         # Check if identical file already exists in target folder (idempotency)
@@ -1190,6 +1190,97 @@ class GoogleDriveArtifactStore:
                 except OSError:
                     pass
 
+    def _patch_remote_file_app_properties(
+        self, remote_id: str, app_properties: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """Send a retryable PATCH request to update file appProperties on Google Drive."""
+        url = f"https://www.googleapis.com/drive/v3/files/{remote_id}?fields=id,name,appProperties"
+        payload = json.dumps({"appProperties": app_properties}).encode("utf-8")
+        status, headers, body = self._request_with_retry(
+            "PATCH",
+            url,
+            headers={"content-type": "application/json"},
+            data=payload,
+        )
+        if status == 401:
+            raise DriveAuthenticationError(
+                f"Drive authentication rejected (401): {_sanitize_drive_error(body, url)}"
+            )
+        if status == 403:
+            body_text = body.decode("utf-8", errors="replace")
+            sanitized = _sanitize_drive_error(body, url)
+            if "quotaExceeded" in body_text or "storageQuotaExceeded" in body_text:
+                raise DriveQuotaExceededError(f"Drive storage quota exceeded (403): {sanitized}")
+            raise DriveAuthenticationError(f"Drive access forbidden (403): {sanitized}")
+        if status != 200:
+            raise DriveTransferError(
+                f"Failed to patch Drive file properties for '{remote_id}' (HTTP {status}): {_sanitize_drive_error(body, url)}"
+            )
+
+        try:
+            res = json.loads(body.decode("utf-8"))
+        except Exception as e:
+            raise DriveTransferError(
+                f"Failed to parse PATCH response for '{remote_id}': {_sanitize_drive_error(str(e), url)}"
+            ) from e
+
+        if not isinstance(res, dict) or res.get("id") != remote_id:
+            raise DriveTransferError(
+                f"PATCH response missing expected file id '{remote_id}' (got {res.get('id') if isinstance(res, dict) else 'invalid'})."
+            )
+
+        res_props = res.get("appProperties") or {}
+        for k, v in app_properties.items():
+            if res_props.get(k) != v:
+                raise DriveTransferError(
+                    f"PATCH verification failed for '{remote_id}': property '{k}' expected '{v}', got '{res_props.get(k)}'."
+                )
+
+        return res
+
+    def _coordinate_remote_latest_revision(
+        self,
+        filename: str,
+        target_folder_id: str,
+        new_remote_id: str,
+        new_sha256: str,
+        logical_path: str,
+        project_id: str,
+        run_id: str,
+        artifact_id: str,
+    ) -> None:
+        """Coordinate remote latest revision markers on Drive.
+
+        Called only after new_remote_id has been uploaded and content-verified.
+        Demotes all previous revisions in target_folder_id to is_latest='false'
+        and sets superseded_by, then promotes new_remote_id to is_latest='true'.
+        """
+        # Step A: List all existing remote files in target_folder_id with name = filename
+        files = self._list_files_in_folder(filename, target_folder_id)
+
+        # Step B: For every remote file f where f.get("id") and f.get("id") != new_remote_id
+        for f in files:
+            f_id = f.get("id")
+            if not f_id or f_id == new_remote_id:
+                continue
+            old_props = dict(f.get("appProperties") or {})
+            if old_props.get("is_latest") == "true":
+                updated_old_props = {**old_props, "is_latest": "false"}
+                if not old_props.get("superseded_by"):
+                    updated_old_props["superseded_by"] = artifact_id
+                self._patch_remote_file_app_properties(f_id, updated_old_props)
+
+        # Step C: Promote new_remote_id to is_latest="true"
+        promoted_props = {
+            "sha256": new_sha256.lower(),
+            "logical_path": logical_path,
+            "revision_id": f"sha256_{new_sha256.lower()}",
+            "project_id": project_id,
+            "run_id": run_id,
+            "is_latest": "true",
+        }
+        self._patch_remote_file_app_properties(new_remote_id, promoted_props)
+
     def _save_manifest_with_backup(self, manifest: PublicationManifest, local_manifest_path: Path) -> None:
         """Atomically persist manifest and sync 0600 backup."""
         manifest.save(local_manifest_path)
@@ -1475,6 +1566,17 @@ class GoogleDriveArtifactStore:
                                     break
 
                 if record is not None and record.status == TransferStatus.PUBLISHED.value and record.remote_file_id:
+                    target_folder_id = self.resolve_target_folder_id(project_id, run_id, subfolder)
+                    self._coordinate_remote_latest_revision(
+                        src.name,
+                        target_folder_id,
+                        record.remote_file_id,
+                        local_sha256,
+                        rel_path,
+                        project_id,
+                        run_id,
+                        artifact_id,
+                    )
                     meta_dict = dict(metadata or {})
                     meta_dict["logical_path"] = rel_path
                     meta_dict["revision_id"] = f"sha256_{local_sha256.lower()}"
@@ -1604,6 +1706,16 @@ class GoogleDriveArtifactStore:
 
                 if existing_file:
                     remote_id = existing_file.get("id")
+                    self._coordinate_remote_latest_revision(
+                        src.name,
+                        target_folder_id,
+                        remote_id,
+                        local_sha256,
+                        rel_path,
+                        project_id,
+                        run_id,
+                        artifact_id,
+                    )
                     if record is None or record.transfer_id != transfer_id:
                         record = TransferRecord(
                             transfer_id=transfer_id,
@@ -1741,7 +1853,7 @@ class GoogleDriveArtifactStore:
                     "revision_id": f"sha256_{local_sha256.lower()}",
                     "project_id": project_id,
                     "run_id": run_id,
-                    "is_latest": "true",
+                    "is_latest": "false",
                 }
                 drive_file_meta = self.upload_file_resumable(
                     staged_src, target_folder_id, record, app_properties=drive_app_props
@@ -1793,6 +1905,17 @@ class GoogleDriveArtifactStore:
                     record.transition_to(TransferStatus.DRIVE_VERIFIED)
                     self.journal.record_transfer(record)
 
+                self._coordinate_remote_latest_revision(
+                    src.name,
+                    target_folder_id,
+                    remote_id,
+                    local_sha256,
+                    rel_path,
+                    project_id,
+                    run_id,
+                    artifact_id,
+                )
+
                 if record.status != TransferStatus.PUBLISHED.value:
                     record.transition_to(TransferStatus.PUBLISHED)
                     record.remote_file_id = remote_id
@@ -1840,6 +1963,16 @@ class GoogleDriveArtifactStore:
                             verified_at=_utc_now_iso(),
                             metadata={**existing_art.metadata, **meta_dict},
                         )
+
+                    for k, art_dict in manifest.artifacts.items():
+                        if (
+                            art_dict.get("path") == rel_path
+                            or art_dict.get("metadata", {}).get("logical_path") == rel_path
+                            or k.split("@sha256_")[0] == logical_artifact_id
+                        ) and k != artifact_id:
+                            if "metadata" not in art_dict or not isinstance(art_dict["metadata"], dict):
+                                art_dict["metadata"] = {}
+                            art_dict["metadata"]["is_latest"] = False
 
                     manifest.add_artifact(stored)
                     manifest.status = "PUBLISHED"
@@ -2224,56 +2357,43 @@ class GoogleDriveArtifactStore:
                 files = self._list_files_in_folder(fname, f_id)
                 if len(files) == 0:
                     raise ArtifactNotFoundError(f"Artifact '{artifact_id}' not found in Google Drive registry.")
-                elif len(files) > 1:
-                    latest_candidates = [
-                        f for f in files
-                        if (f.get("appProperties") or {}).get("is_latest") == "true"
-                        and (f.get("appProperties") or {}).get("sha256")
-                    ]
-                    if len(latest_candidates) == 1:
-                        chosen = latest_candidates[0]
-                        app_props = chosen.get("appProperties") or {}
-                        chosen_sha = app_props["sha256"].strip().lower()
-                        meta = StoredArtifact(
-                            artifact_id=f"{base_art_id}@sha256_{chosen_sha}",
-                            storage_provider=self.provider_name,
-                            path=rel_p,
-                            size_bytes=int(chosen["size"]) if chosen.get("size") is not None else None,
-                            sha256=chosen_sha,
-                            project_id=proj_id,
-                            run_id=r_id,
-                            remote_file_id=chosen["id"],
-                            md5=chosen.get("md5Checksum"),
-                            verified_at=_utc_now_iso(),
-                        )
-                        target_sha = chosen_sha
-                    else:
-                        raise DriveIntegrityError(
-                            f"Ambiguous unversioned Drive recovery: multiple remote revisions exist for '{artifact_id}' and local manifest is missing."
-                        )
-                else:
-                    chosen = files[0]
+
+                latest_candidates = [
+                    f for f in files
+                    if (f.get("appProperties") or {}).get("is_latest") == "true"
+                    and (f.get("appProperties") or {}).get("sha256")
+                ]
+                if len(latest_candidates) == 1:
+                    chosen = latest_candidates[0]
                     app_props = chosen.get("appProperties") or {}
-                    remote_sha = app_props.get("sha256", "").strip().lower()
-                    if remote_sha:
-                        target_sha = remote_sha
-                        meta = StoredArtifact(
-                            artifact_id=f"{base_art_id}@sha256_{remote_sha}",
-                            storage_provider=self.provider_name,
-                            path=rel_p,
-                            size_bytes=int(chosen["size"]) if chosen.get("size") is not None else None,
-                            sha256=remote_sha,
-                            project_id=proj_id,
-                            run_id=r_id,
-                            remote_file_id=chosen["id"],
-                            md5=chosen.get("md5Checksum"),
-                            verified_at=_utc_now_iso(),
+                    chosen_sha = app_props["sha256"].strip().lower()
+
+                    cand_logical = app_props.get("logical_path")
+                    if cand_logical and cand_logical != rel_p and Path(cand_logical).name != fname:
+                        raise DriveIntegrityError(
+                            f"Remote file logical_path '{cand_logical}' does not match expected '{rel_p}'."
                         )
-                    else:
-                        if not allow_unverified_recovery:
-                            raise DriveIntegrityError(
-                                "Unverified Drive recovery refused: local manifest is missing and remote file lacks authoritative SHA256 metadata."
-                            )
+                    if len(chosen_sha) != 64 or not all(c in "0123456789abcdef" for c in chosen_sha):
+                        raise DriveIntegrityError(
+                            f"Invalid SHA256 '{chosen_sha}' in remote file appProperties for '{artifact_id}'."
+                        )
+
+                    meta = StoredArtifact(
+                        artifact_id=f"{base_art_id}@sha256_{chosen_sha}",
+                        storage_provider=self.provider_name,
+                        path=rel_p,
+                        size_bytes=int(chosen["size"]) if chosen.get("size") is not None else None,
+                        sha256=chosen_sha,
+                        project_id=proj_id,
+                        run_id=r_id,
+                        remote_file_id=chosen["id"],
+                        md5=chosen.get("md5Checksum"),
+                        verified_at=_utc_now_iso(),
+                    )
+                    target_sha = chosen_sha
+                elif len(latest_candidates) == 0:
+                    if len(files) == 1 and allow_unverified_recovery:
+                        chosen = files[0]
                         if not chosen.get("md5Checksum") or chosen.get("size") is None:
                             raise DriveIntegrityError(
                                 "Unverified Drive recovery refused: remote file lacks md5Checksum or size."
@@ -2291,6 +2411,14 @@ class GoogleDriveArtifactStore:
                             verified_at=_utc_now_iso(),
                         )
                         target_sha = None
+                    else:
+                        raise DriveIntegrityError(
+                            f"Ambiguous unversioned Drive recovery: no remote revision marked latest found for '{artifact_id}' and local manifest is missing."
+                        )
+                else:
+                    raise DriveIntegrityError(
+                        f"Ambiguous unversioned Drive recovery: multiple ({len(latest_candidates)}) remote revisions marked latest exist for '{artifact_id}' and local manifest is missing."
+                    )
 
         if not meta or not meta.remote_file_id:
             raise ArtifactNotFoundError(f"Artifact '{artifact_id}' not found in Google Drive registry.")
