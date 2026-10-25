@@ -76,7 +76,9 @@ class GateFixture(unittest.TestCase):
         return ProjectSpec(**kwargs)
 
     def make_manager(self):
-        return ProjectSessionManager(spawn_fn=fake_guard_spawner(self), registry=self.registry, lock=self.lock, run_cmd_fn=self.fake_colab)
+        mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), registry=self.registry, lock=self.lock, run_cmd_fn=self.fake_colab)
+        mgr.FAILURE_SETTLE_SECONDS = 0.0
+        return mgr
 
     def fake_colab(self, cmd, **kwargs):
         self.commands.append(list(cmd))
@@ -291,13 +293,19 @@ class TestFailedAllocationConsumesApproval(GateFixture):
         self.new_returncode = 1
         with self.assertRaises(AllocationError):
             self.manager.up(self.spec, lease_seconds=1800.0, approval_id=approval_id)
+        # This backend gives no readable usage data, so absence of a VM is unproven: the record must stay
+        # NEEDS_RECONCILIATION (counted by the cap). FAILED needs evidence; see test_allocation_failure_fail_closed.
         states = [info["state"] for info in self.registry.get_all_managed().values()]
-        self.assertEqual(states, [ProjectSessionState.FAILED.value])
+        self.assertEqual(states, [ProjectSessionState.NEEDS_RECONCILIATION.value])
         self.assertEqual(self.record(approval_id)["status"], "consumed")
 
         self.new_returncode = 0
-        self.assert_refused(lambda: self.manager.up(self.spec, lease_seconds=1800.0, approval_id=approval_id),
-                            "consumed")
+        # The uncertain record still counts toward the one-session cap, which is checked before the approval:
+        # the retry is refused either way and never reaches `colab new`.
+        from colab_adapter.approval import GlobalCapExceededError
+        with self.assertRaises(GlobalCapExceededError):
+            self.manager.up(self.spec, lease_seconds=1800.0, approval_id=approval_id)
+        self.assertEqual(self.record(approval_id)["status"], "consumed")
         self.assertEqual(self.new_count(), 1)
 
     def test_timeout_consumes_approval_and_needs_reconciliation(self):

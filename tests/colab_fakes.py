@@ -11,6 +11,15 @@ verified in its source (commands/session.py, commands/usage.py, consumption.py):
 - `exec -s <id> -f <file>`: runs the file with python3 locally (the upstream kernel stand-in); kernel
   errors go to stderr and the exit code stays 0, as upstream does.
 
+- `new -s <id> --gpu <g>`: mode from env FAKE_COLAB_NEW_MODE (default ok): `ok` assigns <id> and exits 0;
+  `fail_before` exits 1 with no assignment; `fail_after_orphan` assigns an UNNAMED orphan (upstream assigns the VM
+  before it records the local name; `sessions` shows it as "[?] endpoint") and then exits 1;
+  `fail_after_named` assigns <id> and exits 1; `ok_output_but_fail` assigns an orphan, prints "Session READY."
+  and exits 1.
+- `usage` switches: FAKE_COLAB_USAGE_FAIL (always exits 1), FAKE_COLAB_USAGE_FAIL_AFTER_NEW (exits 1 once `new`
+  has been called), and the file `<FAKE_COLAB_DIR>/usage_lag_remaining` holding N, which hides unnamed orphans
+  from the next N `usage` readings (a lagging server-side count).
+
 Env switches: FAKE_COLAB_STOP_FAIL (every stop exits 1), FAKE_COLAB_STOP_LIE (stop exits 0 but keeps
 the id alive), and the file `<FAKE_COLAB_DIR>/stop_fail_remaining` holding N, which makes the next N
 stops exit 1 and then decrements.
@@ -45,12 +54,46 @@ if command == "sessions":
     if not ids:
         print("[colab] No active sessions found on server.")
     for sid in ids:
-        print("[" + sid + "] ep-" + sid + " | Hardware: T4 | Shape: Standard | Variant: GPU")
+        name = "?" if sid.startswith("orphan-") else sid
+        print("[" + name + "] ep-" + sid + " | Hardware: T4 | Shape: Standard | Variant: GPU")
     sys.exit(0)
 if command == "usage":
+    if os.environ.get("FAKE_COLAB_USAGE_FAIL"):
+        print("usage unavailable", file=sys.stderr)
+        sys.exit(1)
+    if os.environ.get("FAKE_COLAB_USAGE_FAIL_AFTER_NEW") and os.path.exists(os.path.join(state_dir, "new_called")):
+        print("usage unavailable", file=sys.stderr)
+        sys.exit(1)
+    ids = alive_ids()
+    lag = os.path.join(state_dir, "usage_lag_remaining")
+    if os.path.exists(lag):
+        remaining = int(open(lag, encoding="utf-8").read().strip() or "0")
+        if remaining > 0:
+            with open(lag, "w", encoding="utf-8") as fh:
+                fh.write(str(remaining - 1))
+            ids = [i for i in ids if not i.startswith("orphan-")]
     print("Current balance: 10.00 compute units")
     print("Usage rate: 1.00/hr")
-    print("Active assignments: %d" % len(alive_ids()))
+    print("Active assignments: %d" % len(ids))
+    sys.exit(0)
+if command == "new":
+    sid = rest[rest.index("-s") + 1]
+    mode = os.environ.get("FAKE_COLAB_NEW_MODE", "ok")
+    open(os.path.join(state_dir, "new_called"), "w", encoding="utf-8").close()
+    if mode == "fail_before":
+        print("[colab] Error: no GPU quota available.", file=sys.stderr)
+        sys.exit(1)
+    if mode in ("fail_after_orphan", "ok_output_but_fail"):
+        open(os.path.join(alive_dir, "orphan-" + sid), "w", encoding="utf-8").close()
+        if mode == "ok_output_but_fail":
+            print("[colab] Session READY.")
+        print("[colab] Error: connection reset while recording the session.", file=sys.stderr)
+        sys.exit(1)
+    open(os.path.join(alive_dir, sid), "w", encoding="utf-8").close()
+    if mode == "fail_after_named":
+        print("[colab] Error: could not finish setup.", file=sys.stderr)
+        sys.exit(1)
+    print("[colab] Session READY.")
     sys.exit(0)
 if command == "stop":
     sid = rest[rest.index("-s") + 1]

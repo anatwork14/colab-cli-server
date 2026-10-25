@@ -579,19 +579,27 @@ class ProjectSessionManager:
                 res = self._run_cmd(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180.0)
                 if res.returncode != 0:
                     err_msg = (res.stderr or res.stdout or "").strip()
-                    session.transition_to(ProjectSessionState.FAILED, reason=f"Allocation CLI failed: {err_msg}")
-                    self._commit_session(session)
-                    raise AllocationError(
-                        f"Failed to allocate session '{session_id}' with accelerator '{gpu}': {err_msg}"
+                    # A nonzero exit is NOT evidence that no VM was assigned: upstream assigns the VM before it
+                    # records the local name. Only positive evidence may free the cap.
+                    proven = self._settle_failed_allocation(
+                        session, f"Allocation CLI failed (exit {res.returncode}): {err_msg}"
                     )
+                    raise self._allocation_error(session_id, gpu, err_msg, proven)
             except subprocess.TimeoutExpired as te:
                 self._flag_orphan_risk(session, "Allocation CLI timed out; an unnamed orphan VM may exist")
-                raise AllocationError(f"Session allocation timed out after 180s for '{session_id}'") from te
+                raise self._allocation_error(session_id, gpu, "timed out after 180s", False) from te
             except AllocationError:
                 raise
-            except Exception as ex:
-                session.transition_to(ProjectSessionState.FAILED, reason=str(ex))
+            except (FileNotFoundError, PermissionError) as ex:
+                # The executable could not be started, so `colab new` never ran: no assignment can exist.
+                session.transition_to(ProjectSessionState.FAILED, reason=f"colab could not be executed: {type(ex).__name__}")
                 self._commit_session(session)
+                raise
+            except Exception as ex:
+                # Unknown failure while `colab new` may have run: uncertain until proven otherwise.
+                proven = self._settle_failed_allocation(session, f"Allocation raised {type(ex).__name__}: {ex}")
+                if not proven:
+                    raise self._allocation_error(session_id, gpu, f"{type(ex).__name__}: {ex}", False) from ex
                 raise
             except BaseException:
                 # KeyboardInterrupt / SystemExit during `colab new`: the VM may exist without a local name.
@@ -790,6 +798,73 @@ class ProjectSessionManager:
             session.updated_at = _iso_now()
             if reason:
                 session.metadata["last_transition_reason"] = reason
+
+    # Seconds between the two consecutive "nothing is assigned" readings required before a failed
+    # allocation may be recorded as FAILED (a lagging server-side count must not fool a single read).
+    FAILURE_SETTLE_SECONDS = 5.0
+
+    def _allocation_failure_evidence(self, session_id: str, baseline: Optional[int]) -> "tuple":
+        """(proven, detail): True only with positive evidence that no assignment remains.
+
+        Requires a known pre-allocation baseline, and TWO consecutive strong verifications
+        (`colab sessions` readable and not listing the id, `colab usage` readable and not above the
+        baseline), separated by FAILURE_SETTLE_SECONDS. Anything unreadable, unknown, above the
+        baseline or inconsistent between the two readings is NOT proof.
+        """
+        if baseline is None:
+            return False, "the active-assignment baseline could not be read before allocation"
+        for attempt in range(2):
+            verdict = self._verify_gone(session_id, baseline)
+            if not verdict.ok or verdict.level != "strong":
+                return False, verdict.detail
+            if attempt == 0 and self.FAILURE_SETTLE_SECONDS > 0:
+                time.sleep(self.FAILURE_SETTLE_SECONDS)
+        return True, f"no assignment remains (two readings, baseline {baseline})"
+
+    def _settle_failed_allocation(self, session: ProjectSession, reason: str) -> bool:
+        """Record a failed allocation. FAILED only when proven empty, else NEEDS_RECONCILIATION (cap kept).
+
+        Never allocates again. Returns True when absence of an assignment was proven.
+        """
+        baseline = session.metadata.get("assignments_before")
+        try:
+            proven, detail = self._allocation_failure_evidence(session.session_id, baseline)
+        except BaseException:  # noqa: BLE001 - evidence gathering must never mask the failure or free the cap
+            proven, detail = False, "evidence check was interrupted or failed"
+        session.metadata["allocation_failure_evidence"] = detail
+        if proven:
+            self._set_state(session, ProjectSessionState.FAILED, f"{reason}; {detail}")
+            self._commit_session(session)
+            return True
+        session.metadata["orphan_possible"] = True
+        self._set_state(
+            session, ProjectSessionState.NEEDS_RECONCILIATION,
+            f"{reason}; allocation state uncertain ({detail}); an orphan runtime may exist",
+        )
+        self._commit_session(session)
+        return False
+
+    @classmethod
+    def _allocation_error(cls, session_id: str, gpu: str, err_msg: str, proven_empty: bool) -> AllocationError:
+        exc = AllocationError(cls._allocation_failure_message(session_id, gpu, err_msg, proven_empty))
+        exc.details = {"session_id": session_id, "orphan_possible": not proven_empty}
+        exc.orphan_possible = not proven_empty
+        return exc
+
+    @staticmethod
+    def _allocation_failure_message(session_id: str, gpu: str, err_msg: str, proven_empty: bool) -> str:
+        if proven_empty:
+            return (
+                f"Failed to allocate session '{session_id}' with accelerator '{gpu}': {err_msg} "
+                "(verified: no assignment remains)."
+            )
+        return (
+            f"Allocation of session '{session_id}' ({gpu}) failed or is uncertain: {err_msg}. "
+            "POSSIBLE ORPHAN GPU RUNTIME: it could not be proven that no runtime was assigned. The record is "
+            "NEEDS_RECONCILIATION and still counts toward the one-session cap; no automatic retry will happen. "
+            "Check `colab usage` (Active assignments vs your baseline) and the Colab web UI, stop any runtime "
+            "you did not intend, then follow the reconciliation procedure."
+        )
 
     def _flag_orphan_risk(self, session: ProjectSession, reason: str) -> None:
         self._set_state(session, ProjectSessionState.NEEDS_RECONCILIATION, reason)

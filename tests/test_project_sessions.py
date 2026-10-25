@@ -150,8 +150,9 @@ class TestProjectSessions(unittest.TestCase):
         self.assertEqual(stored["accelerator"], "T4")
         self.assertTrue(self.registry.is_managed(session.session_id))
 
-    def test_up_allocation_failure_records_failed_state(self):
-        """Failed CLI allocation transitions session to FAILED and raises AllocationError."""
+    def test_up_allocation_failure_without_proof_keeps_needs_reconciliation(self):
+        """A nonzero `colab new` is NOT evidence that no VM was assigned: without proof the record stays
+        NEEDS_RECONCILIATION (still counted by the cap) and AllocationError warns about a possible orphan."""
         def mock_run_fail(cmd, **kwargs):
             return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Quota exceeded for GPU T4")
 
@@ -160,14 +161,41 @@ class TestProjectSessions(unittest.TestCase):
             lock=self.lock,
             run_cmd_fn=mock_run_fail,
         )
+        manager.FAILURE_SETTLE_SECONDS = 0.0
 
         with self.assertRaises(AllocationError) as ctx:
             manager.up(self.spec, approval_id=grant_v2(manager, self.spec))
         self.assertIn("Quota exceeded", str(ctx.exception))
+        self.assertIn("POSSIBLE ORPHAN", str(ctx.exception))
 
         all_managed = self.registry.get_all_managed()
         self.assertEqual(len(all_managed), 1)
         info = list(all_managed.values())[0]
+        self.assertEqual(info["state"], ProjectSessionState.NEEDS_RECONCILIATION.value)
+        self.assertTrue(info["metadata"]["orphan_possible"])
+
+    def test_up_allocation_failure_with_proven_absence_records_failed_state(self):
+        """FAILED is allowed only with positive evidence: a known baseline and two clean server-side readings."""
+        def mock_run(cmd, **kwargs):
+            rest = [a for a in cmd if not str(a).startswith("--auth=")][1:]
+            if rest[:1] == ["usage"]:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Active assignments: 0\n", stderr="")
+            if rest[:1] == ["sessions"]:
+                return subprocess.CompletedProcess(args=cmd, returncode=0,
+                                                   stdout="[colab] No active sessions found on server.\n", stderr="")
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Quota exceeded for GPU T4")
+
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self),
+            registry=self.registry,
+            lock=self.lock,
+            run_cmd_fn=mock_run,
+        )
+        manager.FAILURE_SETTLE_SECONDS = 0.0
+
+        with self.assertRaises(AllocationError) as ctx:
+            manager.up(self.spec, approval_id=grant_v2(manager, self.spec))
+        self.assertNotIn("POSSIBLE ORPHAN", str(ctx.exception))
+        info = list(self.registry.get_all_managed().values())[0]
         self.assertEqual(info["state"], ProjectSessionState.FAILED.value)
 
     def test_up_reuses_existing_active_session_idempotently(self):
