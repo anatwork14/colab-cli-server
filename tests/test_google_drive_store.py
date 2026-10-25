@@ -17,6 +17,8 @@ import re
 import shutil
 import stat
 import tempfile
+import concurrent.futures
+import threading
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -27,11 +29,15 @@ from colab_adapter.errors import (
     DriveIntegrityError,
     DriveQuotaExceededError,
     DriveTransferError,
+    StorageError,
 )
 from colab_adapter.storage import (
     ArtifactType,
     DriveCredentials,
     GoogleDriveArtifactStore,
+    PublicationManifest,
+    TransferRecord,
+    TransferStatus,
     compute_file_md5,
     compute_file_sha256,
 )
@@ -41,6 +47,7 @@ class MockDriveHttpClient:
     """Mock HTTP client simulating Google Drive v3 REST API endpoints."""
 
     def __init__(self):
+        self.lock = threading.Lock()
         self.requests_log: List[Tuple[str, str, Dict[str, str], Optional[bytes]]] = []
         self.folder_id_counter = 100
         self.file_id_counter = 500
@@ -50,10 +57,13 @@ class MockDriveHttpClient:
         self.token_refreshed = False
         self.simulate_resume_interruption = False
         self.resumed_called = False
+        self.upload_sessions_initiated = 0
 
         # Session tracking buffers and committed files
         self.session_buffers: Dict[str, bytearray] = {}
         self.session_to_file_id: Dict[str, str] = {}
+        self.session_to_filename: Dict[str, str] = {}
+        self.session_to_parent: Dict[str, Optional[str]] = {}
         self.committed_files: Dict[str, bytes] = {}
         self.mock_files: List[Dict[str, Any]] = []
 
@@ -98,6 +108,17 @@ class MockDriveHttpClient:
         data: Optional[bytes] = None,
         timeout: float = 30.0,
     ) -> Tuple[int, Dict[str, str], bytes]:
+        with self.lock:
+            return self._locked_request(method, url, headers=headers, data=data, timeout=timeout)
+
+    def _locked_request(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[bytes] = None,
+        timeout: float = 30.0,
+    ) -> Tuple[int, Dict[str, str], bytes]:
         headers = headers or {}
         self.requests_log.append((method, url, headers, data))
 
@@ -122,9 +143,20 @@ class MockDriveHttpClient:
         if "drive/v3/files?q=" in url and method == "GET":
             q_unquoted = urllib.parse.unquote(url)
             if "mimeType = 'application/vnd.google-apps.folder'" in q_unquoted:
-                return 200, {}, b'{"files": []}'
+                matched_folders = []
+                for f in self.mock_files:
+                    if f.get("mimeType") == "application/vnd.google-apps.folder":
+                        f_name = f.get("name")
+                        f_parent = f.get("parent")
+                        if f_name and f"name = '{f_name}'" in q_unquoted:
+                            if (f_parent is None and "'root' in parents" in q_unquoted) or (f_parent and f"'{f_parent}' in parents" in q_unquoted):
+                                matched_folders.append({"id": f["id"], "name": f_name})
+                return 200, {}, json.dumps({"files": matched_folders}).encode("utf-8")
+
             matched = []
             for f in self.mock_files:
+                if f.get("mimeType") == "application/vnd.google-apps.folder":
+                    continue
                 f_name = f.get("name")
                 f_parent = f.get("parent")
                 if f_name and f"name = '{f_name}'" in q_unquoted:
@@ -141,11 +173,22 @@ class MockDriveHttpClient:
             # Creating a folder
             meta = json.loads(data.decode("utf-8")) if data else {}
             self.folder_id_counter += 1
-            resp = {"id": f"folder-{self.folder_id_counter}", "name": meta.get("name", "folder")}
+            folder_id = f"folder-{self.folder_id_counter}"
+            f_name = meta.get("name", "folder")
+            f_parents = meta.get("parents", [])
+            f_parent = f_parents[0] if f_parents else None
+            self.mock_files.append({
+                "id": folder_id,
+                "name": f_name,
+                "parent": f_parent,
+                "mimeType": "application/vnd.google-apps.folder",
+            })
+            resp = {"id": folder_id, "name": f_name}
             return 201, {"content-type": "application/json"}, json.dumps(resp).encode("utf-8")
 
         # 3. Resumable upload initiation
         if "uploadType=resumable" in url and method == "POST":
+            self.upload_sessions_initiated += 1
             self.file_id_counter += 1
             file_id = f"file-{self.file_id_counter}"
             session_id = f"upload-session-{self.file_id_counter}"
@@ -155,6 +198,21 @@ class MockDriveHttpClient:
             self.session_buffers[session_id] = buf
             self.session_to_file_id[session_url] = file_id
             self.session_to_file_id[session_id] = file_id
+
+            f_name = "uploaded_file"
+            f_parent = None
+            if data:
+                try:
+                    meta = json.loads(data.decode("utf-8"))
+                    f_name = meta.get("name", f_name)
+                    f_parents = meta.get("parents", [])
+                    f_parent = f_parents[0] if f_parents else None
+                except Exception:
+                    pass
+            self.session_to_filename[session_url] = f_name
+            self.session_to_filename[session_id] = f_name
+            self.session_to_parent[session_url] = f_parent
+            self.session_to_parent[session_id] = f_parent
             return 200, {"location": session_url}, b""
 
         # 4. Uploading chunk or querying status
@@ -211,9 +269,18 @@ class MockDriveHttpClient:
                 committed = bytes(buf) if buf is not None else chunk_data
                 self.committed_files[file_id] = committed
                 md5_hex = hashlib.md5(committed).hexdigest()
+                fname = self.session_to_filename.get(url, "uploaded_file")
+                fparent = self.session_to_parent.get(url, None)
+                self.mock_files.append({
+                    "id": file_id,
+                    "name": fname,
+                    "parent": fparent,
+                    "size": total_size,
+                    "md5Checksum": md5_hex,
+                })
                 resp = {
                     "id": file_id,
-                    "name": "uploaded_file",
+                    "name": fname,
                     "size": str(total_size),
                     "md5Checksum": md5_hex,
                 }
@@ -237,9 +304,14 @@ class MockDriveHttpClient:
                 fid = m_fid.group(1)
                 if fid in self.committed_files:
                     c_data = self.committed_files[fid]
+                    fname = "uploaded_file"
+                    for mf in self.mock_files:
+                        if mf.get("id") == fid:
+                            fname = mf.get("name", fname)
+                            break
                     resp = {
                         "id": fid,
-                        "name": "uploaded_file",
+                        "name": fname,
                         "size": str(len(c_data)),
                         "md5Checksum": hashlib.md5(c_data).hexdigest(),
                     }
@@ -611,6 +683,218 @@ class TestGoogleDriveArtifactStore(unittest.TestCase):
         records = self.store.journal.list_transfers(project_id="p_sec2", run_id="r_sec2")
         self.assertTrue(len(records) > 0)
         self.assertNotIn(session_val, records[0].last_error or "")
+
+    def test_concurrent_publish_exact_same_file_single_upload_and_idempotent_result(self):
+        """Two concurrent workers publishing exact same file result in 1 upload session & 1 remote file."""
+        file_path = Path(self.test_dir) / "concurrent_model.pt"
+        data = b"SHARED_MODEL_WEIGHTS_CONCURRENT_DATA" * 1000
+        file_path.write_bytes(data)
+
+        # Worker 2 has its own GoogleDriveArtifactStore instance pointing to the same staging dir and mock client
+        store2 = GoogleDriveArtifactStore(
+            credentials=self.creds,
+            credentials_file=self.credentials_file,
+            local_staging_dir=self.staging_dir,
+            http_client=self.mock_client,
+            chunk_size=1024 * 1024,
+            initial_backoff_sec=0.01,
+        )
+
+        barrier = threading.Barrier(2)
+        results = [None, None]
+        errors = [None, None]
+
+        def worker1():
+            try:
+                barrier.wait()
+                results[0] = self.store.publish(
+                    source=file_path,
+                    project_id="p_conc",
+                    run_id="r_conc",
+                    artifact_type=ArtifactType.CHECKPOINT.value,
+                )
+            except Exception as e:
+                errors[0] = e
+
+        def worker2():
+            try:
+                barrier.wait()
+                results[1] = store2.publish(
+                    source=file_path,
+                    project_id="p_conc",
+                    run_id="r_conc",
+                    artifact_type=ArtifactType.CHECKPOINT.value,
+                )
+            except Exception as e:
+                errors[1] = e
+
+        t1 = threading.Thread(target=worker1)
+        t2 = threading.Thread(target=worker2)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        self.assertIsNone(errors[0])
+        self.assertIsNone(errors[1])
+        art1 = results[0]
+        art2 = results[1]
+        self.assertIsNotNone(art1)
+        self.assertIsNotNone(art2)
+
+        # Exactly 1 upload session initiated and 1 file committed on Drive
+        self.assertEqual(self.mock_client.upload_sessions_initiated, 1)
+        self.assertEqual(len(self.mock_client.committed_files), 1)
+
+        # Both callers receive valid StoredArtifact with the same remote_file_id and sha256
+        self.assertEqual(art1.remote_file_id, art2.remote_file_id)
+        self.assertEqual(art1.sha256, art2.sha256)
+        self.assertEqual(art1.sha256, compute_file_sha256(file_path))
+        self.assertEqual(art1.size_bytes, len(data))
+        self.assertEqual(art2.size_bytes, len(data))
+
+        # Check journal state
+        transfers = self.store.journal.list_transfers(project_id="p_conc", run_id="r_conc")
+        self.assertEqual(len(transfers), 1)
+        self.assertEqual(transfers[0].status, "PUBLISHED")
+        self.assertEqual(transfers[0].remote_file_id, art1.remote_file_id)
+
+    def test_publish_modified_checkpoint_publishes_new_revision(self):
+        """Publishing v1 followed by modifying checkpoint with new bytes publishes v2 with new sha256."""
+        file_path = Path(self.test_dir) / "checkpoint.pt"
+        data_v1 = b"VERSION_1_WEIGHTS_CONTENT"
+        file_path.write_bytes(data_v1)
+
+        stored_v1 = self.store.publish(
+            source=file_path,
+            project_id="p_rev",
+            run_id="r_rev",
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+        self.assertEqual(stored_v1.sha256, compute_file_sha256(file_path))
+        self.assertEqual(stored_v1.size_bytes, len(data_v1))
+        fid_v1 = stored_v1.remote_file_id
+
+        # Modify checkpoint locally with new bytes (version 2)
+        data_v2 = b"VERSION_2_WEIGHTS_CONTENT_UPDATED_BYTES"
+        file_path.write_bytes(data_v2)
+
+        stored_v2 = self.store.publish(
+            source=file_path,
+            project_id="p_rev",
+            run_id="r_rev",
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+
+        # Stored v2 must have version 2's sha256 and distinct remote file ID
+        self.assertEqual(stored_v2.sha256, compute_file_sha256(file_path))
+        self.assertNotEqual(stored_v2.sha256, stored_v1.sha256)
+        self.assertNotEqual(stored_v2.remote_file_id, fid_v1)
+        self.assertEqual(stored_v2.size_bytes, len(data_v2))
+
+        # Re-publish version 2 without changing local file: idempotent reuse of v2
+        stored_v2_repub = self.store.publish(
+            source=file_path,
+            project_id="p_rev",
+            run_id="r_rev",
+            artifact_type=ArtifactType.CHECKPOINT.value,
+        )
+        self.assertEqual(stored_v2_repub.remote_file_id, stored_v2.remote_file_id)
+        self.assertEqual(stored_v2_repub.sha256, stored_v2.sha256)
+
+    def test_concurrent_manifest_locking_no_clobber(self):
+        """Concurrent processes publishing distinct files to the same run do not clobber manifest."""
+        file_a = Path(self.test_dir) / "weights_a.pt"
+        file_a.write_bytes(b"DATA_FILE_A_CONCURRENT")
+        file_b = Path(self.test_dir) / "weights_b.pt"
+        file_b.write_bytes(b"DATA_FILE_B_CONCURRENT")
+
+        store2 = GoogleDriveArtifactStore(
+            credentials=self.creds,
+            credentials_file=self.credentials_file,
+            local_staging_dir=self.staging_dir,
+            http_client=self.mock_client,
+            chunk_size=1024 * 1024,
+            initial_backoff_sec=0.01,
+        )
+
+        barrier = threading.Barrier(2)
+        results = [None, None]
+        errors = [None, None]
+
+        def publish_a():
+            try:
+                barrier.wait()
+                results[0] = self.store.publish(file_a, project_id="p_man", run_id="r_man")
+            except Exception as e:
+                errors[0] = e
+
+        def publish_b():
+            try:
+                barrier.wait()
+                results[1] = store2.publish(file_b, project_id="p_man", run_id="r_man")
+            except Exception as e:
+                errors[1] = e
+
+        t1 = threading.Thread(target=publish_a)
+        t2 = threading.Thread(target=publish_b)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        self.assertIsNone(errors[0])
+        self.assertIsNone(errors[1])
+
+        # Verify manifest on disk has both artifacts
+        manifest_path = self.staging_dir / "projects" / "p_man" / "runs" / "r_man" / "manifest.json"
+        manifest = PublicationManifest.load(manifest_path)
+        art_ids = [a.artifact_id for a in manifest.list_artifacts()]
+        self.assertIn("p_man/r_man/checkpoints/weights_a.pt", art_ids)
+        self.assertIn("p_man/r_man/checkpoints/weights_b.pt", art_ids)
+
+    def test_in_progress_transfer_mismatch_raises_storage_error(self):
+        """In-progress/unpublished transfer encountering remote checksum mismatch raises StorageError."""
+        file_path = Path(self.test_dir) / "in_progress_test.pt"
+        local_data = b"LOCAL_UNPUBLISHED_CONTENT"
+        file_path.write_bytes(local_data)
+        local_md5 = compute_file_md5(file_path)
+
+        # Pre-record an in-progress transfer in UPLOADING state
+        target_folder_id = self.store.resolve_target_folder_id("p_inp", "r_inp", "checkpoints")
+        base_tid = f"{self.store.provider_name}-p_inp-r_inp-in_progress_test.pt"
+        record = TransferRecord(
+            transfer_id=base_tid,
+            project_id="p_inp",
+            run_id="r_inp",
+            artifact_id="p_inp/r_inp/checkpoints/in_progress_test.pt",
+            local_path=str(file_path),
+            target_rel_path="checkpoints/in_progress_test.pt",
+            size_bytes=len(local_data),
+            sha256=compute_file_sha256(file_path),
+            md5=local_md5,
+            status=TransferStatus.UPLOADING.value,
+        )
+        self.store.journal.record_transfer(record)
+
+        # Remote Drive has a file with the same name, but corrupted / mismatched MD5
+        self.mock_client.mock_files.append({
+            "id": "corrupt-remote-id-123",
+            "name": "in_progress_test.pt",
+            "parent": target_folder_id,
+            "size": len(local_data),
+            "md5Checksum": "00000000000000000000000000000000",
+        })
+
+        with self.assertRaises(StorageError) as ctx:
+            self.store.publish(file_path, project_id="p_inp", run_id="r_inp")
+        self.assertIn("checksum mismatch", str(ctx.exception))
+
+    def test_exclusive_lock_reentrancy_and_timeout(self):
+        """_exclusive_lock is re-entrant in the same thread and does not deadlock."""
+        with self.store._exclusive_lock("reentrant-lock-test"):
+            with self.store._exclusive_lock("reentrant-lock-test"):
+                pass
 
 
 if __name__ == "__main__":

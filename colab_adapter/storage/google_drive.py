@@ -12,6 +12,7 @@ Implements the official Google Drive API v3 protocol:
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import logging
@@ -19,6 +20,7 @@ import os
 import random
 import re
 import stat
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -30,6 +32,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 from ..errors import (
     ArtifactNotFoundError,
     ArtifactValidationError,
@@ -37,6 +44,8 @@ from ..errors import (
     DriveIntegrityError,
     DriveQuotaExceededError,
     DriveTransferError,
+    JournalLockError,
+    StorageError,
 )
 from .base import ArtifactStore, ArtifactType, StoredArtifact, _utc_now_iso
 from .manifest import PublicationManifest, compute_file_md5, compute_file_sha256
@@ -46,6 +55,11 @@ DEFAULT_CHUNK_SIZE = 1024 * 1024  # 1 MiB chunks (multiple of 256 KiB)
 DEFAULT_DRIVE_ROOT_FOLDER = "Colab-Research"
 
 _SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+
+_NAMED_LOCK_REGISTRY: Dict[str, threading.RLock] = {}
+_NAMED_LOCK_REFCOUNTS: Dict[str, int] = {}
+_NAMED_LOCK_FDS: Dict[str, int] = {}
+_NAMED_LOCK_REGISTRY_MUTEX = threading.Lock()
 
 
 def _sanitize_drive_error(raw: Union[str, bytes], url: str = "") -> str:
@@ -282,6 +296,86 @@ class GoogleDriveArtifactStore:
     def provider_name(self) -> str:
         return "google_drive"
 
+    @contextlib.contextmanager
+    def _exclusive_lock(self, lock_name: str, timeout: float = 60.0):
+        """Acquire a named cross-process and cross-thread exclusive lock.
+
+        Delegates to self.journal.acquire_named_lock if supported by the journal,
+        otherwise uses a re-entrant thread lock combined with fcntl.flock on
+        .transfer_locks/<safe_lock_name>.lock.
+        """
+        if hasattr(self.journal, "acquire_named_lock"):
+            with self.journal.acquire_named_lock(lock_name, timeout=timeout):
+                yield
+            return
+
+        safe_lock_name = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", lock_name)
+        locks_dir = self.journal.path.parent / ".transfer_locks"
+        locks_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(str(locks_dir), 0o700)
+        except OSError:
+            pass
+
+        lock_file = locks_dir / f"{safe_lock_name}.lock"
+        key = str(lock_file.resolve())
+
+        with _NAMED_LOCK_REGISTRY_MUTEX:
+            if key not in _NAMED_LOCK_REGISTRY:
+                _NAMED_LOCK_REGISTRY[key] = threading.RLock()
+            rlock = _NAMED_LOCK_REGISTRY[key]
+
+        start_time = time.time()
+        if not rlock.acquire(timeout=timeout):
+            raise JournalLockError(f"Thread lock acquisition timed out after {timeout}s for {lock_name}")
+
+        try:
+            with _NAMED_LOCK_REGISTRY_MUTEX:
+                ref_count = _NAMED_LOCK_REFCOUNTS.get(key, 0)
+                if ref_count == 0:
+                    fd = os.open(str(lock_file), os.O_RDWR | os.O_CREAT, 0o600)
+                    try:
+                        os.chmod(str(lock_file), 0o600)
+                    except OSError:
+                        pass
+                    if fcntl is not None:
+                        flock_acquired = False
+                        while (time.time() - start_time) < timeout:
+                            try:
+                                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                flock_acquired = True
+                                break
+                            except (BlockingIOError, OSError):
+                                time.sleep(0.02)
+                        if not flock_acquired:
+                            os.close(fd)
+                            raise JournalLockError(
+                                f"Cross-process file lock acquisition timed out after {timeout}s for {lock_name}"
+                            )
+                    _NAMED_LOCK_FDS[key] = fd
+                _NAMED_LOCK_REFCOUNTS[key] = ref_count + 1
+
+            yield
+
+        finally:
+            with _NAMED_LOCK_REGISTRY_MUTEX:
+                if key in _NAMED_LOCK_REFCOUNTS:
+                    _NAMED_LOCK_REFCOUNTS[key] -= 1
+                    if _NAMED_LOCK_REFCOUNTS[key] == 0:
+                        del _NAMED_LOCK_REFCOUNTS[key]
+                        open_fd = _NAMED_LOCK_FDS.pop(key, None)
+                        if open_fd is not None:
+                            if fcntl is not None:
+                                try:
+                                    fcntl.flock(open_fd, fcntl.LOCK_UN)
+                                except OSError:
+                                    pass
+                            try:
+                                os.close(open_fd)
+                            except OSError:
+                                pass
+            rlock.release()
+
     def _ensure_token(self) -> str:
         """Return valid OAuth access token, refreshing if necessary."""
         if not self.credentials and self.credentials_file and self.credentials_file.exists():
@@ -480,6 +574,7 @@ class GoogleDriveArtifactStore:
         folder_id: str,
         expected_size: Optional[int] = None,
         expected_md5: Optional[str] = None,
+        allow_revision_mismatch: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Query for existing non-trashed file with matching name in folder to prevent duplicates."""
         safe_name = filename.replace("'", "\\'")
@@ -488,22 +583,40 @@ class GoogleDriveArtifactStore:
         url = f"https://www.googleapis.com/drive/v3/files?q={encoded}&fields=files(id,name,size,md5Checksum)"
         try:
             status, _, body = self._request_with_retry("GET", url)
-            if status == 200:
-                res = json.loads(body.decode("utf-8"))
-                files = res.get("files", [])
-                for f in files:
-                    if expected_size is not None:
-                        f_sz = f.get("size")
-                        if f_sz is None or int(f_sz) != expected_size:
-                            continue
-                    if expected_md5 is not None:
-                        f_md5 = f.get("md5Checksum")
-                        if not f_md5 or f_md5.lower() != expected_md5.lower():
-                            continue
-                    return f
-                return None
+        except (DriveAuthenticationError, DriveQuotaExceededError):
+            raise
         except Exception:
-            pass
+            return None
+
+        if status != 200:
+            return None
+
+        try:
+            res = json.loads(body.decode("utf-8"))
+        except Exception:
+            return None
+
+        files = res.get("files", [])
+        if not files:
+            return None
+
+        mismatch_reason = None
+        for f in files:
+            f_sz = f.get("size")
+            if expected_size is not None and f_sz is not None and int(f_sz) != expected_size:
+                mismatch_reason = f"Remote file '{filename}' size mismatch: expected {expected_size}, remote has {f_sz}"
+                continue
+            f_md5 = f.get("md5Checksum")
+            if expected_md5 is not None and f_md5 and f_md5.lower() != expected_md5.lower():
+                mismatch_reason = f"Remote file '{filename}' checksum mismatch: expected MD5 {expected_md5}, remote has {f_md5}"
+                continue
+            return f
+
+        if mismatch_reason is not None:
+            if allow_revision_mismatch:
+                return None
+            raise StorageError(mismatch_reason)
+
         return None
 
     def _initiate_resumable_upload(
@@ -659,6 +772,7 @@ class GoogleDriveArtifactStore:
             target_folder_id,
             expected_size=total_size,
             expected_md5=local_md5,
+            allow_revision_mismatch=True,
         )
         if existing and existing.get("id"):
             transfer_record.bytes_transferred = total_size
@@ -692,6 +806,7 @@ class GoogleDriveArtifactStore:
             target_folder_id,
             expected_size=total_size,
             expected_md5=local_md5,
+            allow_revision_mismatch=True,
         )
         if existing and existing.get("id"):
             transfer_record.bytes_transferred = total_size
@@ -944,6 +1059,48 @@ class GoogleDriveArtifactStore:
         raise DriveTransferError(f"Upload completed without final 200/201 response for '{filename}'")
 
 
+    def _verify_remote_file_content(self, remote_id: str, expected_size: int, expected_sha256: str) -> None:
+        """Verify content of a remote file via media download and SHA256 comparison."""
+        readback_url = f"https://www.googleapis.com/drive/v3/files/{remote_id}?alt=media"
+        tmp_readback = self.staging_dir / f".readback_{remote_id}_{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            if hasattr(self.http_client, "stream_download"):
+                rb_status, _, rb_bytes = self.http_client.stream_download(
+                    readback_url,
+                    tmp_readback,
+                    headers={"authorization": f"Bearer {self._ensure_token()}"},
+                )
+                if rb_status != 200:
+                    raise DriveIntegrityError(
+                        f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
+                    )
+                rb_sha256 = compute_file_sha256(tmp_readback)
+            else:
+                rb_status, _, rb_body = self._request_with_retry("GET", readback_url)
+                if rb_status != 200:
+                    raise DriveIntegrityError(
+                        f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
+                    )
+                rb_bytes = len(rb_body)
+                rb_sha256 = hashlib.sha256(rb_body).hexdigest()
+
+            if rb_bytes != expected_size or rb_sha256.lower() != expected_sha256.lower():
+                raise DriveIntegrityError(
+                    f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
+                )
+        except DriveIntegrityError:
+            raise
+        except Exception as rbe:
+            raise DriveIntegrityError(
+                f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
+            ) from rbe
+        finally:
+            if tmp_readback.exists():
+                try:
+                    tmp_readback.unlink()
+                except OSError:
+                    pass
+
     def publish(
         self,
         source: Union[str, Path],
@@ -965,7 +1122,7 @@ class GoogleDriveArtifactStore:
                 f"Local checksum mismatch before Drive upload: expected {expected_sha256}, got {local_sha256}"
             )
         local_md5 = compute_file_md5(src)
-        size_bytes = src.stat().st_size
+        local_size = src.stat().st_size
 
         # Resolve subfolder
         subfolder = None
@@ -974,193 +1131,227 @@ class GoogleDriveArtifactStore:
         elif artifact_type == ArtifactType.OUTPUT.value:
             subfolder = "outputs"
 
-        target_folder_id = self.resolve_target_folder_id(project_id, run_id, subfolder)
         rel_path = f"{subfolder}/{src.name}" if subfolder else src.name
         artifact_id = f"{project_id}/{run_id}/{rel_path}"
+        m_key = (project_id, run_id)
 
-        # Initialize transfer record in journal
-        transfer_id = f"{self.provider_name}-{project_id}-{run_id}-{src.name}"
-        record = self.journal.get_transfer(transfer_id)
+        base_transfer_id = f"{self.provider_name}-{project_id}-{run_id}-{src.name}"
 
-        if not record:
-            record = TransferRecord(
-                transfer_id=transfer_id,
-                project_id=project_id,
-                run_id=run_id,
-                artifact_id=artifact_id,
-                local_path=str(src),
-                target_rel_path=rel_path,
-                size_bytes=size_bytes,
-                sha256=local_sha256,
-                md5=local_md5,
-                status=TransferStatus.LOCAL_STAGED.value,
-            )
-            self.journal.record_transfer(record)
-        else:
-            if (record.sha256 and record.sha256.lower() != local_sha256.lower()) or record.size_bytes != size_bytes:
-                record = TransferRecord(
-                    transfer_id=transfer_id,
-                    project_id=project_id,
-                    run_id=run_id,
-                    artifact_id=artifact_id,
-                    local_path=str(src),
-                    target_rel_path=rel_path,
-                    size_bytes=size_bytes,
-                    sha256=local_sha256,
-                    md5=local_md5,
-                    status=TransferStatus.LOCAL_STAGED.value,
-                    resumable_session_url=None,
-                )
-                self.journal.record_transfer(record)
+        with self._exclusive_lock(f"artifact-{base_transfer_id}"):
+            # 1. Reload record from journal
+            record = self.journal.get_transfer(base_transfer_id)
 
-        # Transition: LOCAL_STAGED -> LOCAL_VERIFIED -> UPLOAD_PENDING -> UPLOADING
-        if record.status == TransferStatus.LOCAL_STAGED.value:
-            record.transition_to(TransferStatus.LOCAL_VERIFIED)
-            self.journal.record_transfer(record)
-
-        if record.status == TransferStatus.LOCAL_VERIFIED.value:
-            record.transition_to(TransferStatus.UPLOAD_PENDING)
-            self.journal.record_transfer(record)
-
-        if record.status in (TransferStatus.UPLOAD_PENDING.value, TransferStatus.RETRY_PENDING.value):
-            record.transition_to(TransferStatus.UPLOADING)
-            self.journal.record_transfer(record)
-        elif record.status == TransferStatus.UPLOAD_FAILED.value:
-            record.transition_to(TransferStatus.RETRY_PENDING)
-            self.journal.record_transfer(record)
-            record.transition_to(TransferStatus.UPLOADING)
-            self.journal.record_transfer(record)
-
-        try:
-            drive_file_meta = self.upload_file_resumable(src, target_folder_id, record)
-
-            # Step 2: Authoritative Integrity Verification
-            remote_id = drive_file_meta.get("id")
-            if not remote_id:
-                raise DriveIntegrityError("Drive upload succeeded but no remote file ID was returned.")
-
-            # Never substitute local expected size: fetch authoritative remote metadata if missing
-            remote_size_raw = drive_file_meta.get("size")
-            remote_md5 = drive_file_meta.get("md5Checksum")
-
-            if remote_size_raw is None or not remote_md5:
-                query_url = f"https://www.googleapis.com/drive/v3/files/{remote_id}?fields=id,name,size,md5Checksum"
-                try:
-                    q_status, _, q_body = self._request_with_retry("GET", query_url)
-                    if q_status == 200:
-                        authoritative_meta = json.loads(q_body.decode("utf-8"))
-                        if authoritative_meta.get("size") is not None:
-                            remote_size_raw = authoritative_meta["size"]
-                        if authoritative_meta.get("md5Checksum"):
-                            remote_md5 = authoritative_meta["md5Checksum"]
-                except Exception:
-                    pass
-
-            if remote_size_raw is None:
-                raise DriveIntegrityError(
-                    f"Drive remote file '{remote_id}' missing authoritative size in response and file metadata; cannot verify integrity.",
-                    details={"remote_id": remote_id},
-                )
-
-            remote_size = int(remote_size_raw)
-            if remote_size != size_bytes:
-                raise DriveIntegrityError(
-                    f"Drive file size mismatch: local {size_bytes} bytes, remote {remote_size} bytes",
-                    details={"local_size": size_bytes, "remote_size": remote_size},
-                )
-
-            if remote_md5:
-                if remote_md5.lower() != local_md5.lower():
-                    raise DriveIntegrityError(
-                        f"Drive MD5 mismatch: local {local_md5}, remote {remote_md5}",
-                        details={"local_md5": local_md5, "remote_md5": remote_md5},
-                    )
+            # 2. Determine whether this is the same content or a new revision
+            is_new_revision = False
+            if record is not None and record.sha256 and record.sha256 != local_sha256 and record.status == TransferStatus.PUBLISHED.value:
+                transfer_id = f"{base_transfer_id}-{local_sha256[:12]}"
+                record = self.journal.get_transfer(transfer_id)
+                is_new_revision = True
             else:
-                # remote_md5 is STILL missing/empty after querying metadata
-                # Perform content readback verification
-                readback_url = f"https://www.googleapis.com/drive/v3/files/{remote_id}?alt=media"
-                tmp_readback = self.staging_dir / f".readback_{remote_id}_{uuid.uuid4().hex[:8]}.tmp"
-                try:
-                    if hasattr(self.http_client, "stream_download"):
-                        rb_status, _, rb_bytes = self.http_client.stream_download(
-                            readback_url,
-                            tmp_readback,
-                            headers={"authorization": f"Bearer {self._ensure_token()}"},
+                transfer_id = base_transfer_id
+                is_new_revision = False
+
+            allow_revision_mismatch = is_new_revision or (record is None)
+
+            # 3. Ensure remote folder hierarchy exists
+            target_folder_id = self.resolve_target_folder_id(project_id, run_id, subfolder)
+
+            try:
+                # 4. Fast-path idempotent check + Remote folder deduplication check under lock
+                existing_file = self._find_file_in_folder(
+                    src.name,
+                    target_folder_id,
+                    expected_size=local_size,
+                    expected_md5=local_md5,
+                    allow_revision_mismatch=allow_revision_mismatch,
+                )
+                if existing_file:
+                    remote_id = existing_file.get("id")
+                    if not remote_id:
+                        raise DriveIntegrityError("Drive existing file found but has no ID.")
+                    if local_md5 and not existing_file.get("md5Checksum"):
+                        self._verify_remote_file_content(remote_id, local_size, local_sha256)
+
+                    if record is None:
+                        record = TransferRecord(
+                            transfer_id=transfer_id,
+                            project_id=project_id,
+                            run_id=run_id,
+                            artifact_id=artifact_id,
+                            local_path=str(src),
+                            target_rel_path=rel_path,
+                            size_bytes=local_size,
+                            sha256=local_sha256,
+                            md5=local_md5,
+                            status=TransferStatus.PUBLISHED.value,
+                            remote_file_id=remote_id,
+                            bytes_transferred=local_size,
                         )
-                        if rb_status != 200:
-                            raise DriveIntegrityError(
-                                f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
-                            )
-                        rb_sha256 = compute_file_sha256(tmp_readback)
                     else:
-                        rb_status, _, rb_body = self._request_with_retry("GET", readback_url)
-                        if rb_status != 200:
-                            raise DriveIntegrityError(
-                                f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
+                        record.status = TransferStatus.PUBLISHED.value
+                        record.remote_file_id = remote_id
+                        record.bytes_transferred = local_size
+                        record.sha256 = local_sha256
+                        record.md5 = local_md5
+                        record.size_bytes = local_size
+                        record.updated_at = _utc_now_iso()
+                    self.journal.record_transfer(record)
+
+                    stored = StoredArtifact(
+                        artifact_id=artifact_id,
+                        storage_provider=self.provider_name,
+                        path=rel_path,
+                        size_bytes=local_size,
+                        sha256=local_sha256,
+                        project_id=project_id,
+                        run_id=run_id,
+                        artifact_type=artifact_type,
+                        remote_file_id=remote_id,
+                        md5=local_md5,
+                        verified_at=_utc_now_iso(),
+                        metadata=metadata or {},
+                    )
+
+                    with self._exclusive_lock(f"manifest-{project_id}-{run_id}"):
+                        local_manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+                        if local_manifest_path.exists():
+                            manifest = PublicationManifest.load(local_manifest_path)
+                        elif m_key in self._manifest_cache:
+                            manifest = self._manifest_cache[m_key]
+                        else:
+                            manifest = PublicationManifest(project_id=project_id, run_id=run_id)
+
+                        existing_art = manifest.get_artifact(artifact_id)
+                        if existing_art and existing_art.storage_provider == "local":
+                            stored = StoredArtifact(
+                                artifact_id=artifact_id,
+                                storage_provider="google_drive",
+                                path=existing_art.path,
+                                size_bytes=local_size,
+                                sha256=local_sha256,
+                                project_id=project_id,
+                                run_id=run_id,
+                                artifact_type=artifact_type,
+                                remote_file_id=remote_id,
+                                md5=local_md5,
+                                verified_at=_utc_now_iso(),
+                                metadata={**existing_art.metadata, **(metadata or {})},
                             )
-                        rb_bytes = len(rb_body)
-                        rb_sha256 = hashlib.sha256(rb_body).hexdigest()
 
-                    if rb_bytes != size_bytes or rb_sha256.lower() != local_sha256.lower():
-                        raise DriveIntegrityError(
-                            f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
+                        manifest.add_artifact(stored)
+                        manifest.status = "PUBLISHED"
+                        manifest.save(local_manifest_path)
+                        self._manifest_cache[m_key] = manifest
+
+                    return stored
+
+                # 5. Not found remotely: perform resumable upload
+                if not record:
+                    record = TransferRecord(
+                        transfer_id=transfer_id,
+                        project_id=project_id,
+                        run_id=run_id,
+                        artifact_id=artifact_id,
+                        local_path=str(src),
+                        target_rel_path=rel_path,
+                        size_bytes=local_size,
+                        sha256=local_sha256,
+                        md5=local_md5,
+                        status=TransferStatus.LOCAL_STAGED.value,
+                    )
+                    self.journal.record_transfer(record)
+                else:
+                    if (record.sha256 and record.sha256.lower() != local_sha256.lower()) or record.size_bytes != local_size:
+                        record = TransferRecord(
+                            transfer_id=transfer_id,
+                            project_id=project_id,
+                            run_id=run_id,
+                            artifact_id=artifact_id,
+                            local_path=str(src),
+                            target_rel_path=rel_path,
+                            size_bytes=local_size,
+                            sha256=local_sha256,
+                            md5=local_md5,
+                            status=TransferStatus.LOCAL_STAGED.value,
+                            resumable_session_url=None,
                         )
-                except DriveIntegrityError:
-                    raise
-                except Exception as rbe:
+                        self.journal.record_transfer(record)
+
+                if record.status == TransferStatus.LOCAL_STAGED.value:
+                    record.transition_to(TransferStatus.LOCAL_VERIFIED)
+                    self.journal.record_transfer(record)
+
+                if record.status == TransferStatus.LOCAL_VERIFIED.value:
+                    record.transition_to(TransferStatus.UPLOAD_PENDING)
+                    self.journal.record_transfer(record)
+
+                if record.status in (TransferStatus.UPLOAD_PENDING.value, TransferStatus.RETRY_PENDING.value):
+                    record.transition_to(TransferStatus.UPLOADING)
+                    self.journal.record_transfer(record)
+                elif record.status == TransferStatus.UPLOAD_FAILED.value:
+                    record.transition_to(TransferStatus.RETRY_PENDING)
+                    self.journal.record_transfer(record)
+                    record.transition_to(TransferStatus.UPLOADING)
+                    self.journal.record_transfer(record)
+
+                drive_file_meta = self.upload_file_resumable(src, target_folder_id, record)
+
+                remote_id = drive_file_meta.get("id")
+                if not remote_id:
+                    raise DriveIntegrityError("Drive upload succeeded but no remote file ID was returned.")
+
+                remote_size_raw = drive_file_meta.get("size")
+                remote_md5 = drive_file_meta.get("md5Checksum")
+
+                if remote_size_raw is None or not remote_md5:
+                    query_url = f"https://www.googleapis.com/drive/v3/files/{remote_id}?fields=id,name,size,md5Checksum"
+                    try:
+                        q_status, _, q_body = self._request_with_retry("GET", query_url)
+                        if q_status == 200:
+                            authoritative_meta = json.loads(q_body.decode("utf-8"))
+                            if authoritative_meta.get("size") is not None:
+                                remote_size_raw = authoritative_meta["size"]
+                            if authoritative_meta.get("md5Checksum"):
+                                remote_md5 = authoritative_meta["md5Checksum"]
+                    except Exception:
+                        pass
+
+                if remote_size_raw is None:
                     raise DriveIntegrityError(
-                        f"Drive file '{remote_id}' missing authoritative md5Checksum and failed content readback verification."
-                    ) from rbe
-                finally:
-                    if tmp_readback.exists():
-                        try:
-                            tmp_readback.unlink()
-                        except OSError:
-                            pass
+                        f"Drive remote file '{remote_id}' missing authoritative size in response and file metadata; cannot verify integrity.",
+                        details={"remote_id": remote_id},
+                    )
 
-            # Step 3: DRIVE_VERIFIED -> PUBLISHED
-            if record.status != TransferStatus.PUBLISHED.value and record.status != TransferStatus.DRIVE_VERIFIED.value:
-                record.transition_to(TransferStatus.DRIVE_VERIFIED)
-                self.journal.record_transfer(record)
+                remote_size = int(remote_size_raw)
+                if remote_size != local_size:
+                    raise DriveIntegrityError(
+                        f"Drive file size mismatch: local {local_size} bytes, remote {remote_size} bytes",
+                        details={"local_size": local_size, "remote_size": remote_size},
+                    )
 
-            if record.status != TransferStatus.PUBLISHED.value:
-                record.transition_to(TransferStatus.PUBLISHED)
-                record.remote_file_id = remote_id
-                self.journal.record_transfer(record)
+                if remote_md5:
+                    if remote_md5.lower() != local_md5.lower():
+                        raise DriveIntegrityError(
+                            f"Drive MD5 mismatch: local {local_md5}, remote {remote_md5}",
+                            details={"local_md5": local_md5, "remote_md5": remote_md5},
+                        )
+                else:
+                    self._verify_remote_file_content(remote_id, local_size, local_sha256)
 
-            stored = StoredArtifact(
-                artifact_id=artifact_id,
-                storage_provider=self.provider_name,
-                path=rel_path,
-                size_bytes=size_bytes,
-                sha256=local_sha256,
-                project_id=project_id,
-                run_id=run_id,
-                artifact_type=artifact_type,
-                remote_file_id=remote_id,
-                md5=local_md5,
-                verified_at=_utc_now_iso(),
-                metadata=metadata or {},
-            )
+                if record.status != TransferStatus.PUBLISHED.value and record.status != TransferStatus.DRIVE_VERIFIED.value:
+                    record.transition_to(TransferStatus.DRIVE_VERIFIED)
+                    self.journal.record_transfer(record)
 
-            # Update and persist manifest locally and optionally in Drive
-            m_key = (project_id, run_id)
-            local_manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
-            if local_manifest_path.exists():
-                manifest = PublicationManifest.load(local_manifest_path)
-            elif m_key in self._manifest_cache:
-                manifest = self._manifest_cache[m_key]
-            else:
-                manifest = PublicationManifest(project_id=project_id, run_id=run_id)
+                if record.status != TransferStatus.PUBLISHED.value:
+                    record.transition_to(TransferStatus.PUBLISHED)
+                    record.remote_file_id = remote_id
+                    self.journal.record_transfer(record)
 
-            existing_art = manifest.get_artifact(artifact_id)
-            if existing_art and existing_art.storage_provider == "local":
-                # Preserve verified local file path while adding remote Drive file ID
                 stored = StoredArtifact(
                     artifact_id=artifact_id,
-                    storage_provider="google_drive",
-                    path=existing_art.path,
-                    size_bytes=size_bytes,
+                    storage_provider=self.provider_name,
+                    path=rel_path,
+                    size_bytes=local_size,
                     sha256=local_sha256,
                     project_id=project_id,
                     run_id=run_id,
@@ -1168,34 +1359,60 @@ class GoogleDriveArtifactStore:
                     remote_file_id=remote_id,
                     md5=local_md5,
                     verified_at=_utc_now_iso(),
-                    metadata={**existing_art.metadata, **(metadata or {})},
+                    metadata=metadata or {},
                 )
 
-            self._manifest_cache[m_key] = manifest
-            manifest.add_artifact(stored)
-            manifest.status = "PUBLISHED"
-            manifest.save(local_manifest_path)
+                with self._exclusive_lock(f"manifest-{project_id}-{run_id}"):
+                    local_manifest_path = self.staging_dir / "projects" / project_id / "runs" / run_id / "manifest.json"
+                    if local_manifest_path.exists():
+                        manifest = PublicationManifest.load(local_manifest_path)
+                    elif m_key in self._manifest_cache:
+                        manifest = self._manifest_cache[m_key]
+                    else:
+                        manifest = PublicationManifest(project_id=project_id, run_id=run_id)
 
-            return stored
+                    existing_art = manifest.get_artifact(artifact_id)
+                    if existing_art and existing_art.storage_provider == "local":
+                        stored = StoredArtifact(
+                            artifact_id=artifact_id,
+                            storage_provider="google_drive",
+                            path=existing_art.path,
+                            size_bytes=local_size,
+                            sha256=local_sha256,
+                            project_id=project_id,
+                            run_id=run_id,
+                            artifact_type=artifact_type,
+                            remote_file_id=remote_id,
+                            md5=local_md5,
+                            verified_at=_utc_now_iso(),
+                            metadata={**existing_art.metadata, **(metadata or {})},
+                        )
 
+                    manifest.add_artifact(stored)
+                    manifest.status = "PUBLISHED"
+                    manifest.save(local_manifest_path)
+                    self._manifest_cache[m_key] = manifest
 
-        except Exception as e:
-            record.retry_count += 1
-            sanitized_err = _sanitize_drive_error(str(e))
-            if record.retry_count <= record.max_retries:
-                try:
-                    record.transition_to(TransferStatus.RETRY_PENDING, error_message=sanitized_err)
-                except Exception:
-                    record.status = TransferStatus.RETRY_PENDING.value
-                    record.last_error = sanitized_err
-            else:
-                try:
-                    record.transition_to(TransferStatus.UPLOAD_FAILED, error_message=sanitized_err)
-                except Exception:
-                    record.status = TransferStatus.UPLOAD_FAILED.value
-                    record.last_error = sanitized_err
-            self.journal.record_transfer(record)
-            raise
+                return stored
+
+            except Exception as e:
+                if record is not None:
+                    record.retry_count += 1
+                    sanitized_err = _sanitize_drive_error(str(e))
+                    if record.retry_count <= record.max_retries:
+                        try:
+                            record.transition_to(TransferStatus.RETRY_PENDING, error_message=sanitized_err)
+                        except Exception:
+                            record.status = TransferStatus.RETRY_PENDING.value
+                            record.last_error = sanitized_err
+                    else:
+                        try:
+                            record.transition_to(TransferStatus.UPLOAD_FAILED, error_message=sanitized_err)
+                        except Exception:
+                            record.status = TransferStatus.UPLOAD_FAILED.value
+                            record.last_error = sanitized_err
+                    self.journal.record_transfer(record)
+                raise
 
     def retrieve(self, artifact_id: str, destination: Union[str, Path]) -> Path:
         """Download artifact from Google Drive by ID with bounded memory streaming and integrity check."""
