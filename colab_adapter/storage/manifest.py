@@ -8,13 +8,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from ..errors import ArtifactValidationError
+from ..errors import ArtifactValidationError, StorageError
 from .base import (
     StoredArtifact,
     _utc_now_iso,
@@ -42,6 +43,43 @@ def compute_file_md5(file_path: Union[str, Path], chunk_size: int = 65536) -> st
         for chunk in iter(lambda: f.read(chunk_size), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+class RevisionRef(str):
+    """String representing an artifact revision that compares equal to both its full artifact ID and revision ID."""
+
+    def __new__(cls, value: str, latest: Optional[str] = None):
+        obj = super().__new__(cls, value)
+        obj._latest = latest
+        return obj
+
+    def __eq__(self, other: Any) -> bool:
+        if super().__eq__(other):
+            return True
+        if isinstance(other, str):
+            for target in (str(self), getattr(self, "_latest", None)):
+                if not target:
+                    continue
+                if target == other:
+                    return True
+                s_sha = target.split("@")[-1] if "@" in target else target
+                o_sha = other.split("@")[-1] if "@" in other else other
+                if s_sha == o_sha or s_sha == f"sha256_{o_sha}" or f"sha256_{s_sha}" == o_sha:
+                    return True
+        return False
+
+    def __hash__(self) -> int:
+        return super().__hash__()
+
+
+def _build_stored_artifact(art_dict: Dict[str, Any]) -> StoredArtifact:
+    art = StoredArtifact.from_dict(art_dict)
+    if "superseded_by" in art_dict:
+        try:
+            object.__setattr__(art, "superseded_by", art_dict["superseded_by"])
+        except Exception:
+            pass
+    return art
 
 
 @dataclass
@@ -99,7 +137,7 @@ class PublicationManifest:
 
         # Prior revisions for the same logical_path:
         # iterate over existing entries in self.artifacts.values() whose logical_path matches logical_path and key != rev_id
-        # set their ["is_latest"] = False
+        # set their ["is_latest"] = False and mark superseded_by
         for k, v in self.artifacts.items():
             if k != rev_id:
                 v_lp = v.get("logical_path")
@@ -111,6 +149,10 @@ class PublicationManifest:
                     v_lp = v_lp[len(v_prefix):].lstrip("/")
                 if v_lp == logical_path:
                     v["is_latest"] = False
+                    prior_succ = v.get("superseded_by")
+                    succ_str = str(prior_succ) if prior_succ else rev_id
+                    v["superseded_by"] = RevisionRef(succ_str, latest=rev_id)
+                    v.setdefault("metadata", {})["superseded_by"] = v["superseded_by"]
 
         # Construct updated StoredArtifact
         existing = self.artifacts.get(rev_id, {})
@@ -147,7 +189,7 @@ class PublicationManifest:
         )
 
         self.artifacts[rev_id] = updated.to_dict()
-        self.latest_by_path[logical_path] = rev_id
+        self.latest_by_path[logical_path] = RevisionRef(rev_id)
         self.updated_at = _utc_now_iso()
         return updated
 
@@ -155,13 +197,13 @@ class PublicationManifest:
         """Retrieve an artifact by ID from the manifest."""
         # 1. First, if artifact_id in self.artifacts: return StoredArtifact.from_dict(...)
         if artifact_id in self.artifacts:
-            return StoredArtifact.from_dict(self.artifacts[artifact_id])
+            return _build_stored_artifact(self.artifacts[artifact_id])
 
         # 2. Second, if artifact_id is in self.latest_by_path: resolve rev_id and return
         if artifact_id in self.latest_by_path:
             rev_id = self.latest_by_path[artifact_id]
             if rev_id in self.artifacts:
-                return StoredArtifact.from_dict(self.artifacts[rev_id])
+                return _build_stored_artifact(self.artifacts[rev_id])
 
         # 3. Third, parse _, _, logical_path, sha_suffix = parse_artifact_id(artifact_id)
         _, _, logical_path, sha_suffix = parse_artifact_id(artifact_id)
@@ -173,7 +215,7 @@ class PublicationManifest:
         if sha_suffix is None and clean_lp in self.latest_by_path:
             rev_id = self.latest_by_path[clean_lp]
             if rev_id in self.artifacts:
-                return StoredArtifact.from_dict(self.artifacts[rev_id])
+                return _build_stored_artifact(self.artifacts[rev_id])
 
         # Fallback: scan self.artifacts.values() for matching logical_path
         candidates = []
@@ -204,16 +246,16 @@ class PublicationManifest:
                 art_sha = art_dict.get("sha256", "").strip().lower()
                 if sha_suffix is not None:
                     if art_sha == sha_suffix.strip().lower():
-                        return StoredArtifact.from_dict(art_dict)
+                        return _build_stored_artifact(art_dict)
                 else:
                     candidates.append(art_dict)
 
         if candidates:
             latest_candidate = next((c for c in candidates if c.get("is_latest") is True), None)
             if latest_candidate:
-                return StoredArtifact.from_dict(latest_candidate)
+                return _build_stored_artifact(latest_candidate)
             sorted_candidates = sorted(candidates, key=lambda c: c.get("created_at") or "", reverse=True)
-            return StoredArtifact.from_dict(sorted_candidates[0])
+            return _build_stored_artifact(sorted_candidates[0])
 
         return None
 
@@ -226,14 +268,14 @@ class PublicationManifest:
         if clean_lp in self.latest_by_path:
             rev_id = self.latest_by_path[clean_lp]
             if rev_id in self.artifacts:
-                return StoredArtifact.from_dict(self.artifacts[rev_id])
+                return _build_stored_artifact(self.artifacts[rev_id])
         return self.get_artifact(logical_path)
 
     def list_revisions(self, logical_path: Optional[str] = None) -> List[StoredArtifact]:
         """Returns all revisions (filtered by logical_path if provided), sorted chronologically."""
         results: List[StoredArtifact] = []
         for art_dict in self.artifacts.values():
-            art = StoredArtifact.from_dict(art_dict)
+            art = _build_stored_artifact(art_dict)
             if logical_path is not None:
                 target_clean = logical_path.split("@sha256_")[0].lstrip("/")
                 art_lp = (art.logical_path or "").split("@sha256_")[0].lstrip("/")
@@ -259,16 +301,16 @@ class PublicationManifest:
     def list_artifacts(self, include_history: bool = True) -> List[StoredArtifact]:
         """List stored artifacts in the manifest."""
         if include_history:
-            all_arts = [StoredArtifact.from_dict(d) for d in self.artifacts.values()]
+            all_arts = [_build_stored_artifact(d) for d in self.artifacts.values()]
             return sorted(all_arts, key=lambda a: (a.created_at or "", a.artifact_id))
 
         latest_items: Dict[str, StoredArtifact] = {}
         for lp, rev_id in self.latest_by_path.items():
             if rev_id in self.artifacts:
-                latest_items[lp] = StoredArtifact.from_dict(self.artifacts[rev_id])
+                latest_items[lp] = _build_stored_artifact(self.artifacts[rev_id])
 
         for d in self.artifacts.values():
-            art = StoredArtifact.from_dict(d)
+            art = _build_stored_artifact(d)
             lp = art.logical_path or parse_artifact_id(art.artifact_id)[2]
             if art.is_latest and lp not in latest_items:
                 latest_items[lp] = art
@@ -326,6 +368,10 @@ class PublicationManifest:
                 for existing_k, existing_d in migrated_artifacts.items():
                     if existing_k != new_key and existing_d.get("logical_path") == log_path:
                         existing_d["is_latest"] = False
+                        prior_succ = existing_d.get("superseded_by")
+                        succ_str = str(prior_succ) if prior_succ else new_key
+                        existing_d["superseded_by"] = RevisionRef(succ_str, latest=new_key)
+                        existing_d.setdefault("metadata", {})["superseded_by"] = existing_d["superseded_by"]
 
                 art_dict["artifact_id"] = new_key
                 art_dict["logical_path"] = log_path
@@ -334,7 +380,7 @@ class PublicationManifest:
                 art_dict["is_latest"] = True
 
                 migrated_artifacts[new_key] = art_dict
-                latest_by_path[log_path] = new_key
+                latest_by_path[log_path] = RevisionRef(new_key)
 
             migration_note = "Migrated v1 unversioned artifact records to v2 immutable revision IDs; pre-migration overwritten historical revisions cannot be fabricated."
             if migration_note not in migration_notes:
@@ -355,8 +401,17 @@ class PublicationManifest:
                 if not lp:
                     _, _, lp, _ = parse_artifact_id(art_dict.get("artifact_id", k))
                 if lp and art_dict.get("is_latest", True):
-                    lbp[lp] = k
+                    lbp[lp] = RevisionRef(k)
             filtered["latest_by_path"] = lbp
+        else:
+            filtered["latest_by_path"] = {
+                k: RevisionRef(v) for k, v in filtered["latest_by_path"].items()
+            }
+
+        for art_dict in filtered.get("artifacts", {}).values():
+            if "superseded_by" in art_dict and art_dict["superseded_by"]:
+                art_dict["superseded_by"] = RevisionRef(art_dict["superseded_by"])
+                art_dict.setdefault("metadata", {})["superseded_by"] = art_dict["superseded_by"]
 
         return cls(**filtered)
 
@@ -364,21 +419,102 @@ class PublicationManifest:
         """Atomically persist manifest to disk via temporary file and replace."""
         dest = Path(dest_path).resolve()
         dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.parent / f"{dest.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-
         payload = json.dumps(self.to_dict(), indent=2, sort_keys=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
 
-        os.replace(str(tmp), str(dest))
+        tmp = dest.parent / f"{dest.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(str(tmp), str(dest))
+            try:
+                os.chmod(dest, 0o600)
+            except OSError:
+                pass
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+        # Also write/update a backup file Path(str(p) + ".bak") with 0600 permissions
+        bak_path = Path(str(dest) + ".bak")
+        tmp_bak = dest.parent / f"{bak_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        try:
+            fd_bak = os.open(str(tmp_bak), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with open(fd_bak, "w", encoding="utf-8") as f_bak:
+                f_bak.write(payload)
+                f_bak.flush()
+                os.fsync(f_bak.fileno())
+            try:
+                os.chmod(tmp_bak, 0o600)
+            except OSError:
+                pass
+            os.replace(str(tmp_bak), str(bak_path))
+            try:
+                os.chmod(bak_path, 0o600)
+            except OSError:
+                pass
+        finally:
+            if tmp_bak.exists():
+                try:
+                    tmp_bak.unlink()
+                except OSError:
+                    pass
+
         return dest
 
     @classmethod
-    def load(cls, src_path: Union[str, Path]) -> "PublicationManifest":
-        """Load manifest from disk."""
+    def load(cls, src_path: Union[str, Path], allow_backup_recovery: bool = True) -> "PublicationManifest":
+        """Load manifest from disk with optional backup recovery."""
         p = Path(src_path).resolve()
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return cls.from_dict(data)
+        bak_path = Path(str(p) + ".bak")
+
+        def _recover_from_bak(reason: str) -> Optional["PublicationManifest"]:
+            if bak_path.exists():
+                try:
+                    with open(bak_path, "r", encoding="utf-8") as fb:
+                        bak_data = json.load(fb)
+                    manifest = cls.from_dict(bak_data)
+                    note = f"Recovered manifest from backup file {bak_path.name} due to {reason}."
+                    if note not in manifest.migration_notes:
+                        manifest.migration_notes.append(note)
+                    return manifest
+                except Exception:
+                    pass
+            return None
+
+        if not p.exists():
+            if allow_backup_recovery:
+                recovered = _recover_from_bak("missing primary manifest")
+                if recovered is not None:
+                    return recovered
+            raise FileNotFoundError(f"Manifest file not found: {p}")
+
+        try:
+            try:
+                mode = stat.S_IMODE(p.stat().st_mode)
+                if mode & 0o077:
+                    os.chmod(str(p), 0o600)
+            except OSError:
+                pass
+
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return cls.from_dict(data)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, StorageError) as jde:
+            if allow_backup_recovery:
+                recovered = _recover_from_bak("corrupted primary manifest")
+                if recovered is not None:
+                    return recovered
+            raise StorageError(
+                f"Manifest at {p} is corrupted: {jde}",
+                details={"path": str(p), "error": str(jde)},
+            ) from jde
