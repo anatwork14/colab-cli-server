@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -37,6 +38,16 @@ from .base import _utc_now_iso
 
 logger = logging.getLogger(__name__)
 
+
+
+def safe_lock_filename(lock_name: str) -> str:
+    """Filesystem-safe lock file stem. Over-long names are shortened with a stable hash so a long
+    logical filename cannot raise ENAMETOOLONG (and distinct long names never collide)."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(lock_name))
+    if len(safe) > 120:
+        digest = hashlib.sha256(str(lock_name).encode("utf-8")).hexdigest()[:40]
+        safe = f"{safe[:60]}-{digest}"
+    return safe
 
 class TransferStatus(str, Enum):
     LOCAL_STAGED = "LOCAL_STAGED"
@@ -451,7 +462,7 @@ class TransferJournal:
     @contextlib.contextmanager
     def acquire_named_lock(self, lock_name: str, timeout: float = 30.0) -> Iterator[Path]:
         """Cross-process and re-entrant thread lock for a named resource."""
-        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(lock_name))
+        safe_id = safe_lock_filename(lock_name)
         locks_dir = getattr(self, "_locks_dir", self.path.parent / ".transfer_locks")
         locks_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:

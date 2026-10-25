@@ -56,6 +56,7 @@ from colab_adapter.project_sessions import (
     ProjectSessionState,
 )
 from colab_adapter.provider import ApprovalRequiredError, ManagedSessionRegistry
+from tests.approval_helpers import fake_guard_spawner, grant_v2
 from colab_adapter.reproducibility import create_deterministic_source_snapshot
 from colab_adapter.storage import (
     ArtifactType,
@@ -155,23 +156,25 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             executed_cmds.append(cmd)
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Session created", stderr="")
 
-        mgr = ProjectSessionManager(
+        mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             run_cmd_fn=mock_run_cmd,
         )
         spec = load_manifest(self.manifest_path)
 
         # Provision first session
-        s1 = mgr.up(spec, lease_seconds=1800.0)
+        s1 = mgr.up(spec, lease_seconds=1800.0, approval_id=grant_v2(mgr, spec, 1800.0))
         self.assertEqual(s1.state, ProjectSessionState.READY.value)
-        self.assertEqual(len(executed_cmds), 1)
-        self.assertEqual(executed_cmds[0][:3], ["colab", "new", "-s"])
+        # up() also reads the usage baseline before `new`; only allocation commands are counted here.
+        allocations = [c for c in executed_cmds if "new" in c]
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(allocations[0][:4], ["colab", "--auth=oauth2", "new", "-s"])
 
         # Second call reuses existing active session
         s2 = mgr.up(spec, reuse_active=True)
         self.assertEqual(s1.session_id, s2.session_id)
         # Invariant: No second allocation CLI call made
-        self.assertEqual(len(executed_cmds), 1)
+        self.assertEqual(len([c for c in executed_cmds if "new" in c]), 1)
 
     def test_scenario_d_incremental_workspace_sync_engine(self):
         """Scenario D: Full cycle of initial sync, 0-file unchanged sync (Q04), and 1-file sync (Q05)."""
@@ -259,7 +262,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             "has_traceback": False,
         }
 
-        mgr = ProjectSessionManager(
+        mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             transport=mock_transport,
         )
@@ -298,7 +301,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             self.registry._atomic_write_locked(data)
 
         mock_run = MagicMock(return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""))
-        mgr = ProjectSessionManager(registry=self.registry, run_cmd_fn=mock_run)
+        mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), registry=self.registry, run_cmd_fn=mock_run)
 
         # 1. Unmanaged session is strictly refused (Q08)
         from colab_adapter.errors import UnmanagedSessionError
@@ -309,13 +312,9 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         # 2. Managed session stops cleanly
         ok = mgr.stop(managed_id)
         self.assertTrue(ok)
-        mock_run.assert_called_once_with(
-            ["colab", "stop", "-s", managed_id],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=60.0,
-        )
+        # The stop is followed by read-only verification (`sessions`, `usage`); no other command may run.
+        self.assertEqual(mock_run.call_args_list[0].args[0], ["colab", "--auth=oauth2", "stop", "-s", managed_id])
+        self.assertTrue(all(c.args[0][2] in ("sessions", "usage") for c in mock_run.call_args_list[1:]))
         self.assertEqual(self.registry.get_all_managed()[managed_id]["state"], ProjectSessionState.TERMINATED.value)
 
     def test_full_13_stage_research_lifecycle(self):
@@ -419,25 +418,25 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             executed_cmds.append(cmd)
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Session created", stderr="")
 
-        session_mgr = ProjectSessionManager(
+        session_mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             run_cmd_fn=mock_run_cmd,
-            require_approval=True,
         )
 
         # Unapproved allocation is strictly blocked (fail closed)
         with self.assertRaises(ApprovalRequiredError) as ctx:
             session_mgr.up(spec, lease_seconds=1800.0)
-        self.assertIn("Explicit approval token required", str(ctx.exception))
+        self.assertEqual(ctx.exception.reason, "missing")
         self.assertEqual(len(executed_cmds), 0, "No allocation command may be dispatched without approval")
 
-        # Authorize via explicit approval token
-        approval_token = f"ALLOCATE {spec.gpu} auth-nonce-token-7777"
-        session = session_mgr.up(spec, lease_seconds=1800.0, approval_token=approval_token)
+        # Authorize via a granted, single-use approval record
+        approval_id = grant_v2(session_mgr, spec, 1800.0)
+        session = session_mgr.up(spec, lease_seconds=1800.0, approval_id=approval_id)
         self.assertEqual(session.state, ProjectSessionState.READY.value)
         self.assertEqual(session.accelerator, "T4")
-        self.assertEqual(len(executed_cmds), 1)
-        self.assertEqual(executed_cmds[0][:3], ["colab", "new", "-s"])
+        allocations = [c for c in executed_cmds if "new" in c]  # baseline `usage` read is not an allocation
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(allocations[0][:4], ["colab", "--auth=oauth2", "new", "-s"])
 
         # =====================================================================
         # Stage 4: Colab session creation
@@ -995,21 +994,17 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
             executed_cmds.append(cmd)
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Session created", stderr="")
 
-        session_mgr = ProjectSessionManager(
+        session_mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             run_cmd_fn=mock_run_cmd,
-            require_approval=True,
         )
 
         # Implicit / unapproved GPU allocation is rejected (negative control)
         with self.assertRaises(ApprovalRequiredError):
             session_mgr.up(spec, lease_seconds=1800.0)
 
-        approval_token = f"ALLOCATE {spec.gpu} auth-nonce-19step-999"
-        if "allow_gpu" in ProjectSessionManager.up.__code__.co_varnames:
-            session = session_mgr.up(spec, lease_seconds=1800.0, allow_gpu=True, approval_token=approval_token)
-        else:
-            session = session_mgr.up(spec, lease_seconds=1800.0, approval_token=approval_token)
+        approval_id = grant_v2(session_mgr, spec, 1800.0)
+        session = session_mgr.up(spec, lease_seconds=1800.0, approval_id=approval_id)
 
         self.assertEqual(session.state, ProjectSessionState.READY.value)
         self.assertEqual(session.accelerator, "T4")
@@ -1340,7 +1335,7 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         1. Local Research Project ('vision-research') initialization
         2. Manifest Validation (validate_manifest)
         3. Execution Plan (plan_project — 0 cloud allocations)
-        4. Explicit Mock GPU Approval (require_approval=True, verifies refusal without token and success with ALLOCATE T4 ...)
+        4. Explicit Mock GPU Approval (approval record required; refusal without it, success with a granted record)
         5. Managed Mock Colab Session (ProjectSessionManager.up)
         6. Incremental Source Synchronization (WorkspaceSyncEngine.apply_sync)
         7. Remote Training Execution (ProjectSessionManager.exec)
@@ -1461,27 +1456,24 @@ class TestProjectWorkspacesE2E(unittest.TestCase):
         mock_transport.download_file.side_effect = mock_download
         mock_transport.exec_code.side_effect = mock_exec_code
 
-        session_mgr = ProjectSessionManager(
+        session_mgr = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             run_cmd_fn=mock_run_cmd,
             transport=mock_transport,
-            require_approval=True,
         )
 
-        # Refusal without approval token
+        # Refusal without approval id
         with self.assertRaises(ApprovalRequiredError):
             session_mgr.up(spec, lease_seconds=1800.0)
 
-        # Refusal with malformed token
-        with self.assertRaises(ApprovalRequiredError):
-            session_mgr.up(spec, lease_seconds=1800.0, approval_token="ALLOCATE A100 invalid-gpu-token")
+        # Refusal with a made-up approval id (never granted)
+        with self.assertRaises(ApprovalRequiredError) as bogus:
+            session_mgr.up(spec, lease_seconds=1800.0, approval_id="apr-" + "0123456789abcdef" * 2)
+        self.assertEqual(bogus.exception.reason, "not_found")
 
-        # Success with valid approval token
-        approval_token = f"ALLOCATE {spec.gpu} auth-nonce-vision-stage4-token"
-        if "allow_gpu" in ProjectSessionManager.up.__code__.co_varnames:
-            session = session_mgr.up(spec, lease_seconds=1800.0, allow_gpu=True, approval_token=approval_token)
-        else:
-            session = session_mgr.up(spec, lease_seconds=1800.0, approval_token=approval_token)
+        # Success with a granted approval id
+        approval_id = grant_v2(session_mgr, spec, 1800.0)
+        session = session_mgr.up(spec, lease_seconds=1800.0, approval_id=approval_id)
 
         # =====================================================================
         # Stage 5: Managed Mock Colab Session Verification

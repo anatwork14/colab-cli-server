@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ..capability import _strip_ansi
 from ..errors import (
@@ -40,6 +40,9 @@ def _validate_remote_path(remote_path: str) -> str:
     if ".." in PurePosixPath(remote_path).parts:
         raise TransportError(f"Invalid or unsafe remote path: {remote_path!r}")
     return remote_path
+
+
+EXEC_UPSTREAM_MARGIN_S = 15
 
 
 class OfficialCliTransport(BaseTransport):
@@ -70,6 +73,15 @@ class OfficialCliTransport(BaseTransport):
         timeout: float = 60.0,
         stdin_input: Optional[str] = None,
     ) -> str:
+        return self._run_cmd_streams(args, timeout=timeout, stdin_input=stdin_input)[0]
+
+    def _run_cmd_streams(
+        self,
+        args: List[str],
+        timeout: float = 60.0,
+        stdin_input: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """Run the upstream CLI and return (stdout, stderr), both ANSI-stripped."""
         cmd = [self.cli_path, f"--auth={self.auth_mode}"] + args
         try:
             res = subprocess.run(
@@ -80,7 +92,8 @@ class OfficialCliTransport(BaseTransport):
                 check=True,
                 timeout=timeout,
             )
-            return _strip_ansi(res.stdout)
+            err = res.stderr if isinstance(res.stderr, str) else ""
+            return _strip_ansi(res.stdout), _strip_ansi(err)
         except subprocess.TimeoutExpired as e:
             raise TransportError(
                 f"Command timed out after {timeout}s: {' '.join(args[:3])}",
@@ -233,17 +246,22 @@ class OfficialCliTransport(BaseTransport):
             tmp_script = tf.name
 
         try:
-            args = ["exec", "-s", session_id, "-f", tmp_script]
+            # Upstream `colab exec` defaults to a 30 s kernel timeout, which kills long training runs.
+            # Pass our budget explicitly, minus a margin so upstream reports its own timeout first.
+            upstream_timeout = max(1, int(timeout) - EXEC_UPSTREAM_MARGIN_S)
+            args = ["exec", "-s", session_id, "-f", tmp_script, "--timeout", str(upstream_timeout)]
             if env:
                 for k, v in env.items():
                     args.extend(["--env", f"{k}={v}"])
 
-            out = self._run_cmd(args, timeout=timeout)
-            # Detect remote traceback or failure in output
-            has_traceback = "Traceback (most recent call last):" in out
+            out, err = self._run_cmd_streams(args, timeout=timeout)
+            # Upstream prints kernel tracebacks to its stderr and still exits 0, so both streams are checked
+            # and returned. The exit status of `colab exec` is therefore NOT a success signal by itself.
+            combined = out if not err.strip() else f"{out}\n{err}"
+            has_traceback = "Traceback (most recent call last):" in combined
             return {
                 "success": not has_traceback,
-                "output": out,
+                "output": combined,
                 "has_traceback": has_traceback,
             }
         finally:

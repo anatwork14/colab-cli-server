@@ -34,6 +34,7 @@ from colab_adapter.project_sessions import (
     VALID_TRANSITIONS,
 )
 from colab_adapter.provider import ColabProcessLock, ManagedSessionRegistry
+from tests.approval_helpers import fake_guard_spawner, grant_v2
 
 
 class TestProjectSessions(unittest.TestCase):
@@ -43,9 +44,13 @@ class TestProjectSessions(unittest.TestCase):
         self.lock_path = Path(self.tmp_dir) / "colab.lock"
         self.registry = ManagedSessionRegistry(self.registry_path)
         self.lock = ColabProcessLock(self.lock_path)
+        # The plan fingerprint covers the project tree, so keep the project apart from the registry and approvals.
+        project_root = Path(self.tmp_dir) / "project"
+        project_root.mkdir()
+        (project_root / "train.py").write_text("print('train')\n", encoding="utf-8")
         self.spec = ProjectSpec(
             name="resnet_cifar",
-            root=Path(self.tmp_dir),
+            root=project_root,
             entrypoint="train.py",
             gpu="T4",
             timeout_seconds=1800.0,
@@ -100,7 +105,7 @@ class TestProjectSessions(unittest.TestCase):
     def test_offline_plan_session_does_not_invoke_cli_or_registry(self):
         """Q03: Planning a session must generate collision-resistant IDs and touch 0 cloud resources."""
         mock_run = MagicMock()
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run,
@@ -129,13 +134,13 @@ class TestProjectSessions(unittest.TestCase):
                 recorded_states.append(info.get("state"))
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Session created", stderr="")
 
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run_cmd,
         )
 
-        session = manager.up(self.spec, lease_seconds=3600.0)
+        session = manager.up(self.spec, lease_seconds=3600.0, approval_id=grant_v2(manager, self.spec, 3600.0))
         self.assertEqual(session.state, ProjectSessionState.READY.value)
         self.assertIn(ProjectSessionState.PROVISIONING.value, recorded_states)
 
@@ -145,47 +150,79 @@ class TestProjectSessions(unittest.TestCase):
         self.assertEqual(stored["accelerator"], "T4")
         self.assertTrue(self.registry.is_managed(session.session_id))
 
-    def test_up_allocation_failure_records_failed_state(self):
-        """Failed CLI allocation transitions session to FAILED and raises AllocationError."""
+    def test_up_allocation_failure_without_proof_keeps_needs_reconciliation(self):
+        """A nonzero `colab new` is NOT evidence that no VM was assigned: without proof the record stays
+        NEEDS_RECONCILIATION (still counted by the cap) and AllocationError warns about a possible orphan."""
         def mock_run_fail(cmd, **kwargs):
             return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Quota exceeded for GPU T4")
 
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run_fail,
         )
+        manager.FAILURE_SETTLE_SECONDS = 0.0
 
         with self.assertRaises(AllocationError) as ctx:
-            manager.up(self.spec)
+            manager.up(self.spec, approval_id=grant_v2(manager, self.spec))
         self.assertIn("Quota exceeded", str(ctx.exception))
+        self.assertIn("POSSIBLE ORPHAN", str(ctx.exception))
 
         all_managed = self.registry.get_all_managed()
         self.assertEqual(len(all_managed), 1)
         info = list(all_managed.values())[0]
+        self.assertEqual(info["state"], ProjectSessionState.NEEDS_RECONCILIATION.value)
+        self.assertTrue(info["metadata"]["orphan_possible"])
+
+    def test_up_allocation_failure_with_proven_absence_records_failed_state(self):
+        """FAILED is allowed only with positive evidence: a known baseline and two clean server-side readings."""
+        def mock_run(cmd, **kwargs):
+            rest = [a for a in cmd if not str(a).startswith("--auth=")][1:]
+            if rest[:1] == ["usage"]:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Active assignments: 0\n", stderr="")
+            if rest[:1] == ["sessions"]:
+                return subprocess.CompletedProcess(args=cmd, returncode=0,
+                                                   stdout="[colab] No active sessions found on server.\n", stderr="")
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Quota exceeded for GPU T4")
+
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self),
+            registry=self.registry,
+            lock=self.lock,
+            run_cmd_fn=mock_run,
+        )
+        manager.FAILURE_SETTLE_SECONDS = 0.0
+
+        with self.assertRaises(AllocationError) as ctx:
+            manager.up(self.spec, approval_id=grant_v2(manager, self.spec))
+        self.assertNotIn("POSSIBLE ORPHAN", str(ctx.exception))
+        info = list(self.registry.get_all_managed().values())[0]
         self.assertEqual(info["state"], ProjectSessionState.FAILED.value)
 
     def test_up_reuses_existing_active_session_idempotently(self):
         """Multiple calls to up() for the same project reuse active valid lease without re-allocating."""
         mock_run = MagicMock(return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr=""))
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run,
         )
 
-        s1 = manager.up(self.spec, lease_seconds=3600.0)
-        self.assertEqual(mock_run.call_count, 1)
+        s1 = manager.up(self.spec, lease_seconds=3600.0, approval_id=grant_v2(manager, self.spec, 3600.0))
+        # up() reads the usage baseline before `colab new`; exactly one allocation must be dispatched.
+        allocations = [c.args[0] for c in mock_run.call_args_list if "new" in c.args[0]]
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(mock_run.call_count, 3)  # baseline `usage` and `sessions` reads (read-only), then `new`
 
         # Second call to up with reuse_active=True (default)
         s2 = manager.up(self.spec, lease_seconds=3600.0, reuse_active=True)
         self.assertEqual(s1.session_id, s2.session_id)
-        # Verify no second CLI allocation was made
-        self.assertEqual(mock_run.call_count, 1)
+        # Verify no second CLI allocation was made (the call count is unchanged by the reuse)
+        self.assertEqual(mock_run.call_count, 3)
+        self.assertEqual(len([c for c in mock_run.call_args_list if "new" in c.args[0]]), 1)
 
     def test_q08_attach_refuses_unmanaged_session(self):
         """Q08: Refuses to attach to unmanaged or unknown sessions."""
-        manager = ProjectSessionManager(registry=self.registry, lock=self.lock)
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), registry=self.registry, lock=self.lock)
 
         with self.assertRaises(UnmanagedSessionError) as ctx:
             manager.attach("colab-unmanaged-external-session")
@@ -211,7 +248,7 @@ class TestProjectSessions(unittest.TestCase):
             }
             self.registry._atomic_write_locked(data)
 
-        manager = ProjectSessionManager(registry=self.registry, lock=self.lock)
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), registry=self.registry, lock=self.lock)
         with self.assertRaises(LeaseExpiredError) as ctx:
             manager.attach(session_id)
         self.assertIn("lease expired", str(ctx.exception))
@@ -245,7 +282,7 @@ class TestProjectSessions(unittest.TestCase):
             "has_traceback": False,
         }
 
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             transport=mock_transport,
@@ -261,7 +298,7 @@ class TestProjectSessions(unittest.TestCase):
     def test_q08_stop_refuses_unmanaged_session(self):
         """Q08: stop() strictly refuses to touch unmanaged sessions; 0 CLI commands dispatched."""
         mock_run = MagicMock()
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run,
@@ -294,7 +331,7 @@ class TestProjectSessions(unittest.TestCase):
             self.registry._atomic_write_locked(data)
 
         mock_run = MagicMock(return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""))
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run,
@@ -302,13 +339,11 @@ class TestProjectSessions(unittest.TestCase):
 
         ok = manager.stop(session_id)
         self.assertTrue(ok)
-        mock_run.assert_called_once_with(
-            ["colab", "stop", "-s", session_id],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=60.0,
-        )
+        # The stop is followed by read-only verification (`sessions`, `usage`); no other command may run.
+        self.assertEqual(mock_run.call_args_list[0].args[0], ["colab", "--auth=oauth2", "stop", "-s", session_id])
+        self.assertEqual(mock_run.call_args_list[0].kwargs,
+                         {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True, "timeout": 60.0})
+        self.assertTrue(all(c.args[0][2] in ("sessions", "usage") for c in mock_run.call_args_list[1:]))
         self.assertEqual(self.registry.get_all_managed()[session_id]["state"], ProjectSessionState.TERMINATED.value)
 
     def test_reconcile_leases_auto_stops_expired_sessions(self):
@@ -354,7 +389,7 @@ class TestProjectSessions(unittest.TestCase):
             stopped_calls.append(cmd)
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
-        manager = ProjectSessionManager(
+        manager = ProjectSessionManager(spawn_fn=fake_guard_spawner(self), 
             registry=self.registry,
             lock=self.lock,
             run_cmd_fn=mock_run_cmd,
@@ -363,7 +398,9 @@ class TestProjectSessions(unittest.TestCase):
         report = manager.reconcile_leases(auto_stop=True)
         self.assertEqual(report["stopped"], [expired_id])
         self.assertEqual(report["active"], [active_id])
-        self.assertEqual(stopped_calls, [["colab", "stop", "-s", expired_id]])
+        stop_only = [c for c in stopped_calls if "stop" in c]
+        self.assertEqual(stop_only, [["colab", "--auth=oauth2", "stop", "-s", expired_id]])
+        self.assertTrue(all(c[2] in ("sessions", "usage") for c in stopped_calls if "stop" not in c))
 
         # Expired is now terminated, active remains ready
         self.assertEqual(self.registry.get_all_managed()[expired_id]["state"], ProjectSessionState.TERMINATED.value)

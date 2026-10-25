@@ -73,19 +73,18 @@ artifacts:
 
 **Parsing decision:** support real YAML via an explicitly declared optional library with pinned/tested version, or use JSON for stdlib support. Never write a partial/surprising YAML parser. Exact field names/CLI flags can be refined in M1/M2 and then frozen with schema_version.
 
-## Proposed operator interface (NOT implemented)
+## Operator interface (implemented subset)
 
 ~~~bash
-colab-adapter project init --root .
-colab-adapter project validate --manifest colab.yaml
-colab-adapter project plan --manifest colab.yaml --json  # offline, no VM
-colab-adapter project up --manifest colab.yaml            # explicit human approval, new owned session
-colab-adapter project sync --manifest colab.yaml --plan    # no allocation
-colab-adapter project sync --manifest colab.yaml --apply   # existing approved session ONLY
-colab-adapter project exec --manifest colab.yaml           # existing approved session ONLY
-colab-adapter project status --manifest colab.yaml
-colab-adapter project logs --manifest colab.yaml
-colab-adapter project stop --manifest colab.yaml
+python3 -m colab_adapter.cli project init --root ./research-project --name research-project
+python3 -m colab_adapter.cli project validate --manifest ./research-project/colab-project.json --json
+python3 -m colab_adapter.cli project plan --manifest ./research-project/colab-project.json --json  # offline, no VM
+python3 -m colab_adapter.cli project approve-request --manifest ./research-project/colab-project.json --lease-seconds 3600 --json  # pending only
+python3 -m colab_adapter.cli project approve <approval-id>  # operator's own terminal (reads /dev/tty)
+python3 -m colab_adapter.cli project up --manifest ./research-project/colab-project.json --lease-seconds 3600 --approval-id <approval-id> --json
+python3 -m colab_adapter.cli project sync --manifest ./research-project/colab-project.json --session-id <session-id> --json
+python3 -m colab_adapter.cli project status --session-id <session-id> --json
+python3 -m colab_adapter.cli project stop --session-id <session-id> --json
 ~~~
 
 The actual executable interface must enforce the approval contract **before** invoking any upstream CLI command capable of creating a session. The official ssh command may itself auto-create when the requested session is absent; command examples do not grant permission for this behavior.

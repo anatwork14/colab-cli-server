@@ -447,21 +447,21 @@ These procedures are **strictly manual and require explicit operator authorizati
 3. **Project Workspace Setup**:
    Create a test workspace with entrypoint `gpu_probe.py` verifying `torch.cuda.is_available()`, device name, and memory.
 4. **Manifest Validation**:
-   Validate project manifest with `python3 -m colab_adapter.cli project validate ./gpu-smoke-test --json`.
+   Validate project manifest with `python3 -m colab_adapter.cli project validate --manifest ./gpu-smoke-test/colab-project.json --json`.
 5. **Zero-Allocation Offline Execution Plan**:
-   Generate plan with `python3 -m colab_adapter.cli project plan ./gpu-smoke-test --json` (verifying 0 VMs allocated).
+   Generate plan with `python3 -m colab_adapter.cli project plan --manifest ./gpu-smoke-test/colab-project.json --json` (verifying 0 VMs allocated).
 6. **Explicit Approval Token Provisioning**:
-   Provision session: `python3 -m colab_adapter.cli project up ./gpu-smoke-test --gpu T4 --lease 900 --approval-token "ALLOCATE T4 $(date +%s)" --json`.
+   Provision session: `python3 -m colab_adapter.cli project approve-request --manifest ./gpu-smoke-test/colab-project.json --lease-seconds 900 --json` then `python3 -m colab_adapter.cli project approve <approval-id>          # operator, in their own terminal` then `python3 -m colab_adapter.cli project up --manifest ./gpu-smoke-test/colab-project.json --lease-seconds 900 --approval-id <approval-id> --json`.
 7. **Incremental Workspace Source Sync**:
-   Synchronize sources: `python3 -m colab_adapter.cli project sync ./gpu-smoke-test --json`.
+   Synchronize sources: `python3 -m colab_adapter.cli project sync --manifest ./gpu-smoke-test/colab-project.json --session-id <session-id> --json`.
 8. **Remote Training Execution**:
-   Run GPU probe: `python3 -m colab_adapter.cli project exec ./gpu-smoke-test --json`.
+   Run GPU probe: `python3 -m colab_adapter.cli project exec "python3 gpu_probe.py" --session-id <session-id> --json`.
 9. **Execution Output & CUDA Device Verification**:
    Inspect output logs to confirm remote GPU was active, executed under assigned PID, and emitted training metrics.
 10. **Output Artifact Pull & Verification**:
     Retrieve generated output/checkpoint and verify SHA256 checksum against execution record.
 11. **Graceful Session Teardown**:
-    Terminate session: `python3 -m colab_adapter.cli project stop ./gpu-smoke-test --json`.
+    Terminate session: `python3 -m colab_adapter.cli project stop --session-id <session-id> --json`.
 12. **Post-Execution Account Audit & CU Accounting**:
     Run `python3 colab_server.py usage` to verify final compute unit spend and confirm `python3 -m colab_adapter.cli sessions` reports 0 active sessions.
 
@@ -472,7 +472,7 @@ These procedures are **strictly manual and require explicit operator authorizati
 **Prerequisites**: Two machines or loopback test environments with SSH or TLS certificates.
 
 1. **Secure Monitoring Server Startup**:
-   Start server: `python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8443 --auth-token "<MONITOR_AUTH_TOKEN>"`.
+   Start server: `COLAB_MONITOR_TOKEN="$(cat /path/to/private/monitor.token)" python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8443`.
 2. **Secure Client Tunnel / TLS Connection**:
    Establish SSH port-forwarding from secondary device (`ssh -NL 8443:127.0.0.1:8443 user@server`) or access TLS endpoint.
 3. **Negative Control (Unauthenticated Access Rejection)**:

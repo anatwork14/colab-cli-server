@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 # Support running directly or as a package module
 if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from colab_adapter.approval import GlobalCapExceededError
     from colab_adapter.artifacts import ArtifactManager
     from colab_adapter.errors import ColabProviderError, ColabV2Error
     from colab_adapter.monitor import start_monitor_server
@@ -24,6 +25,7 @@ if __package__ is None or __package__ == "":
     )
     from colab_adapter.project_sessions import ProjectSessionManager
     from colab_adapter.provider import (
+        AllocationError,
         ApprovalRequiredError,
         ColabGPUProvider,
         JobSpec,
@@ -32,6 +34,7 @@ if __package__ is None or __package__ == "":
     from colab_adapter.tracker import ExperimentTracker
     from colab_adapter.workspace import WorkspaceSyncEngine
 else:
+    from .approval import GlobalCapExceededError
     from .artifacts import ArtifactManager
     from .errors import ColabProviderError, ColabV2Error
     from .monitor import start_monitor_server
@@ -44,6 +47,7 @@ else:
     )
     from .project_sessions import ProjectSessionManager
     from .provider import (
+        AllocationError,
         ApprovalRequiredError,
         ColabGPUProvider,
         JobSpec,
@@ -110,10 +114,31 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p.add_argument("--manifest", type=Path, default=None, help="Path to manifest file.")
     plan_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
 
+    # project approve-request (agent-runnable; writes a pending record, no cloud side effects)
+    areq_p = proj_subs.add_parser(
+        "approve-request",
+        help="Write a pending allocation approval for the manifest's exact plan (no cloud side effects).",
+    )
+    areq_p.add_argument("--manifest", type=Path, default=None, help="Path to manifest file.")
+    areq_p.add_argument("--lease-seconds", type=float, default=3600.0, help="Maximum lease the approval allows.")
+    areq_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
+
+    # project approve (operator step; reads the phrase from /dev/tty)
+    appr_p = proj_subs.add_parser(
+        "approve",
+        help="Operator step: type the approval phrase at the terminal (/dev/tty) to approve one request.",
+    )
+    appr_p.add_argument("approval_id", help="Approval id printed by 'project approve-request'.")
+    appr_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
+
     # project up
-    up_p = proj_subs.add_parser("up", help="Provision or attach a managed project session under lock.")
+    up_p = proj_subs.add_parser(
+        "up",
+        help="Provision or attach a managed project session. New allocations need --approval-id.",
+    )
     up_p.add_argument("--manifest", type=Path, default=None, help="Path to manifest file.")
     up_p.add_argument("--lease-seconds", type=float, default=3600.0, help="Lease duration in seconds.")
+    up_p.add_argument("--approval-id", default=None, help="Operator-approved id from 'project approve'.")
     up_p.add_argument("--no-reuse", action="store_true", help="Force provisioning a new session instead of reusing.")
     up_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
 
@@ -125,10 +150,30 @@ def build_parser() -> argparse.ArgumentParser:
     sync_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
 
     # project exec
-    exec_p = proj_subs.add_parser("exec", help="Execute command or script in remote project session.")
-    exec_p.add_argument("exec_cmd", help="Command or code to execute remotely.")
+    exec_p = proj_subs.add_parser(
+        "exec",
+        help="Run PYTHON code on the remote kernel (or, with --shell, a shell command on the managed VM).",
+    )
+    exec_p.add_argument(
+        "exec_cmd",
+        help="PYTHON code run by the remote kernel (`colab exec` semantics). With --shell: a shell command "
+             "run on the managed VM only.",
+    )
     exec_p.add_argument("--session-id", required=True, help="Target session ID.")
-    exec_p.add_argument("--working-dir", default=None, help="Remote working directory.")
+    exec_p.add_argument(
+        "--working-dir", default=None,
+        help="Absolute remote directory. Python mode: an os.chdir prologue. Shell mode: the command's cwd.",
+    )
+    exec_p.add_argument(
+        "--shell", action="store_true",
+        help="Run exec_cmd as a shell command on the managed VM. Prints stdout, stderr and an 'EXIT_CODE <n>' "
+             "marker; the upstream exec exit status is not the command's exit status.",
+    )
+    exec_p.add_argument(
+        "--timeout", type=float, default=600.0,
+        help="Execution budget in seconds (default 600). Passed to 'colab exec --timeout' (minus a margin) "
+             "and clamped to the remaining lease.",
+    )
     exec_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
 
     # project status
@@ -145,6 +190,17 @@ def build_parser() -> argparse.ArgumentParser:
     rec_p = proj_subs.add_parser("reconcile", help="Reconcile and cleanup expired session leases.")
     rec_p.add_argument("--no-auto-stop", action="store_true", help="Only audit without stopping.")
     rec_p.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
+
+    # project lease-guard (internal: spawned by 'project up'/'exec'/'sync'; not for direct use)
+    lg_p = proj_subs.add_parser(
+        "lease-guard",
+        help="internal: host-side lease deadline guard for one session (spawned automatically).",
+    )
+    lg_p.add_argument("--session-id", required=True, help="internal: managed session id.")
+    lg_p.add_argument("--registry-path", required=True, help="internal: managed session registry path.")
+    lg_p.add_argument("--deadline-ts", required=True, type=float, help="internal: absolute lease deadline (epoch s).")
+    lg_p.add_argument("--colab-binary", default="colab", help="internal: upstream colab executable.")
+    lg_p.add_argument("--auth-mode", default="oauth2", help="internal: upstream auth mode.")
 
     # V2 Monitor Dashboard Command (M8)
     mon_parser = subs.add_parser("monitor", help="Start the cross-device training & compute monitor server.")
@@ -176,6 +232,17 @@ def handle_project_command(args: argparse.Namespace) -> int:
     is_json = getattr(args, "json", False)
 
     try:
+        if action == "lease-guard":
+            from .lease_guard import run_guard
+
+            return run_guard(
+                session_id=args.session_id,
+                registry_path=Path(args.registry_path),
+                colab_binary=args.colab_binary,
+                auth_mode=args.auth_mode,
+                deadline_ts=args.deadline_ts,
+            )
+
         if action == "init":
             target = init_project(
                 target_dir=args.root,
@@ -212,10 +279,42 @@ def handle_project_command(args: argparse.Namespace) -> int:
 
         mgr = ProjectSessionManager()
 
+        if action == "approve-request":
+            spec = load_manifest(manifest_path)
+            rec = mgr.request_approval(spec, lease_seconds=args.lease_seconds)
+            view = mgr.approvals.public_view(rec)
+            if is_json:
+                print(json.dumps(view, indent=2))
+            else:
+                print("Approval requested (pending; no Colab resources were allocated).")
+                print(f"Approval id:  {view['approval_id']}")
+                print(f"Summary:      {view['summary']}")
+                print(f"Expires at:   {view['expires_at']}")
+                print(f"Operator runs: python3 -m colab_adapter.cli project approve {view['approval_id']}")
+                print(f"Operator types: {view['phrase']}")
+            return 0
+
+        if action == "approve":
+            # With --json only stdin must be a terminal: the phrase still comes from /dev/tty, and
+            # stdout carries only the JSON object (prompts and summary go to /dev/tty or stderr).
+            rec = mgr.approve(args.approval_id, require_stdout_tty=not is_json)
+            view = mgr.approvals.public_view(rec)
+            if is_json:
+                print(json.dumps(view, indent=2))
+            else:
+                print(f"Approved {view['approval_id']} (single use; expires at {view['expires_at']}).")
+                print(f"Next: python3 -m colab_adapter.cli project up --manifest <manifest> --approval-id {view['approval_id']}")
+            return 0
+
         if action == "up":
             spec = load_manifest(manifest_path)
             reuse = not getattr(args, "no_reuse", False)
-            session = mgr.up(spec, lease_seconds=args.lease_seconds, reuse_active=reuse)
+            session = mgr.up(
+                spec,
+                lease_seconds=args.lease_seconds,
+                reuse_active=reuse,
+                approval_id=getattr(args, "approval_id", None),
+            )
             if is_json:
                 print(json.dumps(session.to_dict(), indent=2))
             else:
@@ -232,6 +331,7 @@ def handle_project_command(args: argparse.Namespace) -> int:
                     return 1
                 s_id = active.session_id
 
+            mgr.ensure_lease_guard(s_id)
             sync_engine = WorkspaceSyncEngine(transport=mgr.transport)
             res = sync_engine.apply_sync(spec, session_id=s_id)
             if is_json:
@@ -244,12 +344,17 @@ def handle_project_command(args: argparse.Namespace) -> int:
             res = mgr.exec(
                 session_id=args.session_id,
                 command_or_code=args.exec_cmd,
+                timeout=args.timeout,
                 working_dir=args.working_dir,
+                shell=bool(getattr(args, "shell", False)),
             )
             if is_json:
                 print(json.dumps(res, indent=2))
             else:
                 print(res.get("output", ""))
+                if res.get("shell"):
+                    code = res.get("exit_code")
+                    print(f"[adapter] command exit code: {code if code is not None else 'UNKNOWN (EXIT_CODE marker missing)'}")
             return 0 if res.get("success", False) else 1
 
         elif action == "status":
@@ -262,14 +367,19 @@ def handle_project_command(args: argparse.Namespace) -> int:
                 print(f"Managed: {stat.get('managed')}")
                 print(f"GPU:     {stat.get('accelerator')}")
                 print(f"Lease:   {stat.get('time_remaining_seconds', 0):.0f}s remaining (active: {stat.get('lease_active')})")
-            return 0
+                print(f"Guard:   {'alive' if stat.get('guard_alive') else 'dead'} (pid: {stat.get('guard_pid')}, deadline: {stat.get('guard_deadline')}, outcome: {stat.get('guard_outcome')})")
+                print(f"Verify:  baseline={stat.get('assignments_before')} verification={stat.get('verification')}")
+                for warning in stat.get("warnings", []):
+                    print(f"WARNING: {warning}")
+            # Exit 5: needs attention (NEEDS_RECONCILIATION, STOPPING, or a dead guard under an active lease).
+            return 5 if stat.get("needs_attention") else 0
 
         elif action == "stop":
             ok = mgr.stop(args.session_id)
             if is_json:
                 print(json.dumps({"session_id": args.session_id, "stopped": ok}, indent=2))
             else:
-                print(f"Session '{args.session_id}' stopped successfully.")
+                print(f"Session '{args.session_id}' stopped and verified.")
             return 0
 
         elif action == "reconcile":
@@ -278,9 +388,46 @@ def handle_project_command(args: argparse.Namespace) -> int:
             if is_json:
                 print(json.dumps(rep, indent=2))
             else:
-                print(f"Reconcile complete: stopped {len(rep['stopped'])}, failed {len(rep['failed'])}, active {len(rep['active'])}.")
+                print(f"Reconcile complete: stopped {len(rep['stopped'])}, failed {len(rep['failed'])}, active {len(rep['active'])}, needs attention {len(rep['needs_attention'])}.")
+                for item in rep["needs_attention"]:
+                    print(f"  needs attention: {item['session_id']} ({item['state']}): {item['reason']}")
+                for warning in rep["warnings"]:
+                    print(f"WARNING: {warning}")
             return 0
 
+    except ApprovalRequiredError as e:
+        print(json.dumps(e.to_dict(), indent=2), file=sys.stderr)
+        return 3
+    except GlobalCapExceededError as e:
+        print(json.dumps({"error": str(e), "reason": e.reason}, indent=2), file=sys.stderr)
+        return 4
+    except AllocationError as e:
+        # Exit 6 = the allocation failed or is uncertain and a runtime may still be assigned (orphan possible);
+        # exit 1 = the failure was proven not to leave an assignment. Never retried automatically.
+        orphan = bool(getattr(e, "orphan_possible", True))
+        details = getattr(e, "details", None) or {}
+        if is_json:
+            print(json.dumps({
+                "error": str(e),
+                "orphan_possible": orphan,
+                "session_id": details.get("session_id"),
+            }, indent=2), file=sys.stderr)
+        else:
+            print(f"Project Error: {e}", file=sys.stderr)
+        return 6 if orphan else 1
+    except KeyboardInterrupt:
+        if action == "up":
+            msg = ("Interrupted during `project up`. POSSIBLE ORPHAN GPU RUNTIME: `colab new` may have assigned a "
+                   "VM that has no local name. The record is NEEDS_RECONCILIATION and still counts toward the "
+                   "one-session cap; the approval is spent and nothing will retry. Check `colab usage` (Active "
+                   "assignments vs your baseline) and the Colab web UI and stop any runtime you did not intend.")
+            if is_json:
+                print(json.dumps({"error": msg, "orphan_possible": True, "session_id": None}, indent=2), file=sys.stderr)
+            else:
+                print(f"Project Error: {msg}", file=sys.stderr)
+            return 6
+        print("Interrupted.", file=sys.stderr)
+        return 130
     except ColabV2Error as e:
         if is_json:
             print(json.dumps(e.to_dict(), indent=2), file=sys.stderr)
@@ -310,7 +457,7 @@ def main(argv: list[str] | None = None) -> int:
         scheme = "https" if (args.require_tls or args.tls_certfile) else "http"
         print(f"Starting Colab Training & Compute Monitor on {scheme}://{args.host}:{args.port}")
         if token:
-            print(f"Authentication active. Token: {token[:4]}****")
+            print("Authentication active (bearer token configured).")
         elif args.trusted_proxy:
             print("Trusted reverse-proxy authentication active.")
         else:
