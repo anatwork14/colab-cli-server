@@ -43,18 +43,20 @@ See [agent setup steps](docs/AGENT_SETUP.md) and the [copyable prompt](docs/AGEN
 
 ## V2 project workspace operations and agent guidelines
 
-V2 adds project workspace workflows (`colab-adapter project ...`) and compute monitoring (`colab-adapter monitor ...`). All autonomous agents operating in this repository or interacting with Colab must adhere to these rules:
+> **V2 Release Status:** Colab CLI Server V2 was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Post-merge hardening and end-to-end integration verification are tracked under Issue #23 (`fix/v2-postmerge-hardening-23`).
+
+V2 adds project workspace workflows (`python3 -m colab_adapter.cli project ...`) and compute monitoring (`python3 -m colab_adapter.cli monitor ...`). All autonomous agents operating in this repository or interacting with Colab must adhere to these rules:
 
 1. **Always plan and validate offline first:**
-   Use `colab-adapter project validate <dir> --json` and `colab-adapter project plan <dir> --json`. These perform dry-run file diffing and schema checks with zero cloud allocation.
+   Use `python3 -m colab_adapter.cli project validate <dir> --json` and `python3 -m colab_adapter.cli project plan <dir> --json`. These perform dry-run file diffing and schema checks with zero cloud allocation.
 2. **Never allocate compute without explicit human approval:**
-   `colab-adapter project up` provisions paid Colab compute. Agents running autonomously must obtain explicit operator authorization and verify session ownership before execution.
+   `python3 -m colab_adapter.cli project up` provisions paid Colab compute. Agents running autonomously must obtain explicit operator authorization and verify session ownership before execution.
 3. **Machine-readable JSON output:**
-   Pass `--json` to all `colab-adapter project` subcommands (`plan`, `up`, `sync`, `exec`, `status`, `stop`, `reconcile`) for structured JSON output.
+   Pass `--json` to all `python3 -m colab_adapter.cli project` subcommands (`plan`, `up`, `sync`, `exec`, `status`, `stop`, `reconcile`) for structured JSON output.
 4. **Strict isolation from unmanaged sessions:**
    The adapter strictly manages only sessions prefixed with its managed namespace. Never attempt to attach to, execute on, or terminate external user sessions (Q08 fail-closed invariant).
 5. **Read-only monitoring:**
-   `colab-adapter monitor snapshot` and `server` query account usage without provisioning resources. The monitor web dashboard is strictly read-only: do not construct or expose mutating endpoints.
+   `python3 -m colab_adapter.cli usage` and `python3 -m colab_adapter.cli monitor` query account usage without provisioning resources. The monitor web dashboard is strictly read-only: do not construct or expose mutating endpoints.
 6. **Backward compatibility & host safety:**
    Ensure `colab_adapter` remains compatible with standard Python 3.8+ on the host. Upstream `google-colab-cli` remains isolated in Python >=3.12. Do not touch host GPU drivers.
 

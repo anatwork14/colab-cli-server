@@ -143,15 +143,49 @@ For browser clients accessing the embedded monitoring UI through the broker:
      - Production reverse-proxy deployment with verified TLS and proxy headers.
    - Strictly excluded from automated CI runs pending owner authorization.
 
-### PR Review Stack Status
+### Release & Merge Status
 
-The WorkspaceBroker and cross-device attachment subsystem are part of a reconciled review stack:
+The WorkspaceBroker and cross-device attachment subsystem was merged into `main` via **PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`)**:
 - **PR #3**: Initial Project Workspace Architecture Proposal.
 - **PRs #13–#20**: Milestones M1–M8 implementations (including M7 WorkspaceBroker and M8 web interface).
 - **PR #22**: Multi-worker integration, security hardening, and documentation reconciliation.
 
-> [!IMPORTANT]
-> PRs #3, #13–#20, and #22 form a reconciled review stack and **remain unmerged into `main`** pending final owner approval and completion of Tier 3 live environment checks.
+Post-merge hardening under **Issue #23 (`fix/v2-postmerge-hardening-23`)** delivers:
+- **P1 Verified Google Drive Recovery**: 3-case retrieval (exact `@sha256_<HASH>`, verified latest pointer, fail-closed on ambiguous fallback).
+- **P1 Private Checkpoint Staging**: `0700` staging dirs, `0600` files with `fsync`, symlink/device rejection, and canonical containment checks.
+- **P2 Local Artifact Retrieval Size-Mismatch Handling**: Preserving `actual_size` on error before unlinking `.part.` temp file.
+- **P2 Controlled Colab HTTP 500 Upload Recovery**: Validating remote parent directories and retrying bounded upload once if newly created.
+- **Browser Security Host-State Isolation & 5-Revision Multi-Process History**: Strict CSP nonces and verified multi-process history.
+- **Mandatory 21-Stage Offline Pipeline Verification**: Comprehensive test in `tests/test_project_e2e.py`.
+
+> [!NOTE]
+> All automated tests run offline (`OFFLINE_RELEASE_READY`). Real cloud operations remain gated on explicit operator approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
+
+## 20-Step Operator Guide for Cross-Device Workspaces & Remote Execution
+
+A step-by-step operator guide using real, supported CLI commands (`python3 colab_server.py ...` and `python3 -m colab_adapter.cli ...`):
+
+1. **Host Environment Verification**: Check host Python version and uv toolchain: `python3 --version && uv --version` (no sudo required).
+2. **User-Space Upstream CLI Install**: Install official CLI in user space: `bash scripts/install.sh`.
+3. **Headless OAuth Authentication**: Complete Google account authentication in terminal: `bash scripts/authenticate.sh`.
+4. **Environment & Diagnostic Pre-Flight**: Run zero-allocation health check: `python3 colab_server.py doctor` (or `python3 -m colab_adapter.cli doctor`).
+5. **Compute Units & Session Balance Audit**: Inspect active sessions and compute-unit balance: `python3 colab_server.py usage` and `python3 -m colab_adapter.cli sessions`.
+6. **Project Workspace Initialization**: Initialize a research workspace: `python3 -m colab_adapter.cli project init ./research-project --name research-project`.
+7. **Source & Dependency Preparation**: Populate local project code (`train.py`, `model.py`, `requirements.txt`). Keep secrets in `.env` (excluded by default).
+8. **Project Manifest Validation**: Validate schema and security rules: `python3 -m colab_adapter.cli project validate ./research-project --json`.
+9. **Zero-Allocation Offline Execution Plan**: Compute file counts and payload bytes: `python3 -m colab_adapter.cli project plan ./research-project --json`.
+10. **Human-Approval-Gated Session Allocation**:
+    Provision or attach under lock: `python3 -m colab_adapter.cli project up ./research-project --gpu T4 --lease 3600 --approval-token "ALLOCATE T4 $(date +%s)" --json`.
+11. **Initial Workspace Incremental Sync**: Transfer sources to the remote runtime: `python3 -m colab_adapter.cli project sync ./research-project --json`.
+12. **Remote Training Execution**: Run training with live logs: `python3 -m colab_adapter.cli project exec ./research-project -- --epochs 10 --batch-size 32 --json`.
+13. **Incremental Code Hot-Updates**: Update local code and sync only changed files: `python3 -m colab_adapter.cli project sync ./research-project --json`.
+14. **Cross-Device Monitoring Server Launch**: Start read-only dashboard: `python3 -m colab_adapter.cli monitor --host 127.0.0.1 --port 8080 --auth-token "<SECRET_TOKEN>"`.
+15. **Google Drive Credential Setup (0600 Permissions)**: Configure `~/.config/colab-cli/drive_credentials.json` with permissions `chmod 0600 ~/.config/colab-cli/drive_credentials.json`.
+16. **Multi-Revision Checkpoint Publishing**: Checkpoints (`model.pt`) published at steps 100..500 are stored under canonical `@sha256_<HASH>` identities in `PublicationManifest` v2.
+17. **Historical Revision Recovery**: Retrieve a specific historical checkpoint (Revision A) or the latest checkpoint (Revision E) by canonical revision ID with SHA256 verification.
+18. **Cross-Device Workspace Attachment**: Secondary developer laptops or mobile devices attach to active runs via Workspace Broker with zero additional VM allocations.
+19. **Managed Session Teardown**: Stop the active remote session gracefully: `python3 -m colab_adapter.cli project stop ./research-project --json`.
+20. **Lease Reconciliation & Rollback**: Clean up expired leases: `python3 -m colab_adapter.cli project reconcile --auto-stop --json`. If network fails, roll back to verified local checkpoints.
 
 ### Operational Rollback Instructions
 

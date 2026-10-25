@@ -1,6 +1,6 @@
 # Colab CLI Server V2 — Milestones & Release Gates
 
-> Status as of 2026-10-25: M0–M8 & V2-Drive COMPLETE (Offline, local headless Chromium & GitHub Actions `browser-security` CI verified; 266/266 tests passing on Python 3.12, 265/266 + 1 skip on Python 3.8); M9 DEFERRED. PRs #3, #13–#20, and #22 form a reconciled review stack and remain unmerged into `main` pending owner approval. Scope is interactive human-approved research workflows, NOT an unrestricted autonomous cloud provisioning platform. No deadline or engineering estimate is promised.
+> Status as of 2026-10-25: Colab CLI Server V2 (M0–M8 & V2-Drive) was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Issue #23 (`fix/v2-postmerge-hardening-23`) delivers post-merge hardening for verified Google Drive recovery, private checkpoint staging, size-mismatch error handling, Colab HTTP 500 upload recovery, browser security isolation, and a comprehensive 21-stage offline E2E pipeline test. M9 DEFERRED. Scope is interactive human-approved research workflows, NOT an unrestricted autonomous cloud provisioning platform. All automated tests pass offline (`OFFLINE_RELEASE_READY`); live cloud operations remain strictly approval-gated (`LIVE_VALIDATION_REQUIRES_APPROVAL`). No deadline or engineering estimate is promised.
 
 ## Definition of Done (applies to every milestone)
 

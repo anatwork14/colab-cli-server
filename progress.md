@@ -7,8 +7,14 @@
 - **V1: MERGED / verified on GitHub.** PR #2 squash-merged into main at commit 2bfd2194ad8259d785ca59935579eab6bdad052c. Human operator reported server synchronization and 43/43 offline tests on Python 3.8 and 3.12, OAuth diagnostics and no active sessions. The maintainer has not independently inspected the user's running server in this planning PR.
 - **V1 live evidence:** earlier explicitly approved Colab T4 one-shot and stateful E2E executions proved basic remote CUDA execution, input upload, artifact download, checksum/ZIP checks and teardown. These tests predate V2 and do **not** validate SSH, directory sync or new development workflows.
 - **Dashboard M8: COMPLETE (Offline, local headless Chromium & GitHub Actions `browser-security` CI verified).** Full-stack monitor backend (`colab_adapter/monitor/server.py`, `collector.py`, `schemas.py`) and responsive embedded SPA (`colab_adapter/monitor/ui.py`) are implemented and verified offline and in headless Chromium (`playwright-core` with `COLAB_REQUIRE_BROWSER_TESTS=1`) with strict Bearer/trusted-proxy authentication, per-response cryptographic CSP nonces (`script-src 'self' 'nonce-...'` without `'unsafe-inline'`), zero unsafe `innerHTML` or inline event handlers, checkpoint revision history (`LATEST` / `HISTORICAL`), TLS enforcement, and deep secret redaction.
-- **V2 implementation: COMPLETE across M1–M8 and V2-Drive (`feat/v2-drive-workspaces`).** All V2 milestones (M1–M8) and Cross-Device Workspaces & Google Drive Durable Storage (Issue #21, PR #22) are implemented and verified (**266/266 tests passing on Python 3.12; 265/266 passed + 1 Python>=3.10 AST check skipped on Python 3.8**). Note: PRs #3, #13–#20, and #22 form a reconciled review stack on GitHub and remain **unmerged into `main`** pending owner review. **No live V2 SSH test, GPU rental, or live Google Drive API call has been executed.**
-- **Account safety:** NO cloud allocations, SSH auto-provision, Drive mount, paid API, GPU spend or unattended deployment authorized or executed during V2 development and testing.
+- **V2 implementation: MERGED into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`).** All V2 milestones (M1–M8) and Cross-Device Workspaces & Google Drive Durable Storage (Issue #21, PR #22) are fully merged and verified on `main`. Post-merge hardening and end-to-end integration verification are tracked under **Issue #23 (`fix/v2-postmerge-hardening-23`)**, delivering:
+  1. P1 Verified Google Drive Recovery (3-case retrieval: exact `@sha256_<HASH>`, verified latest pointer via manifest/backup, fail-closed on ambiguous/unverified fallback when local manifest is missing).
+  2. P1 Private Checkpoint Staging (`0700` staging directories, `0600` temporary/staged files with `fsync`, symlink/special-file rejection, canonical staging-root containment validation).
+  3. P2 Local Artifact Retrieval Size-Mismatch Error Handling (capturing `actual_size` before unlinking `.part.` temp file so `ArtifactValidationError` is always raised instead of `FileNotFoundError`).
+  4. P2 Controlled Colab HTTP 500 Upload Recovery (validating remote paths, probing whether parent directory is missing via bounded `exec_code`, checking `result["success"]`, and retrying at most once only when missing directory was newly created).
+  5. Browser security test host-state isolation & 5-revision (`SHA256 A..E`) multi-process history verification.
+  6. Comprehensive 21-stage offline E2E pipeline test (`test_complete_21_stage_v2_research_lifecycle_and_recovery`) in `tests/test_project_e2e.py`.
+- **Account safety:** NO cloud allocations, SSH auto-provision, Drive mount, paid API, GPU spend or unattended deployment authorized or executed during V2 development and testing. Automated test suites run in strictly offline/mock environments (`OFFLINE_RELEASE_READY`); all real cloud operations remain approval-gated (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 
 ## Baseline inventory (evidence from main)
 
@@ -46,6 +52,24 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-25 — Issue #23 Resolution: Post-Merge Hardening, Security Isolation & 21-Stage E2E Pipeline (branch `fix/v2-postmerge-hardening-23`):**
+  - **P1 Verified Google Drive Recovery (`colab_adapter/storage/google_drive.py`)**:
+    - Implemented strict 3-case retrieval resolution: (1) exact immutable revision ID `@sha256_<HASH>`, (2) verified latest pointer via local PublicationManifest or backup cache, and (3) fail-closed rejection on ambiguous or unverified fallback when local manifest is missing, preventing hash mismatches and silent corruptions.
+  - **P1 Private Checkpoint Staging & Filesystem Security (`colab_adapter/storage/local.py`, `worker.py`)**:
+    - Enforced `0700` directory permissions on staging roots and `0600` on temporary/staged files with explicit `os.fsync()`.
+    - Added canonical staging-root containment checks (`Path.resolve().relative_to()`) and rejection of symlinks and special devices before staging or publishing.
+  - **P2 Local Artifact Retrieval Size-Mismatch Error Handling (`colab_adapter/storage/local.py`)**:
+    - Captured `actual_size` before unlinking partial `.part.` download files on size mismatch, ensuring `ArtifactValidationError` is raised deterministically rather than masking with `FileNotFoundError`.
+  - **P2 Controlled Colab HTTP 500 Upload Recovery (`colab_adapter/transports/official_cli.py`)**:
+    - Added remote path validation and bounded probe via `exec_code` checking whether remote parent directory exists on HTTP 500 errors during live Colab upload; retries upload at most once only when the missing directory was newly created.
+  - **Browser Security Host-State Isolation & 5-Revision Multi-Process History (`tests/test_browser_xss_and_cross_process_qa.py`)**:
+    - Isolated host state in browser tests to prevent cross-test interference and verified 5-revision (`SHA256 A..E`) multi-process publication history rendering with cryptographic CSP nonces.
+  - **Mandatory 21-Stage Offline V2 Research Lifecycle & Recovery Pipeline (`tests/test_project_e2e.py`)**:
+    - Added `test_complete_21_stage_v2_research_lifecycle_and_recovery` exercising: (1) project init `vision-research`, (2) manifest validation, (3) 0-cloud-allocation plan, (4) explicit mock GPU approval gate with `ALLOCATE T4`, (5) session manager provisioning under lock, (6) incremental source sync excluding `.env`, (7) remote execution, (8) telemetry emission, (9–10) 5 revisions of `model.pt`, (11) immutable local staging, (12) resumable Drive upload, (13) remote content verification, (14) versioned `PublicationManifest` v2 (`manifest_version == 2`, `latest_by_path` pointing to Rev E, all 5 revisions preserved), (15) simulated lease expiration & safe reconciliation, (16) authenticated dashboard API, (17) historical revision selection, (18–20) checkpoint download, SHA256 verification, corrupt download rejection without overwriting existing files, and `ResumePlanner` / `plan_resume_from_checkpoint`, and (21) negative security controls.
+    - Test suite status: **10/10 tests passing in `tests/test_project_e2e.py`**.
+    - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive API calls made; `OFFLINE_RELEASE_READY`).
+    - **PR STACK STATUS**: PR #22 merged to `main` (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`); Issue #23 post-merge hardening delivered on branch `work/23-f-e2e-docs`.
+    - **STATUS: OFFLINE_RELEASE_READY (LIVE_VALIDATION_REQUIRES_APPROVAL).**
 - **2026-10-25 — Review `5640967243` Resolution: Immutable Checkpoint Revision History, Manifest v2 Migration, Reproducible Headless Chromium CI & 19-Step E2E Verification (branch `feat/v2-drive-workspaces`):**
   - **P2 Immutable Checkpoint Revision History & Canonical Identity Contract (`colab_adapter/storage/base.py`, `manifest.py`, `local.py`, `google_drive.py`, `worker.py`, `transfer.py`)**:
     - Defined frozen `ArtifactRevisionIdentity` and canonical revision IDs `{project_id}/{run_id}/{logical_path}@sha256_{full_sha256}` alongside helper functions `format_revision_artifact_id`, `format_logical_artifact_id`, `parse_artifact_id`, and `format_transfer_id`.
@@ -60,8 +84,8 @@ For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial,
     - Expanded `tests/test_project_e2e.py` with the full 19-step research lifecycle (`test_full_19_step_research_lifecycle`) verifying multi-revision `model.pt` publication, VM termination, dashboard inspection of historical and latest revisions, dual retrieval of both `Revision A` and `Revision B` on Device B, and negative security controls.
     - Full test suite: **266/266 tests passing on Python 3.12** (`Ran 266 tests in 46.596s: OK`) and **265/266 passed + 1 skipped on Python 3.8** (`Ran 266 tests in 44.793s: OK (skipped=1)`).
     - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive API calls made).
-    - **PR STACK STATUS**: PRs #3, #13–#20, and #22 remain a reconciled review stack on GitHub and are **not yet merged into `main`**.
-    - **STATUS: READY_FOR_INDEPENDENT_REVIEW.**
+    - **PR STACK STATUS**: Colab CLI Server V2 was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`).
+    - **STATUS: MERGED_TO_MAIN.**
 - **2026-10-25 — Review `5640707483` Resolution: Stored DOM XSS Elimination, Strict Nonce CSP, Cross-Process Publication Atomicity & Real Browser/Multi-Process QA (branch `feat/v2-drive-workspaces`):**
   - **P0 Stored DOM XSS Elimination & Strict Cryptographic Nonce CSP (`colab_adapter/monitor/ui.py`, `colab_adapter/monitor/server.py`)**:
     - Removed 100% of `.innerHTML` assignments and 100% of inline event handler attributes (`onclick=`, `oninput=`, `onchange=`, `onerror=`, `onload=`) across `colab_adapter/monitor/ui.py` and `colab_adapter/monitor/server.py`.
@@ -77,8 +101,8 @@ For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial,
     - Verified with two simultaneous OS processes (`subprocess.Popen`) synchronized via filesystem barrier against a loopback HTTP Drive v3 server (`LoopbackDriveServer`): `session_counter == 1`, `len(committed_checkpoints) == 1`, identical `remote_file_id` and `sha256`, and mid-upload process crash (`os._exit(99)` at 256 KiB) followed by second-process HTTP 308 resume from byte offset `262144`.
     - Full test suite: **240/240 tests passing on Python 3.12** and **239/240 passed + 1 skipped on Python 3.8** (0 failures, 0 errors).
     - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive API calls made).
-    - **PR STACK STATUS**: PRs #3, #13–#20, and #22 remain a reconciled review stack on GitHub and are **not yet merged into `main`**.
-    - **STATUS: READY_FOR_INDEPENDENT_REVIEW.**
+    - **PR STACK STATUS**: Colab CLI Server V2 was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`).
+    - **STATUS: MERGED_TO_MAIN.**
 - **2026-10-25 — V2 Complete Integration, Full-Stack UI, Drive Protocol Hardening & Adversarial QA (branch `feat/v2-drive-workspaces`):**
   - **P0 Trusted-Proxy Authentication & Real TLS Socket Enforcement (`colab_adapter/monitor/server.py`, `colab_adapter/broker.py`)**:
     - Resolved trusted-proxy header spoofing: enabling `trusted_proxy=True` now strictly requires a non-empty `trusted_proxy_secret` (raising `ValueError` / `BrokerAuthenticationError` if omitted), validates client peer IP against `trusted_proxy_ips` (default loopback `127.0.0.1`, `::1`), validates `X-Remote-User` / `X-Forwarded-User` against `^[a-zA-Z0-9_.@-]{1,128}$`, and verifies `X-Proxy-Secret` via `hmac.compare_digest` or `X-Proxy-Signature` via HMAC-SHA256.

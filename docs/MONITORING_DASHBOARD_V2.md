@@ -276,15 +276,23 @@ To validate dashboard functionality and security without premature assumptions o
      - Production reverse-proxy deployment with valid external TLS certificates and trusted-proxy identity injection.
    - Staged exclusively for production deployment after explicit owner authorization; never invoked during offline CI runs.
 
-### PR Review Stack Status
+### Release & Merge Status
 
-The monitoring dashboard and associated V2 platform capabilities are staged across a reconciled review stack:
+The monitoring dashboard and associated V2 platform capabilities were merged into `main` via **PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`)**:
 - **PR #3**: Initial Project Workspace Architecture Proposal.
 - **PRs #13–#20**: Milestone M1–M8 implementations (including M8 dashboard backend and UI components).
 - **PR #22**: Multi-worker integration, comprehensive test expansion, and documentation reconciliation.
 
-> [!IMPORTANT]
-> PRs #3, #13–#20, and #22 form a reconciled review stack and **remain unmerged into `main`** pending final owner approval and completion of Tier 3 live environment checks.
+Post-merge hardening delivered under **Issue #23 (`fix/v2-postmerge-hardening-23`)** includes:
+- **P1 Verified Google Drive Recovery**: 3-case retrieval (exact `@sha256_<HASH>`, verified latest pointer, fail-closed on ambiguous fallback).
+- **P1 Private Checkpoint Staging**: `0700` staging dirs, `0600` files with `fsync`, symlink/device rejection, and canonical containment checks.
+- **P2 Local Artifact Retrieval Size-Mismatch Handling**: Preserving `actual_size` on error before unlinking `.part.` temp file.
+- **P2 Controlled Colab HTTP 500 Upload Recovery**: Validating remote parent directories and retrying bounded upload once if newly created.
+- **Browser Security Host-State Isolation & 5-Revision Multi-Process History**: Strict CSP nonces and verified multi-process history.
+- **Mandatory 21-Stage Offline Pipeline Verification**: Comprehensive test in `tests/test_project_e2e.py`.
+
+> [!NOTE]
+> All automated tests execute in offline/mock mode (`OFFLINE_RELEASE_READY`). Real cloud operations remain gated on explicit operator approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 
 ### Operational Rollback Instructions
 

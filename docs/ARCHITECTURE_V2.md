@@ -285,15 +285,23 @@ To ensure release safety without false assumptions of cloud availability, verifi
      - Production reverse-proxy deployment (TLS ingress, DNS resolution, and trusted proxy header propagation).
    - Never executed in automated CI or unapproved environments.
 
-### PR Review Stack Status
+### Release & Merge Status
 
-The Colab V2 platform improvements are organized as a unified, reconciled review stack across PRs:
+Colab CLI Server V2 was successfully merged into `main` via **PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`)**, consolidating the full platform:
 - **PR #3**: Initial Project Workspace Architecture Proposal.
 - **PRs #13–#20**: Milestones M1 through M8 implementations (manifest loader, sync engine, SSH transport boundary, telemetry emitter, Google Drive store, WorkspaceBroker, and monitoring dashboard).
 - **PR #22**: Multi-worker integration, security hardening, and adversarial regression test suite.
 
-> [!IMPORTANT]
-> PRs #3, #13–#20, and #22 form a reconciled review stack and **remain unmerged into `main`** pending final owner approval and completion of Tier 3 live environment checks.
+Post-merge hardening is delivered under **Issue #23 (`fix/v2-postmerge-hardening-23`)**:
+1. **P1 Verified Google Drive Recovery**: 3-case retrieval resolution (exact `@sha256_<HASH>`, verified latest pointer via manifest/backup, fail-closed on ambiguous/unverified fallback when local manifest is missing).
+2. **P1 Private Checkpoint Staging**: `0700` staging directories, `0600` temporary/staged files with `fsync`, symlink/special-file rejection, canonical staging-root containment validation.
+3. **P2 Local Artifact Retrieval Size-Mismatch Error Handling**: capturing `actual_size` before unlinking `.part.` temp file so `ArtifactValidationError` is always raised instead of `FileNotFoundError`.
+4. **P2 Controlled Colab HTTP 500 Upload Recovery**: validating remote paths, probing whether parent directory is missing via bounded `exec_code`, checking `result["success"]`, and retrying at most once only when missing directory was newly created.
+5. **Browser Security Host-State Isolation & 5-Revision Multi-Process History**: isolated browser test state and verified 5-revision (`SHA256 A..E`) multi-process history.
+6. **21-Stage Offline E2E Pipeline Verification**: `test_complete_21_stage_v2_research_lifecycle_and_recovery` in `tests/test_project_e2e.py`.
+
+> [!NOTE]
+> All automated tests run in strictly offline/mock environments (`OFFLINE_RELEASE_READY`). Any live cloud GPU allocation or live Google Drive API operations remain strictly gated on human operator authorization (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 
 ### Operational Rollback Procedures
 
