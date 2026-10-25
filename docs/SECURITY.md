@@ -38,6 +38,14 @@ Every new managed Colab allocation through `colab_adapter` needs an operator-gra
 
 **Approval gate limits (plain language).** The gate stops accidental or agent-initiated Colab allocation through this adapter. Each approval is bound to one exact plan (project, GPU, manifest and workspace contents), a maximum lease, a 15-minute expiry and single use, and it leaves an audit record. It does **not** stop a process that runs as the same OS user: such a process can read the record key, forge or edit records, drive a pseudo-terminal to answer the prompt, run `colab new` directly, or change the code. Direct use of `colab new`, `colab run` and `colab ssh` cannot be gated by this repository. The gate is a safety interlock, not a security boundary. The real boundary is the approver and Colab OAuth in a separate OS account or a protected executor. Until that exists, the operator should run `project up` personally for paid runtimes.
 
+**Fingerprint coverage.** The workspace digest in a plan fingerprint covers every regular file under the project root, except: `artifacts_local_dir` (default `./artifacts`, resolved against the project root when inside it), the `.colab_experiments` approvals and registry state directory (when inside the root), `*.log` files, `__pycache__`, `*.pyc` and `.git`. Any change to a covered file, including a new source file, invalidates the plan and needs a new approval. Writing or pulling artifacts, logs and bytecode does not invalidate it. Reuse of a live exact session still works after artifacts are pulled. The fingerprint covers source and manifest content only: a process that changes an excluded file cannot alter a run through the fingerprint, so do not put executable or configuration content in excluded paths.
+
+**Cap and `--no-reuse`.** A `--no-reuse` request while any managed session is active (V1 or V2, or a `colab_server.py run` record) always fails the global cap with exit 4, and the approval is not consumed. Stop or reconcile the live session first.
+
+**Key handling.** The per-directory HMAC key must be a regular, non-symlink file owned by the current user. Group and other permission bits are removed. A key shorter than 32 bytes (for example an empty file left by a crash) is replaced atomically, since no record can have been signed with it. A symlink or a foreign-owned key is refused with reason `corrupt`.
+
+**Terminal input.** The phrase is read from `/dev/tty` only, and stdin must be a terminal. With `project approve --json` stdout does not need to be a terminal, so the JSON can be piped. Ctrl-C or EOF at the prompt refuses the request (exit 3) without a traceback.
+
 ## Storage hardening controls (PR #24, offline)
 
 These controls are implemented in `colab_adapter/storage/` and are verified only by offline tests. They do not replace the approval gates above.

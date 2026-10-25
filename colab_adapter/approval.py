@@ -15,22 +15,25 @@ The real boundary is the operator running ``approve`` from a separate account or
 """
 from __future__ import annotations
 
+import dataclasses
 import errno
 import fcntl
+import glob
 import hashlib
 import hmac
 import json
 import os
 import re
 import secrets
+import stat
 import sys
 import termios
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
-from .project_manifest import ProjectSpec, plan_project
+from .project_manifest import ProjectSpec, discover_project_files, validate_manifest
 from .provider import (
     ACTIVE_MANAGED_STATES,
     ApprovalRequiredError,
@@ -45,7 +48,11 @@ MAX_ACTIVE_MANAGED_SESSIONS = 1       # shared cap across V1 and V2 allocations
 KIND_V2_UP = "v2_up"
 KIND_V1_JOB = "v1_job"
 KIND_SERVER_RUN = "colab_server_run"
-_ID_RE = re.compile(r"^apr-[0-9a-f]{32}$")
+_ID_RE = re.compile(r"apr-[0-9a-f]{32}")  # always used with fullmatch(): no trailing-newline acceptance
+_KEY_BYTES = 32
+# Covered-file rules for plan_fingerprint(), on top of MANDATORY_EXCLUDE_PATTERNS (which already
+# drop .git, __pycache__, *.pyc). Logs and the local state directory never change what a run uses.
+FINGERPRINT_EXTRA_EXCLUDES = ("*.log", "**/.colab_experiments", "**/.colab_experiments/**")
 
 
 class GlobalCapExceededError(DuplicateAllocationError):
@@ -66,9 +73,46 @@ def digest_of(plan: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(plan)).hexdigest()
 
 
+def _relative_inside_root(path: Path, root: Path) -> Optional[str]:
+    """POSIX path of ``path`` relative to ``root`` when it lies strictly inside it, else None."""
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None
+    rel_posix = rel.as_posix()
+    return None if rel_posix in ("", ".") else rel_posix
+
+
+def _fingerprint_excludes(spec: ProjectSpec) -> List[str]:
+    """Extra exclude patterns for the workspace digest, including artifacts_local_dir when inside the root."""
+    patterns = list(FINGERPRINT_EXTRA_EXCLUDES)
+    artifacts = Path(spec.artifacts_local_dir)
+    if not artifacts.is_absolute():
+        artifacts = Path(spec.root) / artifacts
+    rel = _relative_inside_root(artifacts, Path(spec.root))
+    if rel is not None:
+        escaped = glob.escape(rel)  # literal directory name even if it holds glob characters
+        patterns.extend([escaped, escaped + "/**"])
+    return patterns
+
+
+def workspace_digest(spec: ProjectSpec) -> str:
+    """Digest of the covered source files under the project root (see docs/SECURITY.md).
+
+    Same hashing format as ``plan_project``'s ``manifest_digest``, but over a filtered file set.
+    Not covered: artifacts_local_dir, the `.colab_experiments` state directory, `*.log`, `__pycache__`,
+    `*.pyc` and `.git`. ``plan_project`` itself is unchanged, so `project plan` output is unaffected.
+    """
+    validate_manifest(spec)
+    scoped = dataclasses.replace(spec, exclude=list(spec.exclude) + _fingerprint_excludes(spec))
+    files = discover_project_files(scoped)
+    return hashlib.sha256(
+        json.dumps([(f[0], f[1], f[2]) for f in files], sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def plan_fingerprint(spec: ProjectSpec) -> str:
-    """Digest binding a project's identity, GPU, remote root, manifest and workspace contents."""
-    plan = plan_project(spec)
+    """Digest binding a project's identity, GPU, remote root, manifest and covered source files."""
     project_id = getattr(spec, "project_id", None) or f"proj-{spec.name}"
     return digest_of({
         "schema": SCHEMA,
@@ -77,7 +121,7 @@ def plan_fingerprint(spec: ProjectSpec) -> str:
         "gpu": spec.gpu,
         "remote_root": spec.remote_root,
         "manifest": spec.to_dict(),
-        "workspace_digest": plan["manifest_digest"],
+        "workspace_digest": workspace_digest(spec),
     })
 
 
@@ -136,9 +180,12 @@ def ensure_global_cap(registry: ManagedSessionRegistry, cap: int = MAX_ACTIVE_MA
         )
 
 
-def _stdio_is_tty() -> bool:
+def _stdio_is_tty(require_stdout: bool = True) -> bool:
+    """stdin must be a terminal. stdout must be one too unless the caller prints JSON (`--json`)."""
     try:
-        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+        if not sys.stdin.isatty():
+            return False
+        return bool(sys.stdout.isatty()) if require_stdout else True
     except (AttributeError, ValueError):
         return False
 
@@ -147,9 +194,13 @@ def _open_tty() -> int:
     return os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
 
 
-def read_tty_phrase(prompt: str) -> str:
-    """Read one line from the controlling terminal (/dev/tty), never from piped stdin."""
-    if not _stdio_is_tty():
+def read_tty_phrase(prompt: str, require_stdout_tty: bool = True) -> str:
+    """Read one line from the controlling terminal (/dev/tty), never from piped stdin.
+
+    The phrase is always read from /dev/tty. A caller that prints JSON to stdout passes
+    ``require_stdout_tty=False``; stdin must still be a terminal.
+    """
+    if not _stdio_is_tty(require_stdout=require_stdout_tty):
         raise ApprovalRequiredError(
             "REFUSED: Colab GPU provisioning requires human authorization at an interactive terminal "
             "(stdin is not a tty).",
@@ -206,32 +257,77 @@ class ApprovalStore:
             finally:
                 os.close(fd)
 
-    def _key(self) -> bytes:
-        path = self.directory / ".hmac.key"
-        for _ in range(2):
+    def _corrupt_key(self, detail: str) -> ApprovalRequiredError:
+        return ApprovalRequiredError(f"Approval key is unusable ({detail}); refusing to use approvals.", reason="corrupt")
+
+    def _read_key_file(self, path: Path) -> bytes:
+        """Read the key without following symlinks; the opened descriptor must be a regular file."""
+        try:
+            fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as exc:
+            raise self._corrupt_key("cannot open") from exc
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                raise self._corrupt_key("not a regular file")
+            return fh.read(4096)
+
+    def _install_key(self, path: Path, replace: bool) -> bytes:
+        """Write a new key via temp file + fsync. ``replace=False`` creates it with no clobber (os.link)."""
+        key = secrets.token_bytes(_KEY_BYTES)
+        tmp = self.directory / f".hmac.key.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(key)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            if replace:
+                os.replace(str(tmp), str(path))
+            else:
+                os.link(str(tmp), str(path))  # EEXIST when another creator won the race
+        except FileExistsError:
+            return self._read_key_file(path)
+        finally:
             try:
-                with open(path, "rb") as fh:
-                    key = fh.read()
-                if len(key) >= 32:
-                    return key
+                os.unlink(str(tmp))
             except FileNotFoundError:
                 pass
-            try:
-                fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                continue
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(secrets.token_bytes(32))
-                fh.flush()
-                os.fsync(fh.fileno())
-        raise ApprovalRequiredError("Approval key is unreadable; refusing to use approvals.", reason="corrupt")
+        dfd = os.open(str(self.directory), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return key
+
+    def _key(self) -> bytes:
+        """Return the per-directory HMAC key, creating or repairing it. Callers hold ``_lock``.
+
+        A key shorter than 32 bytes is a crash leftover: no record can have been signed with it, so it
+        is replaced atomically. A symlink, a non-regular file or a key owned by another user is refused
+        as ``corrupt``. Group and other permission bits are removed from our own key file.
+        """
+        path = self.directory / ".hmac.key"
+        try:
+            st = os.lstat(str(path))
+        except FileNotFoundError:
+            return self._install_key(path, replace=False)
+        if not stat.S_ISREG(st.st_mode):
+            raise self._corrupt_key("symlink or not a regular file")
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            raise self._corrupt_key("not owned by this user")
+        if stat.S_IMODE(st.st_mode) & 0o077:
+            os.chmod(str(path), 0o600)
+        key = self._read_key_file(path)
+        if len(key) >= _KEY_BYTES:
+            return key
+        return self._install_key(path, replace=True)
 
     def _mac(self, rec: Dict[str, Any]) -> str:
         body = {k: v for k, v in rec.items() if k != "mac"}
         return hmac.new(self._key(), canonical_json(body), hashlib.sha256).hexdigest()
 
     def _path(self, approval_id: str) -> Path:
-        if not isinstance(approval_id, str) or not _ID_RE.match(approval_id):
+        if not isinstance(approval_id, str) or not _ID_RE.fullmatch(approval_id):
             raise ApprovalRequiredError("Unknown approval id.", reason="not_found")
         return self.directory / f"{approval_id}.json"
 
@@ -308,8 +404,11 @@ class ApprovalStore:
             self._write(rec)
         return rec
 
-    def approve(self, approval_id: str) -> Dict[str, Any]:
-        """Operator step: show the summary, read the exact phrase from /dev/tty, mark approved."""
+    def approve(self, approval_id: str, require_stdout_tty: bool = True) -> Dict[str, Any]:
+        """Operator step: show the summary, read the exact phrase from /dev/tty, mark approved.
+
+        ``require_stdout_tty=False`` serves callers that print JSON to stdout; stdin must still be a tty.
+        """
         with self._lock():
             rec = self._read(approval_id)
         if rec["status"] != "pending":
@@ -318,7 +417,8 @@ class ApprovalStore:
 
         print(f"Approval {rec['approval_id']} ({rec['kind']}): {rec['summary']}", file=sys.stderr)
         print(f"Plan digest: {rec['plan_digest']}", file=sys.stderr)
-        entered = read_tty_phrase(f"To approve, type exactly: {rec['phrase']}\n> ")
+        entered = read_tty_phrase(f"To approve, type exactly: {rec['phrase']}\n> ",
+                                  require_stdout_tty=require_stdout_tty)
 
         with self._lock():
             rec = self._read(approval_id)

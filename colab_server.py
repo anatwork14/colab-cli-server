@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import secrets
 import shutil
 import subprocess
 import sys
@@ -84,6 +85,12 @@ def render_plan(provider: str, script: Path, gpu: str, timeout: float) -> list[s
     return cmd
 
 
+RUN_RECORD_PREFIX = "colab-server-run-"
+# Terminal registry states: not in ACTIVE_MANAGED_STATES, so a finished run does not count toward the cap.
+STATE_TERMINATED = "TERMINATED"
+STATE_FAILED = "FAILED"
+
+
 def _state_registry():
     """Managed-session registry whose directory also holds the approval records."""
     from colab_adapter.provider import ManagedSessionRegistry
@@ -91,39 +98,119 @@ def _state_registry():
     return ManagedSessionRegistry()
 
 
-def authorize_run(gpu: str, script: Path, timeout: float, auth: str) -> bool:
-    """Create, operator-approve (at /dev/tty) and consume a one-time record before `colab run`.
+def _state_lock(registry):
+    """The allocation lock shared with the V1/V2 adapters, kept in the registry's directory."""
+    from colab_adapter.provider import ColabProcessLock
 
-    Not a security boundary against code running as this OS user; see colab_adapter/approval.py.
-    """
+    return ColabProcessLock(Path(registry.registry_path).parent / "colab_gpu.lock")
+
+
+def _script_sha256(script: Path) -> str:
     import hashlib
 
-    from colab_adapter.approval import ApprovalStore, KIND_SERVER_RUN, approvals_dir_for_registry, digest_of
-    from colab_adapter.provider import ApprovalRequiredError
+    return hashlib.sha256(script.read_bytes()).hexdigest()
 
-    plan = {
-        "schema": 1,
+
+def build_run_plan(gpu: str, script: Path, timeout: float, auth: str) -> dict:
+    from colab_adapter.approval import KIND_SERVER_RUN, SCHEMA
+
+    return {
+        "schema": SCHEMA,
         "kind": KIND_SERVER_RUN,
         "gpu": gpu,
         "auth": auth,
-        "script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+        "script_sha256": _script_sha256(script),
         "timeout": float(timeout),
     }
-    store = ApprovalStore(approvals_dir_for_registry(_state_registry()))
+
+
+def run_gated(
+    gpu: str,
+    script: Path,
+    timeout: float,
+    auth: str,
+    cmd: list,
+    *,
+    registry,
+    lock,
+    run=None,
+) -> int:
+    """Run `colab run` only inside the shared allocation gate.
+
+    Order inside the ColabProcessLock: global cap (before any prompt), operator approval at
+    /dev/tty with a per-approval nonce, verify-and-consume, script re-hash, managed registry record
+    in PROVISIONING (counts toward the cap), `colab run`, then the record is finalized in `finally`
+    (TERMINATED on exit 0, FAILED otherwise; terminal states do not count toward the cap).
+
+    Not a security boundary against code running as this OS user; see colab_adapter/approval.py.
+    """
+    from colab_adapter.approval import (
+        KIND_SERVER_RUN,
+        ApprovalStore,
+        approvals_dir_for_registry,
+        digest_of,
+        ensure_global_cap,
+    )
+    from colab_adapter.provider import ApprovalRequiredError, DuplicateAllocationError
+
+    run = run or subprocess.run  # resolved at call time so tests can replace subprocess.run
+    plan = build_run_plan(gpu, script, timeout, auth)
+    store = ApprovalStore(approvals_dir_for_registry(registry))
     try:
-        record = store.request(
-            kind=KIND_SERVER_RUN,
-            plan=plan,
-            gpu=gpu,
-            summary=f"colab run --gpu {gpu} for {script.name} (auth {auth})",
-            phrase_code="",
-        )
-        store.approve(record["approval_id"])
-        store.verify_and_consume(record["approval_id"], kind=KIND_SERVER_RUN, plan_digest=digest_of(plan))
+        with lock:  # DuplicateAllocationError when another allocation holds the lock
+            ensure_global_cap(registry)
+            approval_id = _request_and_approve(store, gpu, script, plan)
+            store.verify_and_consume(approval_id, kind=KIND_SERVER_RUN, plan_digest=digest_of(plan))
+            # Re-hash right before the upstream CLI reads the script; the window shrinks but does not close.
+            if _script_sha256(script) != plan["script_sha256"]:
+                raise ApprovalRequiredError(
+                    "The script changed after it was approved; request a new approval.",
+                    reason="plan_mismatch",
+                )
+            record_id = f"{RUN_RECORD_PREFIX}{secrets.token_hex(4)}"
+            registry.register(record_id, job_id=approval_id, gpu=gpu, project_name=script.stem)
+            outcome = STATE_FAILED
+            try:
+                res = run(cmd, check=False)
+                returncode = int(res.returncode)
+                outcome = STATE_TERMINATED if returncode == 0 else STATE_FAILED
+                return returncode
+            except KeyboardInterrupt:
+                print(
+                    "Interrupted. Inspect 'colab sessions' for orphaned assignments "
+                    "and stop any remaining session manually.",
+                    file=sys.stderr,
+                )
+                return 130
+            finally:
+                registry.update_state(record_id, outcome)
+    except DuplicateAllocationError as exc:  # includes GlobalCapExceededError
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 4
     except ApprovalRequiredError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
-        return False
-    return True
+        print("NOT APPROVED: no Colab allocation requested.", file=sys.stderr)
+        return 3
+    except (KeyboardInterrupt, EOFError):
+        print(
+            "REFUSED: interrupted at the approval prompt; no Colab allocation requested.",
+            file=sys.stderr,
+        )
+        return 3
+
+
+def _request_and_approve(store, gpu: str, script: Path, plan: dict) -> str:
+    """Create a pending record with a per-approval nonce, have the operator approve it, return its id."""
+    code = secrets.token_hex(4)
+    record = store.request(
+        kind=plan["kind"],
+        plan=plan,
+        gpu=gpu,
+        summary=f"colab run --gpu {gpu} for {script.name} (auth {plan['auth']})",
+        phrase_code=code,
+    )
+    store.approve(record["approval_id"])
+    return record["approval_id"]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -147,18 +234,11 @@ def main(argv: list[str] | None = None) -> int:
     if not shutil.which("colab"):
         print("colab not found; run bash scripts/install.sh", file=sys.stderr)
         return 1
-    if not authorize_run(args.gpu, script, args.timeout, args.auth):
-        print("NOT APPROVED: no Colab allocation requested.", file=sys.stderr)
-        return 3
-    try:
-        return subprocess.run(cmd, check=False).returncode
-    except KeyboardInterrupt:
-        print(
-            "Interrupted. Inspect 'colab sessions' for orphaned assignments "
-            "and stop any remaining session manually.",
-            file=sys.stderr,
-        )
-        return 130
+    registry = _state_registry()
+    return run_gated(
+        args.gpu, script, args.timeout, args.auth, cmd,
+        registry=registry, lock=_state_lock(registry),
+    )
 
 
 if __name__ == "__main__":

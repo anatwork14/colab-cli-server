@@ -251,7 +251,9 @@ def handle_project_command(args: argparse.Namespace) -> int:
             return 0
 
         if action == "approve":
-            rec = mgr.approve(args.approval_id)
+            # With --json only stdin must be a terminal: the phrase still comes from /dev/tty, and
+            # stdout carries only the JSON object (prompts and summary go to /dev/tty or stderr).
+            rec = mgr.approve(args.approval_id, require_stdout_tty=not is_json)
             view = mgr.approvals.public_view(rec)
             if is_json:
                 print(json.dumps(view, indent=2))

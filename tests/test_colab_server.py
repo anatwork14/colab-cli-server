@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import io
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -60,9 +61,13 @@ class TestColabServer(unittest.TestCase):
         run.assert_not_called()
 
     def test_approved_run_invokes_official_cli_once(self):
+        def answer_exact_phrase(prompt, **_kwargs):
+            # The phrase carries a per-approval nonce; the operator types exactly what the prompt shows.
+            return re.search(r"type exactly: (ALLOCATE [^\n]*)\n", prompt).group(1)
+
         with mock.patch.object(server.shutil, "which", return_value="/usr/bin/colab"):
             with mock.patch.object(server.sys.stdin, "isatty", return_value=True):
-                with mock.patch("colab_adapter.approval.read_tty_phrase", return_value="ALLOCATE T4"):
+                with mock.patch("colab_adapter.approval.read_tty_phrase", side_effect=answer_exact_phrase):
                     with mock.patch.object(server.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
                         code = server.main(["run", "--gpu", "T4", "--script", str(self.script)])
         self.assertEqual(code, 0)

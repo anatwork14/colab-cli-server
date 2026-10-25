@@ -294,9 +294,9 @@ class ProjectSessionManager:
             max_lease_seconds=lease,
         )
 
-    def approve(self, approval_id: str) -> Dict[str, Any]:
+    def approve(self, approval_id: str, require_stdout_tty: bool = True) -> Dict[str, Any]:
         """Operator step: confirm the pending approval at /dev/tty. Never called by agents."""
-        return self.approvals.approve(approval_id)
+        return self.approvals.approve(approval_id, require_stdout_tty=require_stdout_tty)
 
     def up(
         self,

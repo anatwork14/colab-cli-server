@@ -114,6 +114,10 @@ Start here:
 
 **Approval gate limits (plain language).** The gate stops accidental or agent-initiated Colab allocation through this adapter. Each approval is bound to one exact plan (project, GPU, manifest and workspace contents), a maximum lease, a 15-minute expiry and single use, and it leaves an audit record. It does **not** stop a process that runs as the same OS user: such a process can read the record key, forge or edit records, drive a pseudo-terminal to answer the prompt, run `colab new` directly, or change the code. Direct use of `colab new`, `colab run` and `colab ssh` cannot be gated by this repository. The gate is a safety interlock, not a security boundary. The real boundary is the approver and Colab OAuth in a separate OS account or a protected executor. Until that exists, the operator should run `project up` personally for paid runtimes.
 
+**What the approval fingerprint covers.** The workspace part of the fingerprint hashes every regular file under the project root except `artifacts_local_dir` (default `./artifacts`), the `.colab_experiments` state directory, `*.log` files, `__pycache__`, `*.pyc` and `.git`. Changing any covered file (for example a source file) requires a new approval. Pulling artifacts or writing logs does not, so an existing session can still be reused. `project plan` output is unchanged.
+
+**Global cap and `--no-reuse`.** One managed session is allowed at a time. `project up --no-reuse` while any managed session is live always fails the cap (exit 4) and leaves the approval unconsumed: stop or reconcile the live session first. `colab_server.py run` follows the same cap: it registers a managed record before `colab run`, and the record stops counting toward the cap once the run finishes.
+
 ## Documentation
 
 | Guide | What it covers |
