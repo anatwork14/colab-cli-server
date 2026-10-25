@@ -152,7 +152,7 @@ This wrapper and its documentation are licensed under [MIT](LICENSE). Google's `
 
 ## V2 — VKong-Inspired Project Workspaces and Training Monitor
 
-> **Status:** Colab CLI Server V2 (Milestones M1–M8, Google Drive Durable Storage & Cross-Device Workspaces) was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Post-merge hardening and multi-revision catastrophic recovery (Review `5642047783` F1–F4) are delivered in **Issue #23 (`fix/v2-postmerge-hardening-23`)**. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW`. All human approval gates strictly preserved.
+> **Status:** Colab CLI Server V2 (Milestones M1–M8, Google Drive Durable Storage & Cross-Device Workspaces) was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Post-merge hardening and multi-revision catastrophic recovery (Review `5642047783` F1–F4) are delivered in **Issue #23 (`fix/v2-postmerge-hardening-23`)**. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW pending CI only`. All human approval gates strictly preserved.
 
 The V2 implementation extends the original one-shot adapter into a comprehensive project-centric remote GPU workspace system and real-time training monitor:
 
@@ -289,9 +289,9 @@ A step-by-step operator guide using strictly real, supported CLI commands (`pyth
     chmod 0600 ~/.config/colab-cli/drive_credentials.json
     ```
 16. **Multi-Revision Checkpoint Publishing**:
-    Publish successive training epochs (`model.pt`) to Google Drive; each revision is preserved under immutable `@sha256_<HASH>` identity in `PublicationManifest` v2 with immediate-successor `superseded_by` chain (`A -> B -> C -> D -> E -> None`) and coordinated via two-phase Drive v3 `PATCH`.
+    Publish successive training epochs (`model.pt`) to Google Drive; each revision is preserved under immutable `@sha256_<HASH>` identity in `PublicationManifest` v2 with immediate-successor `superseded_by` chain (`A -> B -> C -> D -> E -> None`). Remote Google Drive custom properties adhere to the strict 124 UTF-8 bytes limit (key + value, max 30 properties, citing [Google Drive API limits of custom file properties](https://developers.google.com/workspace/drive/api/guides/properties#limits_of_custom_file_properties)) enforced via `validate_drive_properties` before every remote write. Drive carries compact schema v2 (`schema: "2"`, `sha256`, `path_sha256`, `is_latest`, `next_sha256`), while legacy keys (`logical_path`, `revision_id`, `project_id`, `run_id`, `superseded_by`) are read-only for backward compatibility and cleaned up on PATCH. Republishing historical revisions is strictly idempotent (no data transfer, no PATCH); explicit rollback is not implemented.
 17. **Historical & Latest Checkpoint Recovery**:
-    Retrieve latest weights via logical path or specific historical checkpoint revision (`@sha256_<HASH>`) with bitwise verification; catastrophic local state loss safely falls back to remote Drive listing with fail-closed integrity checks:
+    Retrieve latest weights via logical path or specific historical checkpoint revision (`@sha256_<HASH>`) with bitwise verification; catastrophic local state loss safely falls back to remote Drive listing with fail-closed integrity checks (ambiguous 0 or >1 remote latest markers raise `DriveIntegrityError` fail-closed):
     ```bash
     python3 -c "from colab_adapter.storage import GoogleDriveArtifactStore, DriveCredentials; store = GoogleDriveArtifactStore(credentials_file='~/.config/colab-cli/drive_credentials.json'); store.retrieve('research-project/<run_id>/checkpoints/model.pt', './model_latest.pt')"
     ```
@@ -308,6 +308,10 @@ A step-by-step operator guide using strictly real, supported CLI commands (`pyth
     python3 -m colab_adapter.cli project reconcile --auto-stop --json
     ```
     Rollback: If network or recovery fails, inspect `transfer_journal.json`, verify hashes, and fall back to local staged checkpoints.
+
+**Testing & Verification Demarcation:**
+- All features and failure recovery modes are verified offline using deterministic mock clients (`OFFLINE_RELEASE_READY`).
+- Real Google Drive and Google Colab environments have never been exercised in this codebase/worktree; live OAuth token exchanges, Drive cloud writes, and remote GPU compute are strictly unauthorized without explicit operator approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 
 **Security & Account Protection:**
 - Poller executes strictly read-only official CLI queries (`colab usage`, `colab sessions`) and **never** provisions cloud VMs.

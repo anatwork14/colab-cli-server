@@ -1,10 +1,10 @@
 # Expected Results, Metrics & Acceptance Matrix — V2
 
-> **Status:** Colab CLI Server V2 (M0–M8 & V2-Drive) was merged into `main` via **PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`)**. Issue #23 (`fix/v2-postmerge-hardening-23`) and Review `5642047783` (F1–F4) deliver post-merge hardening, 5-revision multi-epoch history, two-phase remote coordination, bounded pagination, catastrophic recovery, and comprehensive 21-stage + Section 9 offline E2E verification tests. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW`.
+> **Status:** Colab CLI Server V2 (M0–M8 & V2-Drive) was merged into `main` via **PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`)**. Issue #23 (`fix/v2-postmerge-hardening-23`) and Review `5642047783` (F1–F4) deliver post-merge hardening, 5-revision multi-epoch history, two-phase remote coordination, bounded pagination, catastrophic recovery, and comprehensive 21-stage + Section 9 offline E2E verification tests. Compact schema v2 and revision replay safety enforce Google Drive's 124 UTF-8 bytes custom property limit (https://developers.google.com/workspace/drive/api/guides/properties#limits_of_custom_file_properties) via `validate_drive_properties` pre-write validation, idempotent republish without data transfer or PATCH, and fail-closed ambiguity handling. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW pending CI only`.
 >
 > **Release Categories:**
 > - **`OFFLINE_RELEASE_READY`**: Fully automated offline unit tests, integration tests, mock Drive uploads/downloads, mock Colab sessions, and headless Chromium browser tests passing 100% in CI without cloud credentials or compute charges.
-> - **`LIVE_VALIDATION_REQUIRES_APPROVAL`**: Live cloud GPU allocation and real Google Drive cloud API calls require explicit human operator approval, valid credentials, budget caps, and are executed manually using the smoke-test procedures below. All human approval gates strictly preserved.
+> - **`LIVE_VALIDATION_REQUIRES_APPROVAL`**: Live cloud GPU allocation and real Google Drive cloud API calls require explicit human operator approval, valid credentials, budget caps, and are executed manually using the smoke-test procedures below. All human approval gates strictly preserved. Real Google Drive and Google Colab environments have never been exercised in this codebase or test runs; OAuth and live cloud writes are unauthorized.
 
 ## User-visible outcomes (release G7)
 
@@ -139,6 +139,9 @@ For each claim, add a result row to progress.md:
 | **Q55** | Local artifact retrieval size-mismatch handling | Capturing `actual_size` before unlinking `.part.` temp file so `ArtifactValidationError` is raised deterministically | Confirmed in `test_storage_abstraction.py` | PASS |
 | **Q56** | Controlled Colab HTTP 500 upload recovery | Remote path validation, missing parent directory probe via bounded `exec_code`, and bounded single retry | Confirmed in `test_transports.py` | PASS |
 | **Q57** | Mandatory 21-stage offline V2 research lifecycle & recovery pipeline | Complete 21-stage end-to-end verification passing in offline CI | Confirmed in `test_project_e2e.py` | PASS |
+| **Q58** | Compact schema v2 & 124-byte property limit | 124 UTF-8 bytes limit (https://developers.google.com/workspace/drive/api/guides/properties#limits_of_custom_file_properties) enforced via `validate_drive_properties` pre-write validation; compact schema v2 (`schema`, `sha256`, `path_sha256`, `is_latest`, `next_sha256`); legacy keys read-only compat | Confirmed in `test_drive_metadata_limits.py` & `test_drive_adversarial_review_25.py` | PASS |
+| **Q59** | Revision replay safety & idempotence | Republishing historical revision keeps it historical with 0 new uploads, 0 data transfer, and 0 PATCH requests; interrupted-publish recovery promotes pending file; explicit rollback is not implemented | Confirmed in `test_revision_replay_safety.py` | PASS |
+| **Q60** | Crash-point recovery & fail-closed ambiguity | Crash recovery converges to single latest across crash before demote, after demote, after promote; unversioned recovery with ambiguous 0 or >1 remote latest fails closed with `DriveIntegrityError` | Confirmed in `test_revision_replay_safety.py` & `test_drive_adversarial_review_25.py` | PASS |
 
 ---
 
