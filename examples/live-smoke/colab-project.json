@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "live-smoke",
+    "root": "."
+  },
+  "runtime": {
+    "gpu": "T4",
+    "timeout_seconds": 900,
+    "retain_session": false
+  },
+  "workspace": {
+    "remote_root": "/content/colab-workspaces/live-smoke",
+    "include": [
+      "gpu_probe.py",
+      "train_tiny.py",
+      "workload_manifest.json"
+    ],
+    "exclude": [
+      "artifacts/**",
+      "**/*.pt",
+      "**/*.sha256",
+      "**/*.jsonl"
+    ],
+    "delete_remote": false
+  },
+  "execution": {
+    "entrypoint": "train_tiny.py",
+    "args": [
+      "--steps",
+      "60",
+      "--require-gpu"
+    ]
+  },
+  "artifacts": {
+    "pull": [
+      "artifacts/checkpoints/model.pt",
+      "artifacts/checkpoints/model.pt.sha256"
+    ],
+    "local_dir": "./artifacts"
+  }
+}
