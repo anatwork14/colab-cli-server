@@ -908,9 +908,15 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                         pass
 
             for root, dirs, files in os.walk(run_path):
-                dirs[:] = [d for d in dirs if d not in (".revisions", ".upload_staging", ".staged_uploads")]
+                dirs[:] = [d for d in dirs if d not in (".revisions", ".upload_staging", ".staged_uploads", ".transfer_locks")]
                 for fname in files:
-                    if fname == "manifest.json" or fname.endswith(".tmp") or ".tmp." in fname:
+                    if (
+                        fname in ("manifest.json", "manifest.json.bak")
+                        or fname.endswith(".bak")
+                        or fname.endswith(".tmp")
+                        or ".tmp." in fname
+                        or ".part." in fname
+                    ):
                         continue
                     if ".sha256_" in fname:
                         continue  # Skip internal revision-staged files

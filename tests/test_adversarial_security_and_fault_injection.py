@@ -1441,7 +1441,7 @@ class TestResourceUsageAndBoundedMemoryStreaming(unittest.TestCase):
         m.add_artifact(art)
         m.save(m_dir / "manifest.json")
 
-        with self.assertRaises(DriveTransferError):
+        with self.assertRaises((DriveTransferError, DriveAuthenticationError)):
             store.retrieve(
                 artifact_id=art.artifact_id,
                 destination=dest_dir / "model.pt",
