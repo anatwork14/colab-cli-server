@@ -17,7 +17,7 @@
   7. P2 Controlled Colab HTTP 500 Upload Recovery (validating remote paths, probing whether parent directory is missing via bounded `exec_code`, checking `result["success"]`, and retrying at most once only when missing directory was newly created).
   8. Browser security test host-state isolation & 5-revision (`SHA256 A..E`) multi-process history verification.
   9. Comprehensive 21-stage offline E2E pipeline test and Section 9 5-revision catastrophic manifest loss scenario (`TestV2FullEndToEndPipeline.test_five_revision_history_and_catastrophic_manifest_loss_e2e`) in `tests/test_project_e2e.py`.
-  10. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW`. All human approval gates strictly preserved (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
+  10. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW pending CI only`. All human approval gates strictly preserved (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 - **Account safety:** NO cloud allocations, SSH auto-provision, Drive mount, paid API, GPU spend or unattended deployment authorized or executed during V2 development and testing. Automated test suites run in strictly offline/mock environments (`OFFLINE_RELEASE_READY`); all real cloud operations remain approval-gated (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 
 ## Baseline inventory (evidence from main)
@@ -56,6 +56,44 @@
 For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial, (c) tests run with exact commands and output counts, (d) actual live-VM usage **or explicit none**, (e) observed results vs target values, (f) blockers/risks, (g) next owner. Never mark a milestone COMPLETE merely because the code compiles. Keep this status table consistent with milestones.md.
 
 ### Change log
+- **2026-10-25 — Compact Schema v2, 124-Byte Drive Property Limits & Replay Safety (branch `work/25-e`):**
+  - **Google Drive Custom Property Limit (124 UTF-8 Bytes)**:
+    - Enforces Google Drive's 124 UTF-8 bytes key+value limit (and 30 property count cap) per official specification ([Limits of custom file properties](https://developers.google.com/workspace/drive/api/guides/properties#limits_of_custom_file_properties)).
+    - `validate_drive_properties` is invoked before every remote write (resumable session initialization and metadata PATCH).
+    - Pre-flight rejection: raises typed `DriveTransferError` locally before network requests if any property is oversize or non-string; error messages redact values and report only key names and sizes.
+  - **Compact Schema v2 & Legacy Read-Only Compatibility**:
+    - Replaced legacy properties on Google Drive with compact, fixed-size schema v2:
+      | Property Key | Value | Purpose |
+      | :--- | :--- | :--- |
+      | `schema` | `"2"` | Schema version identifier |
+      | `sha256` | `<64-hex>` | Full content SHA-256 digest of this revision |
+      | `path_sha256` | `<64-hex>` | Deterministic SHA-256 of UTF-8 `{project_id}/{run_id}/{logical_path}` |
+      | `is_latest` | `"true"` \| `"false"` | Remote latest revision head pointer |
+      | `next_sha256` | `<64-hex>` (optional) | Content digest of immediate successor (superseded historical revisions only) |
+    - Legacy properties (`logical_path`, `revision_id`, `project_id`, `run_id`, `superseded_by`) are supported read-only for backward compatibility and stripped via `None` on remote PATCH.
+    - Remote custom properties serve as hints; downloaded content is always independently verified by streaming SHA-256 byte hashing.
+  - **Canonical Local Identity in PublicationManifest**:
+    - Full canonical artifact IDs (`{project_id}/{run_id}/{logical_path}@sha256_{full_sha256}`) live exclusively in `PublicationManifest` (persisted in `manifest.json` and `manifest.json.bak` with mode `0600`).
+    - Local `superseded_by` is the full canonical ID reconstructed from project/run/path + `next_sha256`.
+  - **Unicode & Long-Path Safety**:
+    - Logical paths of arbitrary length or multi-byte Unicode characters are hashed via deterministic UTF-8 SHA-256 into `path_sha256` (fixed 64 hex characters), guaranteeing zero property overflow on Drive.
+  - **Replay Semantics & Idempotence**:
+    - New revision: Resumable upload (`is_latest="false"`), authoritative verification, demote prior (`next_sha256=new_sha`), promote new (`is_latest="true"`).
+    - Idempotent republish: Republishing a historical revision keeps it historical (`is_latest="false"`). Executes **0 new upload sessions, 0 data transfers, and 0 PATCH requests**.
+    - Interrupted-publish recovery: Revisions left in `pending` state after upload are coordinated and promoted on retry.
+    - Explicit rollback: **NOT implemented** (republishing an older revision never moves the latest pointer backward).
+  - **Remote Coordination & Crash-Point Recovery**:
+    - Tested crash-point recovery: (1) crash before demotion, (2) crash after demotion before promotion, and (3) crash after promotion before manifest save. All scenarios converge to a single verified latest revision on retry.
+    - Unversioned retrieval ambiguity (0 or >1 remote revisions marked `is_latest="true"`) fails closed with `DriveIntegrityError`.
+  - **Test Evidence**:
+    - `tests/test_drive_metadata_limits.py`: 124 vs 125 byte boundary, non-string rejection, 30 property count cap, multi-byte Unicode, long paths, Strict124ByteRejectingMockDriveClient rejection (HTTP 400).
+    - `tests/test_revision_replay_safety.py`: Test A (republish historical revision issues 0 uploads and 0 PATCHes), Test B (manifest loss with journal recovery), Test C (manifest and journal loss with Drive discovery), Test D (crash-point recovery before demote / before promote / before manifest save), Test E (concurrent retries).
+    - `tests/test_drive_adversarial_review_25.py`: StrictDriveMock 124-byte enforcement reproducing legacy 136-byte `superseded_by` failure shape, A->B->C publication under strict limits, fail-closed unversioned ambiguity.
+  - **Testing & Cloud Safety Demarcation**:
+    - All test suites execute 100% offline using deterministic mock clients (`OFFLINE_RELEASE_READY`).
+    - Real Google Drive and Google Colab environments have never been exercised in this worktree or automated tests; live OAuth credentials, Drive cloud writes, and remote GPU compute are unauthorized (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
+  - **Status**: `READY_FOR_INDEPENDENT_MERGE_REVIEW pending CI only`.
+  - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 live Drive API calls made; `OFFLINE_RELEASE_READY`).
 - **2026-10-25 — Review 5642047783 Resolution (F1–F4) & Section 9 E2E Verification (branch `work/24-e-e2e-docs`):**
   - **F1 Canonical Versioned Revision Identity & Accessors (`PublicationManifest` v2)**:
     - Formalized canonical string artifact IDs: `{project_id}/{run_id}/{logical_path}@sha256_{FULL_SHA256}`.
@@ -75,7 +113,7 @@ For every PR, record: (a) date and branch/commit, (b) tasks finished vs partial,
   - **E2E Pipeline Test in `tests/test_project_e2e.py`**:
     - Added `TestV2FullEndToEndPipeline.test_five_revision_history_and_catastrophic_manifest_loss_e2e` exercising all 5 steps: project init, 5-revision publication, manifest v2 verification, backup recovery after `manifest.json` deletion, catastrophic loss recovery with fresh store/journal, exact byte-for-byte retrieval of all 5 revisions, unversioned latest retrieval, remote split-brain `DriveIntegrityError`, and idempotent re-publication.
     - Test execution: `python3 -m unittest tests/test_project_e2e.py -v` -> **11/11 tests pass in 6.08s**.
-    - Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW`.
+    - Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW pending CI only`.
     - **ACTUAL LIVE VM USAGE: NONE** (0 compute units consumed, 0 remote VMs allocated, 0 cloud spend; `OFFLINE_RELEASE_READY`).
 - **2026-10-25 — Issue #23 Resolution: Post-Merge Hardening, Security Isolation & 21-Stage E2E Pipeline (branch `fix/v2-postmerge-hardening-23`):**
   - **P1 Verified Google Drive Recovery (`colab_adapter/storage/google_drive.py`)**:

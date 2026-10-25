@@ -236,35 +236,97 @@ When loading older `manifest_version: 1` files where `artifacts` keys lacked `@s
 - Headless Chromium/Playwright test suites execute in CI against loopback `MonitorServer` instances.
 - Verifies that `#artifacts-table` displays `LATEST` (green badge) for current revisions and `HISTORICAL` (neutral badge) for superseded revisions, with zero `.innerHTML` and strict CSP nonce enforcement.
 
-### 7. Two-Phase Remote `is_latest` Coordination Protocol (Drive v3 `PATCH`)
+### 7. Google Drive Custom Property Limit (124 UTF-8 Bytes) & Compact Schema v2
+
+Google Drive imposes a hard limit on custom file properties (`appProperties`):
+- **124 UTF-8 bytes limit**: Each property key and value combined must not exceed 124 UTF-8 bytes (see [Google Drive API limits of custom file properties](https://developers.google.com/workspace/drive/api/guides/properties#limits_of_custom_file_properties)).
+- **Property count cap**: At most 30 custom properties per file.
+
+Storing full canonical artifact IDs (e.g., `superseded_by: vision-research/experiment-001/checkpoints/model.pt@sha256_<64hex>`) consumed 136 UTF-8 bytes (13 bytes key + 123 bytes value), provoking HTTP 400 Bad Request rejection from the Drive API.
+
+To guarantee compliance, Google Drive Artifact Storage V2 implements a strict separation:
+- **Canonical local identity in `PublicationManifest`**: Full canonical artifact IDs (`{project_id}/{run_id}/{logical_path}@sha256_{full_sha256}`) live exclusively in the local `PublicationManifest` (persisted in `manifest.json` and `manifest.json.bak` with mode `0600`). Local `superseded_by` stores the full canonical successor ID.
+- **Compact Schema v2 on Drive**: Remote Drive objects carry only compact, fixed-size properties:
+
+| Property Key | Value Format | Size (key + value) | Description |
+| :--- | :--- | :--- | :--- |
+| `schema` | `"2"` | 7 bytes | Compact metadata schema version |
+| `sha256` | `<64-hex>` | 70 bytes | Full content SHA-256 digest of this revision (never truncated, lowercased) |
+| `path_sha256` | `<64-hex>` | 75 bytes | SHA-256 hex digest of the UTF-8 logical artifact ID (`{project_id}/{run_id}/{logical_path}`) |
+| `is_latest` | `"true"` \| `"false"` | 14 bytes | Remote head revision marker |
+| `next_sha256` | `<64-hex>` (optional) | 75 bytes | Content digest of immediate successor (present only on superseded historical revisions) |
+
+- **Successor Canonical ID Reconstruction**: When reading remote properties, the full canonical successor ID is reconstructed deterministically from the known project, run, and logical path plus `next_sha256`:
+  `canonical_successor_id = f"{project_id}/{run_id}/{logical_path}@sha256_{next_sha256}"`
+- **Legacy Read-Only Compatibility**: Pre-v2 legacy properties (`logical_path`, `revision_id`, `project_id`, `run_id`, `superseded_by`) are parsed when inspecting older files (`successor_sha256()`, `props_match_path()`) but are **never written** for new revisions. When demoting or promoting files remotely, any existing legacy keys are explicitly deleted by setting their values to `None` in the Drive v3 `PATCH` body.
+- **Pre-Flight Validation**: `validate_drive_properties` is executed before *every* remote write (resumable session initialization and metadata PATCH). Any property set exceeding limits is rejected locally with `DriveTransferError` before network dispatch. Error messages report only the offending key and byte lengths, strictly redacting property values.
+- **Unicode & Long-Path Safety**: Long nested directory structures and multi-byte Unicode paths are bound collision-safely via `path_sha256` (64 hex characters), ensuring total property size never exceeds 75 bytes regardless of path length or character set.
+- **Content Verification Over Metadata Hints**: Remote properties are treated strictly as metadata hints. Content integrity is always verified by downloading the bytes and hashing them independently (`alt=media`), never trusting property values blindly.
+
+### 8. Two-Phase Remote `is_latest` Coordination Protocol & Replay Safety
+
 To prevent race conditions, split-brain `is_latest` states, or premature promotion of unverified files, `GoogleDriveArtifactStore` coordinates remote revision state via a strict two-phase protocol:
 
 ```text
 Phase 1: Resumable Upload with is_latest="false"
   Local File (model.pt) ---> Drive Resumable Upload Session
                             appProperties: {
-                              is_latest: "false",
+                              schema: "2",
                               sha256: <HASH_NEW>,
-                              revision_id: "sha256_<HASH_NEW>",
-                              logical_path: "checkpoints/model.pt"
+                              path_sha256: <PATH_HASH>,
+                              is_latest: "false"
                             }
                             ↓
                      Content Verification (size + MD5 / SHA256 readback)
 
 Phase 2: Atomic Remote Coordination via Drive v3 PATCH
   1. Demote Prior Revisions:
-     For each remote file with matching logical_path claiming is_latest="true":
+     For each remote file matching path_sha256 claiming is_latest="true":
        PATCH /drive/v3/files/<prior_id>
-       appProperties: { is_latest: "false", superseded_by: "sha256_<HASH_NEW>" }
+       appProperties: {
+         is_latest: "false",
+         next_sha256: <HASH_NEW>,
+         logical_path: null,
+         revision_id: null,
+         superseded_by: null
+       }
   2. Promote New Revision:
      PATCH /drive/v3/files/<new_id>
-     appProperties: { is_latest: "true", superseded_by: null }
+     appProperties: {
+       is_latest: "true",
+       logical_path: null,
+       revision_id: null,
+       superseded_by: null
+     }
 ```
 
-- **Fail-Safe Invariant**: If an upload crashes, times out, or fails integrity verification during Phase 1, it remains marked `is_latest="false"`. It will never be picked up as the active latest revision.
-- **Single Active Remote Latest**: Prior revisions are demoted before the new revision is promoted to `is_latest="true"`. At no point in steady-state operations can two remote files validly claim `is_latest="true"`.
+#### Replay Semantics Matrix
 
-### 8. Bounded Pagination & Strict Listing Error Classification
+The publish pipeline enforces strict replay safety across all invocation scenarios:
+
+| Scenario | Trigger / Initial State | Publish Action | Remote Drive State | Local Manifest State |
+| :--- | :--- | :--- | :--- | :--- |
+| **New Revision** | New content SHA-256 published for logical path (e.g. Epoch B after A). | Uploads new file (`is_latest="false"`), verifies size/checksums, demotes prior revision (`next_sha256=sha_B`), promotes new revision (`is_latest="true"`). | Both remote files preserved; old file is historical (`is_latest="false"`), new file is latest (`is_latest="true"`). | Both revisions recorded; old has `superseded_by=canonical_id(B)`, new has `is_latest=True`, `latest_by_path` points to B. |
+| **Idempotent Republish** | Existing historical revision re-published (e.g. republishing Revision A while B is latest). | Detected via manifest, journal, or remote file inspection (`_remote_revision_state` = `historical`). Historical revision stays historical. **0 new upload sessions, 0 bytes transferred, 0 Drive PATCH requests**. | Unchanged. B remains remote latest (`is_latest="true"`). A remains historical (`is_latest="false"`). | Manifest preserves B as latest (`latest_by_path` unchanged). A recorded as historical (`is_latest=False`). Returns stored artifact for A. |
+| **Interrupted-Publish Recovery** | Previous publish crashed after upload/verify but before coordination (`_remote_revision_state` = `pending`). | Replay detects pending remote revision; coordinates latest pointer (`_coordinate_remote_latest_revision`) to demote prior revisions and promote pending file to `is_latest="true"`. | Pending remote file promoted to latest (`is_latest="true"`), prior demoted (`is_latest="false"`). Zero duplicate files created. | Manifest updated with published revision as latest. |
+| **Explicit Rollback** | User desires to revert logical latest pointer to earlier revision A. | **NOT implemented**. Re-publishing A is strictly idempotent and does NOT demote B. (To make A the new latest, user must publish it under a new timestamp or new revision). | Historical revisions remain historical. | Head pointer is not moved backward by replay. |
+
+#### Crash-Point Recovery Matrix
+
+| Crash Point | Remote Drive State at Crash | Recovery Action on Publish Retry | Converged Final State |
+| :--- | :--- | :--- | :--- |
+| **Crash before demotion** (Upload succeeded with `is_latest="false"`, crash before PATCH demoting old) | Old file has `is_latest="true"`; new file has `is_latest="false"` (pending state). | Retry detects matching file in journal/remote; invokes `_coordinate_remote_latest_revision`, demotes old file, promotes new file. | Old file demoted (`is_latest="false"`), new file promoted (`is_latest="true"`), single latest. |
+| **Crash after demotion before promotion** (Old file demoted to `is_latest="false"`, crash before PATCH promoting new file) | Old file has `is_latest="false"`; new file has `is_latest="false"` (0 files marked latest remotely). | Retry detects new file is `pending`; `publish()` calls `_coordinate_remote_latest_revision`, promoting new file to `is_latest="true"`. | Old file demoted, new file promoted (`is_latest="true"`), single latest. |
+| **Crash after promotion before manifest save** (Both demote and promote PATCHes succeeded remotely, crash before saving `manifest.json`) | Remote has new file as `is_latest="true"`, old as `is_latest="false"`; local manifest missing new record. | Retry detects remote file already latest; registers new artifact in manifest, saves manifest atomically with backup `.json.bak`. | Single latest on Drive and in manifest; no duplicate upload. |
+
+#### Fail-Closed Ambiguity Handling on Recovery
+
+During unversioned recovery when the local manifest and journal are both unavailable:
+- **0 latest remote files**: If no remote revision has `is_latest="true"`, retrieval fails closed with `DriveIntegrityError` (`"Ambiguous unversioned Drive recovery: no remote revision marked latest found..."`) unless `allow_unverified_recovery=True` on a single file with authoritative MD5 and size.
+- **>1 latest remote files**: If multiple remote revisions claim `is_latest="true"`, retrieval fails closed with `DriveIntegrityError` (`"Ambiguous unversioned Drive recovery: multiple (...) remote revisions marked latest exist..."`).
+- **Missing/Invalid SHA-256**: If the latest candidate lacks a valid 64-hex SHA-256 property, retrieval fails closed with `DriveIntegrityError`.
+
+### 9. Bounded Pagination & Strict Listing Error Classification
 When querying Google Drive folders (e.g. during recovery, file discovery, or duplicate checks):
 
 - **Bounded Pagination Controls**:
@@ -321,17 +383,17 @@ The Google Drive durable artifact storage engine was merged into `main` via **PR
 
 Post-merge hardening delivered under **Issue #23 (`fix/v2-postmerge-hardening-23`)** and **Review `5642047783` (F1–F4)** includes:
 - **F1 Canonical Versioned Revision Identity & Accessors**: Canonical string IDs (`{project_id}/{run_id}/{logical_path}@sha256_{FULL_SHA256}`), immediate-successor `superseded_by` chain (`A -> B -> C -> D -> E -> None`), and typed accessors `get_latest_artifact()`, `get_latest_revision_id()`, `get_latest_sha256()`.
-- **F2 Two-Phase Remote Coordination Protocol**: Drive upload with `is_latest="false"`, content verification, demote prior revisions via Drive v3 `PATCH`, promote new revision to `is_latest="true"` via `PATCH`.
+- **F2 Two-Phase Remote Coordination Protocol**: Drive upload with `is_latest="false"`, content verification, demote prior revisions via Drive v3 `PATCH` (setting `next_sha256` and clearing legacy keys), promote new revision to `is_latest="true"` via `PATCH`. Compact schema v2 adheres strictly to the 124 UTF-8 bytes custom property limit (https://developers.google.com/workspace/drive/api/guides/properties#limits_of_custom_file_properties).
 - **F3 Bounded Pagination & Strict Error Classification**: `pageSize=100`, bounded `max_list_pages=50`, `max_list_candidates=5000`, loop detection via visited ID tracking, and strict error classification (never returning `[]` on HTTP 401/403/429/5xx or network errors).
 - **F4 Catastrophic Loss Recovery Matrix**: Unversioned latest recovery via single verified remote `is_latest="true"` marker; fail-closed `DriveIntegrityError` when 0 or >1 remote revisions claim `is_latest="true"`; fail-closed `DriveTransferError` / `DriveAuthenticationError` / `DriveQuotaExceededError` on remote listing faults.
 - **P1 Private Checkpoint Staging**: `0700` staging directories, `0600` temporary/staged files with `fsync`, symlink/special-file rejection, canonical staging-root containment validation.
 - **P2 Local Artifact Retrieval Size-Mismatch Error Handling**: Capturing `actual_size` before unlinking `.part.` temp file so `ArtifactValidationError` is always raised instead of `FileNotFoundError`.
 - **P2 Controlled Colab HTTP 500 Upload Recovery**: Validating remote paths, probing missing parent directories via bounded `exec_code`, and retrying at most once if newly created.
 - **Mandatory Offline E2E Pipeline Verification**: Full lifecycle pass in `tests/test_project_e2e.py` including the 5-revision history & catastrophic manifest loss scenario (`test_five_revision_history_and_catastrophic_manifest_loss_e2e`).
-- **Review Status**: `READY_FOR_INDEPENDENT_MERGE_REVIEW`.
+- **Review Status**: `READY_FOR_INDEPENDENT_MERGE_REVIEW pending CI only`.
 
 > [!NOTE]
-> All automated tests execute in strictly offline/mock environments (`OFFLINE_RELEASE_READY`). Any live cloud GPU allocation or live Google Drive API requests require explicit human operator approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
+> All automated tests execute in strictly offline/mock environments (`OFFLINE_RELEASE_READY`). Real Google Drive and Google Colab environments have never been exercised in this codebase or test runs; live cloud GPU allocations, OAuth credentials, and live Drive writes are strictly unauthorized without explicit human operator approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
 
 ## Human-Approval-Gated Live Smoke-Test Procedures
 
