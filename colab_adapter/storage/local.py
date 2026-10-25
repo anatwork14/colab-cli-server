@@ -62,7 +62,7 @@ class LocalArtifactStore:
 
     def _load_manifest(self, project_id: str, run_id: str) -> PublicationManifest:
         m_path = self._get_manifest_path(project_id, run_id)
-        if m_path.exists():
+        if m_path.exists() or Path(str(m_path) + ".bak").exists():
             return PublicationManifest.load(m_path)
         return PublicationManifest(project_id=project_id, run_id=run_id)
 
@@ -76,10 +76,22 @@ class LocalArtifactStore:
         expected_sha256: Optional[str] = None,
     ) -> StoredArtifact:
         """Publish a local file into the store idempotently."""
-        src = Path(source).resolve()
-        if not src.is_file():
+        raw_src = Path(source)
+        if raw_src.is_symlink():
             raise ArtifactValidationError(
-                f"Source file to publish does not exist: {src}",
+                f"Source cannot be a symlink: {source}",
+                details={"source": str(source)},
+            )
+        if not raw_src.exists() or not raw_src.is_file():
+            raise ArtifactValidationError(
+                f"Source file to publish does not exist or is not a regular file: {source}",
+                details={"source": str(source)},
+            )
+
+        src = raw_src.resolve()
+        if src.is_symlink() or not src.is_file():
+            raise ArtifactValidationError(
+                f"Source file to publish is not a regular file: {src}",
                 details={"source": str(src)},
             )
 
@@ -115,14 +127,35 @@ class LocalArtifactStore:
 
         # Revision file destination inside content-addressed .revisions/<sha16>/ directory
         # so Path(rev_dest_file).name remains target_filename while never overwriting prior revisions.
-        rev_dest_dir = dest_dir / ".revisions" / src_sha256[:16]
+        revs_base_dir = dest_dir / ".revisions"
+        revs_base_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(revs_base_dir, 0o700)
+        except OSError:
+            pass
+
+        rev_dest_dir = revs_base_dir / src_sha256[:16]
         rev_dest_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(rev_dest_dir, 0o700)
+        except OSError:
+            pass
+
         rev_dest_file = rev_dest_dir / target_filename
 
-        # Write immutable revision file via atomic copy
+        # Write immutable revision file via atomic copy with 0600 mode and fsync
         tmp_rev = rev_dest_dir / f"{target_filename}.rev.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-        shutil.copy2(src, tmp_rev)
         try:
+            fd_rev = os.open(str(tmp_rev), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with open(fd_rev, "wb") as f_out, open(src, "rb") as f_in:
+                shutil.copyfileobj(f_in, f_out)
+                f_out.flush()
+                os.fsync(f_out.fileno())
+            try:
+                os.chmod(tmp_rev, 0o600)
+            except OSError:
+                pass
+
             verify_sha = compute_file_sha256(tmp_rev)
             if verify_sha.lower() != src_sha256.lower():
                 raise ArtifactValidationError(
@@ -130,6 +163,10 @@ class LocalArtifactStore:
                     details={"file": target_filename, "expected": src_sha256, "actual": verify_sha},
                 )
             os.replace(str(tmp_rev), str(rev_dest_file))
+            try:
+                os.chmod(rev_dest_file, 0o600)
+            except OSError:
+                pass
         finally:
             if tmp_rev.exists():
                 try:
@@ -137,11 +174,23 @@ class LocalArtifactStore:
                 except OSError:
                     pass
 
-        # Also copy to latest_dest_file so caller checking unversioned path finds latest file
+        # Also copy to latest_dest_file with 0600 mode and fsync so caller checking unversioned path finds latest file
         tmp_latest = dest_dir / f"{target_filename}.latest.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-        shutil.copy2(rev_dest_file, tmp_latest)
         try:
+            fd_latest = os.open(str(tmp_latest), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with open(fd_latest, "wb") as f_out, open(rev_dest_file, "rb") as f_in:
+                shutil.copyfileobj(f_in, f_out)
+                f_out.flush()
+                os.fsync(f_out.fileno())
+            try:
+                os.chmod(tmp_latest, 0o600)
+            except OSError:
+                pass
             os.replace(str(tmp_latest), str(latest_dest_file))
+            try:
+                os.chmod(latest_dest_file, 0o600)
+            except OSError:
+                pass
         finally:
             if tmp_latest.exists():
                 try:
@@ -193,43 +242,92 @@ class LocalArtifactStore:
                 details={"artifact_id": artifact_id, "path": str(stored_path)},
             )
 
-        dest = Path(destination).resolve()
+        if stored_path.is_symlink() or not stored_path.is_file():
+            raise ArtifactValidationError(
+                f"Stored artifact path is invalid or a symlink: {stored_path}",
+                details={"artifact_id": artifact_id, "path": str(stored_path)},
+            )
+
+        dest_raw = Path(destination)
+        if dest_raw.is_symlink():
+            raise ArtifactValidationError(
+                f"Destination cannot be a symlink: {destination}",
+                details={"destination": str(destination)},
+            )
+
+        dest = dest_raw.resolve()
         if dest.is_dir():
             filename = Path(meta.logical_path).name if meta.logical_path else Path(meta.path).name
             dest = dest / filename
 
+        if dest.is_symlink():
+            raise ArtifactValidationError(
+                f"Resolved destination cannot be a symlink: {dest}",
+                details={"destination": str(dest)},
+            )
+
         dest.parent.mkdir(parents=True, exist_ok=True)
         part_file = dest.parent / f"{dest.name}.part.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-        shutil.copy2(meta.path, part_file)
+        try:
+            fd_part = os.open(str(part_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with open(fd_part, "wb") as f_out, open(meta.path, "rb") as f_in:
+                shutil.copyfileobj(f_in, f_out)
+                f_out.flush()
+                os.fsync(f_out.fileno())
+            try:
+                os.chmod(part_file, 0o600)
+            except OSError:
+                pass
 
-        # Verify size
-        if meta.size_bytes is not None and part_file.stat().st_size != meta.size_bytes:
+            actual_size = part_file.stat().st_size
+            # Verify size
+            if meta.size_bytes is not None and actual_size != meta.size_bytes:
+                if part_file.exists():
+                    try:
+                        part_file.unlink()
+                    except OSError:
+                        pass
+                raise ArtifactValidationError(
+                    f"Retrieved artifact size mismatch: recorded {meta.size_bytes}, actual {actual_size}",
+                    details={
+                        "artifact_id": artifact_id,
+                        "recorded_size": meta.size_bytes,
+                        "actual_size": actual_size,
+                        "expected_size": meta.size_bytes,
+                    },
+                )
+
+            # Verify integrity on retrieval (expected_sha256 or recorded meta.sha256)
+            target_sha = expected_sha256 or meta.sha256
+            retrieved_hash = compute_file_sha256(part_file)
+            if target_sha and retrieved_hash.lower() != target_sha.lower():
+                if part_file.exists():
+                    try:
+                        part_file.unlink()
+                    except OSError:
+                        pass
+                raise ArtifactValidationError(
+                    f"Retrieved artifact hash mismatch: recorded {target_sha}, actual {retrieved_hash}",
+                    details={
+                        "artifact_id": artifact_id,
+                        "recorded": target_sha,
+                        "actual": retrieved_hash,
+                        "expected": target_sha,
+                    },
+                )
+
+            os.replace(str(part_file), str(dest))
+            try:
+                os.chmod(dest, 0o600)
+            except OSError:
+                pass
+            return dest
+        finally:
             if part_file.exists():
                 try:
                     part_file.unlink()
                 except OSError:
                     pass
-            raise ArtifactValidationError(
-                f"Retrieved artifact size mismatch: recorded {meta.size_bytes}, actual {part_file.stat().st_size}",
-                details={"artifact_id": artifact_id, "recorded_size": meta.size_bytes, "actual_size": part_file.stat().st_size},
-            )
-
-        # Verify integrity on retrieval (expected_sha256 or recorded meta.sha256)
-        target_sha = expected_sha256 or meta.sha256
-        retrieved_hash = compute_file_sha256(part_file)
-        if target_sha and retrieved_hash.lower() != target_sha.lower():
-            if part_file.exists():
-                try:
-                    part_file.unlink()
-                except OSError:
-                    pass
-            raise ArtifactValidationError(
-                f"Retrieved artifact hash mismatch: recorded {target_sha}, actual {retrieved_hash}",
-                details={"artifact_id": artifact_id, "recorded": target_sha, "actual": retrieved_hash},
-            )
-
-        os.replace(str(part_file), str(dest))
-        return dest
 
     def exists(self, artifact_id: str) -> bool:
         meta = self.get_metadata(artifact_id)
@@ -284,7 +382,7 @@ class LocalArtifactStore:
 
         results = []
         for r_dir in sorted(proj_dir.iterdir()):
-            if r_dir.is_dir() and (r_dir / "manifest.json").exists():
+            if r_dir.is_dir() and ((r_dir / "manifest.json").exists() or (r_dir / "manifest.json.bak").exists()):
                 m = PublicationManifest.load(r_dir / "manifest.json")
                 results.extend(m.list_artifacts(include_history=include_history))
         return results
