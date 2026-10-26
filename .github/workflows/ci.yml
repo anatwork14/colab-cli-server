@@ -45,10 +45,22 @@ jobs:
         run: |
           npm init -y
           npm install playwright-core@1.51.0
-          npx playwright install --with-deps chromium
+          npx --no-install playwright-core install --with-deps chromium
           node -e "const pw = require('playwright-core'); console.log('Chromium path:', pw.chromium.executablePath());"
       - name: Run real headless Chromium security suite
         env:
           COLAB_REQUIRE_BROWSER_TESTS: "1"
         run: |
           python -m unittest tests/test_browser_xss_and_cross_process_qa.py -v
+      - name: Verify industrial theme in real Chromium (offline fixtures)
+        env:
+          COLAB_REQUIRE_BROWSER_TESTS: "1"
+        run: python -m unittest tests/test_industrial_theme_browser.py -v
+      - name: Attach non-secret theme screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-industrial-themes
+          path: artifacts/monitor-*.png
+          if-no-files-found: ignore
+          retention-days: 7
