@@ -134,7 +134,7 @@ API requests: 88 of the 150 cap (42 list, 12 get, 9 download, 9 patch, 6 folder 
 Resources: one session, about 2 minutes. Account-wide balance 186.75 to 186.74 CU (display rounds to 0.01; an account-wide delta, not per-job billing). No GPU run was started outside the plan.
 
 ### 7.4 Cleanup of the Drive test data
-Authorized by the owner. The root folder could not be trashed with the narrow token: Drive answered 403 `appNotAuthorizedToChild` even after every item inside it was trashed. All 11 items under the root (5 files, 5 sub-folders, plus the `projects` tree) were moved to Trash (reversible); the empty root folder `colab-live-smoke-20261026T003700Z-ea2fb8` remains and must be removed by the owner in the Drive web UI. A broader-scope token was deliberately not used. Finding: with a `drive.file` token, trashing the harness root folder fails; the harness's cleanup plan should say so.
+Authorized by the owner. The root folder could not be trashed with the narrow token: Drive answered 403 `appNotAuthorizedToChild` even after every item inside it was trashed. All 10 items under the root (5 files and the 5 nested folders `projects`, `colab-live-smoke`, `runs`, `run-001`, `checkpoints`) were moved to Trash (reversible); the empty root folder `colab-live-smoke-20261026T003700Z-ea2fb8` remains and must be removed by the owner in the Drive web UI. A broader-scope token was deliberately not used. Finding: with a `drive.file` token, trashing the harness root folder fails; the harness's cleanup plan should say so.
 
 ### 7.5 Not run / unverified
 - Guard deadline drill (optional G7): not run; the guard's own deadline stop has never been observed on real Colab. Only the manual verified stop was exercised.
