@@ -7,17 +7,17 @@ Status: **LIVE RESULTS RECORDED IN SECTION 7 (2026-10-26); the table in Section 
 | Field | Value |
 |---|---|
 | Repository | colab-cli-server |
-| Base commit (tested) | `f4c9ee52c90312bde744c07614620250e7a44bc4` (main, "Merge PR #24: V2 storage, recovery, security and monitor hardening") |
-| Commit containing this record | `<TO BE FILLED: SHA of the docs(live) commit that adds this file>` |
+| Base commit (tested) | live Drive, T4, guard and second-device monitor tests ran on `3a62c9b291f755e06533756eba590dcd4d3ea094` (main after PR #28); the template was originally written against `f4c9ee52c90312bde744c07614620250e7a44bc4`. PR #32 (monitor fixes) merged afterwards and was **not** retested live. Assessment commit: `94e3fbebed07fcdf2563e99c180f2d3244fe2af0` (post-merge CI run 40256494607: 3.8, 3.12, 3.13 and browser-security success) |
+| Commit containing this record | the merge commit of the PR that contains this file (see `git log -- docs/live/LIVE_TEST_EVIDENCE.md`) |
 | Record date (initial) | 2026-10-25 |
-| Live test date(s) | `<TO BE FILLED>` |
-| Host OS | `<TO BE FILLED: uname -a output, sanitized>` |
-| Python version | `<TO BE FILLED>` |
+| Live test date(s) | 2026-10-26 (UTC) |
+| Host OS | Ubuntu 20.04.6 LTS, Linux 5.4 x86_64 (headless) |
+| Python version | 3.8.10 (host); remote runtime 3.13.16 |
 | Colab CLI version | 0.7.5 (observed; see Section 4) |
-| Repo CLI version | `<TO BE FILLED>` |
-| Reviewer(s) | `<TO BE FILLED: independent engineer>` |
-| Owner signoff | `<TO BE FILLED>` |
-| Opus signoff | `<TO BE FILLED>` |
+| Repo CLI version | `python3 -m colab_adapter.cli` at the commits above |
+| Reviewer(s) | independent merge reviews on PRs #24 and #28 (GitHub reviews); Opus 5.5 independent evidence assessment, 2026-10-26 |
+| Owner signoff | Signed by the owner on 2026-10-26, in chat: "Correct, I sign", on the verdict `LIVE_SUCCESS_PATH_VERIFIED_WITH_LIMITATIONS` and the limitations in Section 7.11. The owner's cleanup items (delete both leftover Drive roots after inspecting them, delete the throwaway monitor token files, confirm no active Colab runtime) were **not confirmed done** at signing and remain pending. |
+| Opus signoff | Independent read-only assessment 2026-10-26: `LIVE_SUCCESS_PATH_VERIFIED_WITH_LIMITATIONS` (not production readiness; not failure-path verification). Opus verified the saved evidence offline and did not contact any cloud service. |
 
 ## 2. Rules
 
@@ -76,7 +76,7 @@ Exactly one of the following verdicts applies. Record it here only after all row
 | BLOCKED_BY_TECHNICAL_ISSUE | A technical problem (defect, environment, service error) prevents a required test from completing. |
 | CLOUD_RESOURCE_CLEANUP_REQUIRED | Cloud resources (Colab sessions, Drive files) remain that were not intended, or teardown could not be verified. |
 
-Current verdict: `<TO BE FILLED>` (no live test has been executed at the time of this template).
+Current verdict: `LIVE_SUCCESS_PATH_VERIFIED_WITH_LIMITATIONS` (2026-10-26; see Section 7.11). This is **not** `LIVE_INTEGRATION_VERIFIED`: PASS criteria 3 and 5 are met only for the success path, and the failure paths, a single continuous GPU-to-Drive run and a post-#32 live monitor retest are still missing.
 
 ### PASS criteria (all required for LIVE_INTEGRATION_VERIFIED)
 
@@ -140,7 +140,7 @@ Authorized by the owner. The root folder could not be trashed with the narrow to
 - Guard deadline drill (G7): see Section 7.8 (run later the same day and passed on the success path).
 - Failure paths on real Colab (nonzero `new`, orphan runtime, `[?]` line, "not found" stop): not exercised; they remain offline-verified only.
 - Cross-device monitoring: see Section 7.9 (run later the same day and passed).
-- Integrated workflow (checkpoint to Drive after GPU): not run.
+- Integrated workflow: only the narrower step in Section 7.10 was run (publish from the saved copy after teardown); a single continuous GPU-to-Drive run was not.
 - V1 `run`/`submit_job` and `colab_server.py run`: not covered and not safe-by-design for live use (known gap in PR #28).
 - Provisioning under load, long-running exec output limits, and usage-count lag were not characterized.
 
@@ -178,7 +178,7 @@ Setup: read-only monitor started on the host bound to `127.0.0.1:8080` only (a l
 | No secrets in responses or monitor log | PASS | checker e1/e2 on both runs; host grep of the monitor log for token/secret patterns and the token value: 0 matches |
 | Monitor stopped | PASS | process gone, port 8080 closed |
 
-Findings (issue #31, not fixed): the account-usage collector is never started (`poll_once` has no caller), so the panel shows DEGRADED / Samples 0 / Never / CU balance Unavailable; "Active Assignments: 0" is shown when the value is null; Drive status shows PENDING when no publication is recorded; the session table lists all 202 TERMINATED sessions without pagination; the run table shows the last of two step-60 loss events (0.0878 then `FINAL_LOSS` 0.0735).
+Findings (issue #31; fixed afterwards by PR #32, merged and NOT retested live): the account-usage collector is never started (`poll_once` has no caller), so the panel shows DEGRADED / Samples 0 / Never / CU balance Unavailable; "Active Assignments: 0" is shown when the value is null; Drive status shows PENDING when no publication is recorded; the session table lists all 202 TERMINATED sessions without pagination; the run table shows the last of two step-60 loss events (0.0878 then `FINAL_LOSS` 0.0735).
 
 Limits: this validates the SSH-tunnel path and the monitor's authentication and read-only behaviour from a second device. It does not validate public exposure, TLS or a reverse proxy, display of more than one checkpoint revision, or the live collector. The data was seeded from the recorded G5 output rather than streamed by a running job, so "telemetry matches the executed workload" is verified against a recorded run.
 
@@ -198,3 +198,20 @@ Scope (stated narrowly): this joins two separately verified live pieces. The 3,1
 API requests: 32 (19 list, 6 folder create, 2 get, 2 download, 1 upload init, 1 upload chunk, 1 patch), cap 60 for this step. Evidence: `~/colab-live-evidence/integrated-20261026/evidence.json` (0600). No deletion was performed; the new root folder and file remain in Drive for the owner to remove in the web UI (the same `drive.file` limitation on trashing a root folder was seen earlier).
 
 Updated verdict: `PARTIAL_LIVE_VALIDATION`. Verified live: Drive D1-D5, one bounded T4 session, the guard deadline stop (success path), second-device monitoring, and publication of the real GPU checkpoint to Drive with a verified round trip. Still missing for `LIVE_INTEGRATION_VERIFIED`: failure paths on real Colab (nonzero `new`, orphan or `[?]`, 'not found' stop, Drive 403/429), a single continuous GPU-to-Drive workflow, and owner and Opus sign-off.
+
+### 7.11 Final independent assessment and sign-off, 2026-10-26
+Assessor: Opus 5.5, read-only and offline, at `94e3fbe` (no cloud contact, no credential files read). Verdict: **`LIVE_SUCCESS_PATH_VERIFIED_WITH_LIMITATIONS`**. Nothing in the saved evidence contradicts this record. This verdict is not production readiness and not failure-path verification.
+
+Evidence classes:
+- *Independently saved and recomputed (high confidence):* Drive D1-D5 (47 checks all ok, 88 requests); T4 `up` output; G4 probe and sync; G5 training (63 telemetry events: 60 metric steps 1-60, plus start, checkpoint and finish events); G6 checkpoint (sha256 `277d08f9…fdec9f` recomputed from `model_g6.pt`, decoded payload byte-identical, matches remote `sha256sum`, sidecar, telemetry and `DONE_OK`); G7 guard stop (deadline 00:58:27.8, verified stop logged 00:58:31, outcome `STOPPED_VERIFIED`); X1 host-side loopback run (13/13); I1 publish and replay (one `upload_init`, one `upload_chunk`, same remote id).
+- *Operator-observed or operator-reported (medium confidence, no raw copy):* the T4 baseline and G3d readings, the T4 teardown output, the second device's checker result (13/13) and its dashboard view, and "no manual stop was issued during G7" (inferred from files and code; cannot be fully excluded from the files alone).
+- *Untested:* all real-provider failure paths.
+
+Limitations that remain open (all non-production-ready conditions): (1) real-provider failure paths never exercised live - nonzero `colab new`, the `[?]` unnamed-runtime line (the regex has never matched a real line), upstream "not found" on `stop`, ResourceExhausted, orphan recovery, Drive 403/429 retries; (2) usage accounting does not reconcile (T4 run: display moved 0.01 CU against about 0.036 predicted; G7: 0.05 against about 0.09) - these are account-wide display deltas, not billing evidence; (3) the lease guard is host-side best effort (no survival of reboot, `kill -9` of the guard or OAuth loss; depends on the shared lock and the real `sessions` output format) and only one success-path drill on an otherwise empty account was run; (4) I1 is not one continuous run; (5) PR #32 changed the monitor (poller, Unavailable display, Drive status, session table) after the second-device test and has not been retested live; (6) the Drive hash values in D1-D5 are recorded but the synthetic source bytes were not saved, so they cannot be recomputed; the I1 cloud copy cannot be re-checked from the host without a new cloud read.
+
+Blocking for any full or production-readiness claim: items (1) and (4), and the pending cleanup below. Non-blocking for the success-path verdict: items (2), (3) as disclosed, (5), the operator-only rows, and the permission-wording note (`publish_g6.py` and `launch_monitor.py` are mode 0644 and some seeded monitor subdirectories 0755 inside the 0700 evidence directory; harmless, but not all files in it are 0600).
+
+Cleanup status at signing (from files and owner instruction only; cloud state not inspected): pending owner actions - inspect and delete the Drive roots `colab-live-smoke-20261026T003700Z-ea2fb8` (its 10 children are in Trash; the root could not be trashed with the narrow token, and a child outside the token's grant may exist) and `colab-live-integrated-20261026T012445Z`; delete the throwaway monitor token (`~/.config/colab-monitor/owner_token` on the host and the copy on the second device); remove the leftover temp directory `/tmp/g6-pub-jphfjk1r` on the host; confirm in the Colab UI that no runtime is active. No Colab session was left running according to the final host-side readings (Active assignments 0).
+
+Owner sign-off checklist: (1) Drive roots inspected and deleted - pending; (2) monitor token files deleted - pending; (3) Colab UI shows no runtime and a balance near 186.69 - pending; (4) stale documentation corrected - done in this record, README and the GPU plan; (5) owner verdict signed - done (Section 1); (6) failure paths, a continuous run and a post-#32 monitor retest recorded as pending future work - done above.
+
