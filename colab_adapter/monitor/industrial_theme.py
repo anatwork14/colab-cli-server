@@ -579,6 +579,7 @@ SCRIPT = r"""
         });
       }
     }
+    initMonitorTheme();
 """
 
 
