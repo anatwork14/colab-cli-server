@@ -45,7 +45,7 @@ jobs:
         run: |
           npm init -y
           npm install playwright-core@1.51.0
-          npx playwright install --with-deps chromium
+          npx --no-install playwright-core install --with-deps chromium
           node -e "const pw = require('playwright-core'); console.log('Chromium path:', pw.chromium.executablePath());"
       - name: Run real headless Chromium security suite
         env:
