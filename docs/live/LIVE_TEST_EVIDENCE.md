@@ -102,7 +102,7 @@ Current verdict: `<TO BE FILLED>` (no live test has been executed at the time of
 
 ## 7. Live results, 2026-10-26 (main `3a62c9b291f755e06533756eba590dcd4d3ea094`)
 
-Environment: Ubuntu 20.04.6, Python 3.8.10, official Colab CLI 0.7.5 (`--auth=oauth2`), uv 0.12.13. Remote runtime: Python 3.13.16, Torch 2.11.0+cu130, Tesla T4. Local suite on this commit: 847 tests, OK, 3 skipped (torch-dependent); post-merge CI run 40213697055: 3.8, 3.12, 3.13 and browser-security all success. Private raw evidence (not in the repo): `~/colab-live-evidence/drive-20261026/` (mode 0600). Identifiers below are the harness-created test objects only; no account address, token or secret appears here.
+Environment: Ubuntu 20.04.6, Python 3.8.10, official Colab CLI 0.7.5 (`--auth=oauth2`), uv 0.12.13. Remote runtime: Python 3.13.16, Torch 2.11.0+cu130, Tesla T4. Offline context only (not live results): local suite on this commit 847 tests, OK, 3 skipped (torch-dependent); post-merge CI run 40213697055 all four jobs success. Private raw evidence (not in the repo, directories 0700, files 0600): Drive `~/colab-live-evidence/drive-20261026/`; GPU raw command outputs (`up_out.json`, `g4_sync.json`, `g4_probe.json`, `g5_train.json`, `g6_exec.json`, `model_g6.pt`) `~/colab-live-evidence/gpu-20261026/`. Rows marked *operator-observed* below were read from live command output during the session but no raw copy was saved; treat them as less strongly evidenced than rows backed by a saved file. Identifiers below are the harness-created test objects only; no account address, token or secret appears here.
 
 ### 7.1 Authorization (owner, in chat)
 - Drive: `APPROVE DRIVE SMOKE TEST` (scope `drive.file`, 3 revisions, cap 150 requests, no deletion by the harness).
@@ -116,25 +116,25 @@ Environment: Ubuntu 20.04.6, Python 3.8.10, official Colab CLI 0.7.5 (`--auth=oa
 | D2 B then C | PASS | 3 distinct remote ids, each full hash verified, history kept (20.1 s) |
 | D3 replay A | PASS | no upload, no PATCH, A historical, C still latest (1.6 s) |
 | D4 recovery | PASS | exact A, B, C on a fresh store; after deleting only the isolated test manifest and backup, latest recovered (8.7 s) |
-| D5 compatibility | PASS | property byte limits, real PATCH, `pageSize=1` listing, Unicode and long names, error reporting (20.7 s) |
+| D5 compatibility | PASS | property byte limits, real PATCH, `pageSize=1` listing, a Unicode filename (`モデル-chkpt-ü.pt`) and a 180-byte filename published and listed, error reporting (20.7 s) |
 
 API requests: 88 of the 150 cap (42 list, 12 get, 9 download, 9 patch, 6 folder create, 5 upload init, 5 upload chunk). Secret scan: 0 leaks. Revision hashes (full values in the private evidence): A `08c4676f…` 65,536 B; B `be1d62f8…` 196,608 B; C `d7784ed9…` 524,288 B. Not exercised live: real 403/429 rate-limit and retry behaviour (cannot be provoked safely).
 
 ### 7.3 Live Colab T4 (one allocation)
 | Step | Result | Observed |
 |---|---|---|
-| Baseline | PASS | 186.75 CU, 0.00/hr, Active assignments 0, no runtime, no managed session |
-| `project up` (single) | PASS | exit 0, session `colab-v2-live-smoke-ca8ca3ab` READY in about 19 s, T4, lease 900 s |
-| G3d guard and account | PASS | guard alive, deadline about 888 s ahead, `assignments_before` 0, Active assignments 1, session listed by name, usage rate 1.07/hr |
+| Baseline | PASS (operator-observed) | 186.75 CU, 0.00/hr, Active assignments 0, no runtime, no managed session |
+| `project up` (single) | PASS | `up_out.json`: session `colab-v2-live-smoke-ca8ca3ab`, state READY, T4, lease 900 s, `assignments_before` 0; exit 0 and about 19 s are wall-clock readings from the shell (operator-observed) |
+| G3d guard and account | PASS (operator-observed) | guard alive, deadline about 888 s ahead, `assignments_before` 0, Active assignments 1, session listed by name, usage rate 1.07/hr |
 | G4 sync + probe | PASS | 3 files / 13,258 bytes synced; `CUDA available: True`, Tesla T4, `GPU_PROBE_OK device=cuda:0 checksum=-674`, final `EXIT_CODE 0` |
-| G5 training | PASS | `Device: cuda:0`, 60 metric events for steps 1 to 60, loss 9.74 to 0.088, run_started / checkpoint_saved / run_finished present, `DONE_OK`, final `EXIT_CODE 0` (about 10 s) |
+| G5 training | PASS | `Device: cuda:0`, 60 metric events for steps 1 to 60, loss 9.74 to 0.088, run_started / checkpoint_saved / run_finished present, `DONE_OK`, final `EXIT_CODE 0`; about 10 s wall clock, of which 5.3 s is the telemetry span. `FINAL_LOSS` 0.0735 differs from the step-60 metric loss 0.0878 (reported as emitted; not investigated) |
 | G6 checkpoint | PASS | remote `sha256sum`, sidecar, `DONE_OK` value and the locally decoded 3,111-byte file all `277d08f9c90aba66d3ebf234553a9720ec86342dfcb8fae320cf3f0ea6fdec9f` |
-| Teardown | PASS | `project stop` exit 0; real `sessions`: none; `usage`: Active assignments 0; registry TERMINATED, `verification: strong`, `orphan_possible: false`; no lease-guard process left |
+| Teardown | PASS (operator-observed) | `project stop` exit 0 with `stopped: true`; real `sessions`: none; real `usage`: Active assignments 0; registry TERMINATED, `orphan_possible: false`, no lease-guard process left. `verification: strong` is defined in `project_sessions.py` as: the session is not listed by name AND the account-wide Active-assignments count is at or below the recorded baseline. It is an account-wide check, not proof about this specific runtime. |
 
-Resources: one session, about 2 minutes. Account-wide balance 186.75 to 186.74 CU (display rounds to 0.01; an account-wide delta, not per-job billing). No GPU run was started outside the plan.
+Resources: one session, about 2 minutes. Account-wide balance 186.75 to 186.74 CU. **Not reconciled:** about 2 minutes at the observed 1.07 CU/hr predicts roughly 0.036 CU, while the display moved by 0.01 (rounding and/or usage lag). This is an account-wide display delta, not per-job billing, and no cost claim is made beyond 'well under the 5 CU limit'. No GPU run was started outside the plan.
 
 ### 7.4 Cleanup of the Drive test data
-Authorized by the owner. The root folder could not be trashed with the narrow token: Drive answered 403 `appNotAuthorizedToChild` even after every item inside it was trashed. All 10 items under the root (5 files and the 5 nested folders `projects`, `colab-live-smoke`, `runs`, `run-001`, `checkpoints`) were moved to Trash (reversible); the empty root folder `colab-live-smoke-20261026T003700Z-ea2fb8` remains and must be removed by the owner in the Drive web UI. A broader-scope token was deliberately not used. Finding: with a `drive.file` token, trashing the harness root folder fails; the harness's cleanup plan should say so.
+Authorized by the owner. The root folder could not be trashed with the narrow token: Drive answered 403 `appNotAuthorizedToChild` even after every item inside it was trashed. All 10 items under the root (5 files and the 5 nested folders `projects`, `colab-live-smoke`, `runs`, `run-001`, `checkpoints`) were moved to Trash (reversible); the root folder `colab-live-smoke-20261026T003700Z-ea2fb8` remains and must be removed by the owner in the Drive web UI. **Possible hidden child:** the refusal means a child outside this token's grant may exist (for example created from the web UI or by another app). The `drive.file` token cannot list such objects, so the owner should open the folder in the web UI and inspect it before emptying Trash. The harness cleanup plan lists the 5 files and the root but not the 5 nested folder ids; that is a documentation gap to fix. A broader-scope token was deliberately not used. Finding: with a `drive.file` token, trashing the harness root folder fails; the harness's cleanup plan should say so.
 
 ### 7.5 Not run / unverified
 - Guard deadline drill (optional G7): not run; the guard's own deadline stop has never been observed on real Colab. Only the manual verified stop was exercised.
@@ -145,4 +145,7 @@ Authorized by the owner. The root folder could not be trashed with the narrow to
 - Provisioning under load, long-running exec output limits, and usage-count lag were not characterized.
 
 ### 7.6 Verdict at this point
-`PARTIAL_LIVE_VALIDATION`. Verified live: Drive D1-D5, one bounded T4 session with sync, GPU probe, training, checkpoint hash match, verified teardown, and clean accounting. Mandatory scenarios still missing for `LIVE_INTEGRATION_VERIFIED`: guard drill (G7), cross-device monitoring, integrated workflow, owner and Opus sign-off.
+`PARTIAL_LIVE_VALIDATION`. Verified live (success paths only): Drive D1-D5, one bounded T4 session with sync, GPU probe, training, checkpoint hash match and a verified teardown; usage accounting is not reconciled. Mandatory scenarios still missing for `LIVE_INTEGRATION_VERIFIED`: guard drill (G7), cross-device monitoring, integrated workflow, owner and Opus sign-off.
+
+### 7.7 Real-provider compatibility: confirmed vs not
+Confirmed live (success paths): `colab new`/`up`, `usage` parsing of Active assignments (0 to 1 to 0) and the rate, `sessions` showing the named session and then none, `stop` exit 0, `exec -f` with the final `EXIT_CODE` marker and a roughly 4 KB base64 transfer, workspace sync. Not confirmed: the `[?]` unnamed-runtime line (the regex has never matched a real line; `unnamed_before` 0 only means zero matches), the exit code and exact text of the empty `sessions` listing, upstream 'not found' on `stop`, ResourceExhausted, nonzero `new`, orphan handling, large exec output, Drive 403/429 retries, the guard's deadline stop.
