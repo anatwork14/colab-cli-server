@@ -139,7 +139,7 @@ Authorized by the owner. The root folder could not be trashed with the narrow to
 ### 7.5 Not run / unverified
 - Guard deadline drill (G7): see Section 7.8 (run later the same day and passed on the success path).
 - Failure paths on real Colab (nonzero `new`, orphan runtime, `[?]` line, "not found" stop): not exercised; they remain offline-verified only.
-- Cross-device monitoring: not run (needs a second device or SSH tunnel) - BLOCKED.
+- Cross-device monitoring: see Section 7.9 (run later the same day and passed).
 - Integrated workflow (checkpoint to Drive after GPU): not run.
 - V1 `run`/`submit_job` and `colab_server.py run`: not covered and not safe-by-design for live use (known gap in PR #28).
 - Provisioning under load, long-running exec output limits, and usage-count lag were not characterized.
@@ -164,3 +164,22 @@ Cost: 186.74 to 186.69 CU (about 0.05), within the 1 CU limit; about 5 minutes a
 What this establishes: on real Colab, the host-side lease guard stopped exactly its own session at the lease deadline and the removal was confirmed by the provider's own `sessions` and `usage` output (success path, empty account otherwise). What it does not establish: behaviour when the guard is killed or the host reboots, repeated stop failures, a `not found` stop, orphan or `[?]` handling, or any guarantee that compute stops being billed; the lease remains a best-effort deadline, not a billing cap.
 
 Updated verdict: `PARTIAL_LIVE_VALIDATION`. Still missing for `LIVE_INTEGRATION_VERIFIED`: cross-device monitoring (BLOCKED, needs a second device or SSH tunnel), the integrated workflow (checkpoint from the GPU run published to Drive), the failure paths on real Colab, and owner and Opus sign-off.
+
+### 7.9 X1 cross-device monitoring, 2026-10-26
+Setup: read-only monitor started on the host bound to `127.0.0.1:8080` only (a launcher calling the same `start_monitor_server`, with an isolated private telemetry ledger and artifacts directory; the host managed-session registry was read as usual). Data: the real G5 run (63 telemetry events from `g5_train.json`) as project `live-smoke`, run `run-g5-20261026`, plus the verified 3,111-byte checkpoint published to a local artifact store (sha256 `277d08f9…fdec9f`, one revision). Bearer token from a 0600 file via the environment (never on a command line or in chat). The owner's second device (a laptop) reached the monitor only through `ssh -L 8080:127.0.0.1:8080`; no public exposure, no TLS, no non-loopback binding.
+
+| Check | Result | Observed |
+|---|---|---|
+| Second-device checker (`scripts/live/monitor_check.py`) | PASS (operator-reported) | `overall: PASS`, 13 of 13 checks (a1 a2 a3 b c1 c2 c3 d1 d2 d3 e1 e2 f), no failed IDs. The second device's evidence file stays on the owner's machine; no raw copy exists in the private directory |
+| Host-side loopback run of the same checker (does not count as cross-device) | PASS | 13 of 13, `evidence_host_loopback.json` (private directory) |
+| Unauthenticated request | PASS | HTTP 401 (observed on the host) |
+| Dashboard in the second device's browser | PASS (owner-observed) | project `live-smoke`, run `run-g5-20261026`, 60 steps, loss chart visible in the Run Inspector, one checkpoint marked latest, no mutating controls |
+| Second client created no VM | PASS | host-side real `sessions` (none) and `usage` (Active assignments 0, balance 186.69, unchanged) saved in `host_*_after.txt` / `host_*_final.txt`; no `colab new/run/ssh` or `project up` process seen |
+| No secrets in responses or monitor log | PASS | checker e1/e2 on both runs; host grep of the monitor log for token/secret patterns and the token value: 0 matches |
+| Monitor stopped | PASS | process gone, port 8080 closed |
+
+Findings (issue #31, not fixed): the account-usage collector is never started (`poll_once` has no caller), so the panel shows DEGRADED / Samples 0 / Never / CU balance Unavailable; "Active Assignments: 0" is shown when the value is null; Drive status shows PENDING when no publication is recorded; the session table lists all 202 TERMINATED sessions without pagination; the run table shows the last of two step-60 loss events (0.0878 then `FINAL_LOSS` 0.0735).
+
+Limits: this validates the SSH-tunnel path and the monitor's authentication and read-only behaviour from a second device. It does not validate public exposure, TLS or a reverse proxy, display of more than one checkpoint revision, or the live collector. The data was seeded from the recorded G5 output rather than streamed by a running job, so "telemetry matches the executed workload" is verified against a recorded run.
+
+Updated verdict: `PARTIAL_LIVE_VALIDATION`. Verified live: Drive D1-D5, one bounded T4 session (sync, probe, training, checkpoint hash match, verified manual stop), the guard deadline stop (success path) and second-device monitoring. Still missing for `LIVE_INTEGRATION_VERIFIED`: the integrated workflow (GPU checkpoint published to Drive in one flow), failure paths on real Colab (nonzero `new`, orphan or `[?]`, 'not found' stop, Drive 403/429), and owner and Opus sign-off.
