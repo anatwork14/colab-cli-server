@@ -137,7 +137,7 @@ Resources: one session, about 2 minutes. Account-wide balance 186.75 to 186.74 C
 Authorized by the owner. The root folder could not be trashed with the narrow token: Drive answered 403 `appNotAuthorizedToChild` even after every item inside it was trashed. All 10 items under the root (5 files and the 5 nested folders `projects`, `colab-live-smoke`, `runs`, `run-001`, `checkpoints`) were moved to Trash (reversible); the root folder `colab-live-smoke-20261026T003700Z-ea2fb8` remains and must be removed by the owner in the Drive web UI. **Possible hidden child:** the refusal means a child outside this token's grant may exist (for example created from the web UI or by another app). The `drive.file` token cannot list such objects, so the owner should open the folder in the web UI and inspect it before emptying Trash. The harness cleanup plan lists the 5 files and the root but not the 5 nested folder ids; that is a documentation gap to fix. A broader-scope token was deliberately not used. Finding: with a `drive.file` token, trashing the harness root folder fails; the harness's cleanup plan should say so.
 
 ### 7.5 Not run / unverified
-- Guard deadline drill (optional G7): not run; the guard's own deadline stop has never been observed on real Colab. Only the manual verified stop was exercised.
+- Guard deadline drill (G7): see Section 7.8 (run later the same day and passed on the success path).
 - Failure paths on real Colab (nonzero `new`, orphan runtime, `[?]` line, "not found" stop): not exercised; they remain offline-verified only.
 - Cross-device monitoring: not run (needs a second device or SSH tunnel) - BLOCKED.
 - Integrated workflow (checkpoint to Drive after GPU): not run.
@@ -149,3 +149,18 @@ Authorized by the owner. The root folder could not be trashed with the narrow to
 
 ### 7.7 Real-provider compatibility: confirmed vs not
 Confirmed live (success paths): `colab new`/`up`, `usage` parsing of Active assignments (0 to 1 to 0) and the rate, `sessions` showing the named session and then none, `stop` exit 0, `exec -f` with the final `EXIT_CODE` marker and a roughly 4 KB base64 transfer, workspace sync. Not confirmed: the `[?]` unnamed-runtime line (the regex has never matched a real line; `unnamed_before` 0 only means zero matches), the exit code and exact text of the empty `sessions` listing, upstream 'not found' on `stop`, ResourceExhausted, nonzero `new`, orphan handling, large exec output, Drive 403/429 retries, the guard's deadline stop.
+
+### 7.8 G7 guard deadline drill, 2026-10-26 (second and last allocation)
+Authorization: `APPROVE 1 T4 SESSION — 300 SECONDS — 1 CU LIMIT — GUARD DRILL` (owner); the owner ran `project approve apr-2c473fbb…` in their own terminal (`approved_at` 00:53:04 UTC). Baseline immediately before: 186.74 CU, Active assignments 0, no runtime listed, no managed session. One `project up` with `--lease-seconds 300`; session `colab-v2-live-smoke-9289d488` READY at about 00:53:33. No workload was run. No manual stop was issued.
+
+| Check | Result | Observed |
+|---|---|---|
+| Guard alive before the deadline | PASS | `status`: `guard_alive` true (pid 469999), deadline 00:58:27, `assignments_before` 0; real `usage` Active assignments 1 (1.07 CU/hr); real `sessions` listed the session by name |
+| Guard stops the session at the deadline | PASS | guard log: `stop attempt 1 verified` at 00:58:31 (4 s after the deadline); outcome `STOPPED_VERIFIED`, guard exit 0 |
+| Independent verification | PASS | my own real `sessions` after the stop: "No active sessions found on server"; real `usage`: Active assignments 0, 0.00/hr; registry TERMINATED, `verification: strong` (active assignments 0 <= baseline 0), `orphan_possible: false`; no lease-guard process left |
+
+Cost: 186.74 to 186.69 CU (about 0.05), within the 1 CU limit; about 5 minutes at 1.07 CU/hr predicts roughly 0.09, so accounting remains not reconciled (account-wide display, not per-job billing). Raw outputs, including the guard's own log: `~/colab-live-evidence/g7-20261026/` (0700 directory, 0600 files).
+
+What this establishes: on real Colab, the host-side lease guard stopped exactly its own session at the lease deadline and the removal was confirmed by the provider's own `sessions` and `usage` output (success path, empty account otherwise). What it does not establish: behaviour when the guard is killed or the host reboots, repeated stop failures, a `not found` stop, orphan or `[?]` handling, or any guarantee that compute stops being billed; the lease remains a best-effort deadline, not a billing cap.
+
+Updated verdict: `PARTIAL_LIVE_VALIDATION`. Still missing for `LIVE_INTEGRATION_VERIFIED`: cross-device monitoring (BLOCKED, needs a second device or SSH tunnel), the integrated workflow (checkpoint from the GPU run published to Drive), the failure paths on real Colab, and owner and Opus sign-off.
