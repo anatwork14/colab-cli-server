@@ -32,6 +32,7 @@ from ..provider import ManagedSessionRegistry
 from ..telemetry import TelemetryEmitter
 from ..tracker import sanitize_data
 from .collector import AccountUsageCollector
+from .poller import MonitorPoller, clamp_poll_interval
 from .schemas import HealthStatus, MonitoringSummary, RunSummary, _iso_now
 
 try:
@@ -329,6 +330,58 @@ def _drop_phantom_legacy_keys(keys: Iterable[Tuple[str, str]]) -> Set[Tuple[str,
     key_set = set(keys)
     named_run_ids = {k[1] for k in key_set if k[0]}
     return {k for k in key_set if k[0] or k[1] not in named_run_ids}
+
+
+# Drive publication states, as recorded by the storage layer. A recorded value outside
+# DRIVE_PUBLISHED_STATUS and DRIVE_STATUS_NOT_RECORDED means a transfer was interrupted or is in progress.
+DRIVE_STATUS_PUBLISHED = "PUBLISHED"
+DRIVE_STATUS_PENDING = "PENDING"
+DRIVE_STATUS_NOT_RECORDED = "NOT RECORDED"
+_DRIVE_INTERRUPTED_STATES = frozenset({
+    "UPLOAD_PENDING", "UPLOADING", "RETRY_PENDING", "UPLOAD_FAILED", "LOCAL_VERIFIED", "PENDING", "FAILED", "PARTIAL",
+})
+_DRIVE_STATE_FIELDS = ("drive_publication_status", "transfer_status")
+
+
+def _records_interrupted_drive_transfer(manifest_data: Optional[Dict[str, Any]], events: Iterable[Dict[str, Any]]) -> bool:
+    """True only when the manifest or telemetry actually records an interrupted or in-progress Drive transfer.
+
+    The manifest-level IN_PROGRESS default is NOT evidence of a transfer and is ignored.
+    """
+    if manifest_data:
+        if str(manifest_data.get("status") or "").upper() in ("PARTIAL", "FAILED"):
+            return True
+        raw_artifacts = manifest_data.get("artifacts") or {}
+        if isinstance(raw_artifacts, dict):
+            for art in raw_artifacts.values():
+                if not isinstance(art, dict):
+                    continue
+                containers = [art, art.get("metadata") if isinstance(art.get("metadata"), dict) else {}]
+                for container in containers:
+                    for name in _DRIVE_STATE_FIELDS:
+                        if str(container.get(name) or "").upper() in _DRIVE_INTERRUPTED_STATES:
+                            return True
+    for ev in events:
+        details = ev.get("details") if isinstance(ev.get("details"), dict) else {}
+        for container in (ev, details):
+            for name in _DRIVE_STATE_FIELDS:
+                if str(container.get(name) or "").upper() in _DRIVE_INTERRUPTED_STATES:
+                    return True
+    return False
+
+
+def _drive_publication_state(
+    drive_backed: bool,
+    manifest_data: Optional[Dict[str, Any]],
+    events: Iterable[Dict[str, Any]],
+) -> str:
+    """PUBLISHED when a Drive-backed artifact is recorded; PENDING when an interrupted or in-progress
+    transfer is recorded; otherwise NOT RECORDED (no Drive information, never a guessed PENDING)."""
+    if drive_backed:
+        return DRIVE_STATUS_PUBLISHED
+    if _records_interrupted_drive_transfer(manifest_data, events):
+        return DRIVE_STATUS_PENDING
+    return DRIVE_STATUS_NOT_RECORDED
 
 
 def _load_run_manifest(run_dir: Path, project_id: str, run_id: str) -> Optional[Dict[str, Any]]:
@@ -705,7 +758,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         summary = MonitoringSummary(
             current_balance_cu=latest.balance_cu if latest else None,
             current_rate_cu_per_hour=latest.rate_cu_per_hour if latest else None,
-            active_assignments=latest.active_assignments if latest else 0,
+            active_assignments=latest.active_assignments if latest else None,
             managed_running_runs=running_count,
             total_runs=unique_runs if project is not None else max(unique_runs, len(all_managed)),
             monitoring_since=col.monitoring_since,
@@ -788,11 +841,14 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         events = self.server.telemetry.get_events(project_id=proj_filter)
 
         runs_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        events_by_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        manifests_by_key: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
         for ev in events:
             r_id = ev.get("run_id")
             if not r_id:
                 continue
             key = _event_run_key(ev)
+            events_by_key.setdefault(key, []).append(ev)
 
             if key not in runs_map:
                 runs_map[key] = {
@@ -843,6 +899,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
             # Read manifest if present
             m_data = _load_run_manifest(r_dir, p_id, r_id)
+            manifests_by_key[key] = m_data
             if m_data is not None:
                 try:
                     run = runs_map[key]
@@ -893,7 +950,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             run = runs_map[key]
             run["is_runtime_active"] = key[1] in active_session_ids and run_id_counts.get(key[1], 0) == 1
             if "drive_publication_status" not in run:
-                run["drive_publication_status"] = "PENDING"
+                run["drive_publication_status"] = _drive_publication_state(
+                    False, manifests_by_key.get(key), events_by_key.get(key, [])
+                )
             if "source_snapshot_available" not in run:
                 run["source_snapshot_available"] = False
 
@@ -1162,7 +1221,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             run_id, manifest_data=manifest_data, run_dir=r_dir, project_id=project_id
         )
         drive_artifacts = [a for a in artifacts_list if a.get("storage_provider") == "google_drive" or a.get("remote_file_id") or a.get("remote_available")]
-        status_str = "PUBLISHED" if drive_artifacts else ("PENDING" if artifacts_list else "DISABLED")
+        status_str = _drive_publication_state(bool(drive_artifacts), manifest_data, events)
 
         if len(parts) == 4:
             if not events and not manifest_data and not artifacts_list:
@@ -1306,6 +1365,8 @@ class MonitorServer(ThreadingHTTPServer):
     ):
         host, port = server_address
         # Enforce loopback binding by default (Q28)
+        # Set before any validation can raise so shutdown/server_close never hit a missing attribute.
+        self._poller: Optional[MonitorPoller] = None
         if not allow_external and host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError(
                 f"Security violation: Monitor server attempted to bind to external interface '{host}'. "
@@ -1380,6 +1441,19 @@ class MonitorServer(ThreadingHTTPServer):
         self.broker = broker
         self.start_time = time.time()
 
+    def _stop_poller(self) -> None:
+        poller = getattr(self, "_poller", None)
+        if poller is not None:
+            poller.stop()
+
+    def shutdown(self) -> None:
+        self._stop_poller()
+        super().shutdown()
+
+    def server_close(self) -> None:
+        self._stop_poller()
+        super().server_close()
+
 
 def start_monitor_server(
     host: str = "127.0.0.1",
@@ -1399,8 +1473,14 @@ def start_monitor_server(
     tls_certfile: Optional[Union[str, Path]] = None,
     tls_keyfile: Optional[Union[str, Path]] = None,
     dashboard_html: Optional[str] = None,
+    poll_interval: Optional[float] = 60.0,
 ) -> MonitorServer:
-    """Instantiate and start the MonitorServer."""
+    """Instantiate the MonitorServer and start its background account poller.
+
+    ``poll_interval`` seconds between read-only ``colab usage`` polls (default 60, clamped to
+    at least 15). ``None`` or ``0`` disables polling. The poller stops on ``shutdown()`` or
+    ``server_close()``.
+    """
     col = collector or AccountUsageCollector()
     reg = registry or ManagedSessionRegistry()
     tel = telemetry or TelemetryEmitter()
@@ -1423,5 +1503,8 @@ def start_monitor_server(
         tls_keyfile=tls_keyfile,
         dashboard_html=dashboard_html,
     )
+    effective_interval = clamp_poll_interval(poll_interval)
+    if effective_interval is not None:
+        server._poller = MonitorPoller(col, interval=effective_interval).start()
     return server
 

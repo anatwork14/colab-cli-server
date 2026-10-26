@@ -213,6 +213,14 @@ def build_parser() -> argparse.ArgumentParser:
     mon_parser.add_argument("--require-tls", action="store_true", help="Enforce TLS encryption on the monitor socket.")
     mon_parser.add_argument("--tls-certfile", default=None, help="Path to TLS certificate PEM file.")
     mon_parser.add_argument("--tls-keyfile", default=None, help="Path to TLS private key PEM file.")
+    mon_parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="Seconds between read-only `colab usage` polls (default 60, minimum 15; 0 disables polling). "
+             "Failures back off exponentially up to 600 s.",
+    )
 
     return parser
 
@@ -472,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
             require_tls=args.require_tls,
             tls_certfile=args.tls_certfile,
             tls_keyfile=args.tls_keyfile,
+            poll_interval=args.poll_interval,
         )
         try:
             server.serve_forever()

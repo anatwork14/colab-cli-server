@@ -698,6 +698,7 @@ class TestTrustedProxyAndSecurityAudit(unittest.TestCase):
         """
         try:
             server = start_monitor_server(
+                poll_interval=None,
                 host="127.0.0.1",
                 port=0,
                 registry=self.registry,
@@ -748,6 +749,7 @@ class TestTrustedProxyAndSecurityAudit(unittest.TestCase):
         """
         with self.assertRaises(ValueError):
             srv = start_monitor_server(
+                poll_interval=None,
                 host="127.0.0.1",
                 port=0,
                 registry=self.registry,
@@ -771,6 +773,7 @@ class TestTrustedProxyAndSecurityAudit(unittest.TestCase):
         """
         with self.assertRaises(ValueError) as ctx:
             srv = start_monitor_server(
+                poll_interval=None,
                 host="0.0.0.0",
                 port=0,
                 allow_external=True,
@@ -784,6 +787,7 @@ class TestTrustedProxyAndSecurityAudit(unittest.TestCase):
         """Query parameter tokens (?token=...) are strictly rejected on all monitoring endpoints."""
         token = "secret-token-abcdef-12345"
         server = start_monitor_server(
+            poll_interval=None,
             host="127.0.0.1",
             port=0,
             registry=self.registry,
@@ -820,6 +824,7 @@ class TestTrustedProxyAndSecurityAudit(unittest.TestCase):
         """Path traversal patterns (../, %2e%2e) are rejected by monitor server and WorkspaceBroker."""
         token = "test-token"
         server = start_monitor_server(
+            poll_interval=None,
             host="127.0.0.1",
             port=0,
             registry=self.registry,
@@ -898,6 +903,7 @@ class TestTrustedProxyAndSecurityAudit(unittest.TestCase):
         m.save(run_dir / "manifest.json")
 
         server = start_monitor_server(
+            poll_interval=None,
             host="127.0.0.1",
             port=0,
             registry=self.registry,
@@ -1071,6 +1077,7 @@ class TestSeededSecretNonDisclosure(unittest.TestCase):
         Reproduces unpatched HEAD returning unredacted session URLs in telemetry error events.
         """
         server = start_monitor_server(
+            poll_interval=None,
             host="127.0.0.1",
             port=0,
             registry=self.registry,
