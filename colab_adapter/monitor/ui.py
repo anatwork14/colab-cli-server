@@ -16,6 +16,8 @@ import html
 import re
 from typing import Optional
 
+from .industrial_theme import apply_industrial_theme
+
 __all__ = [
     "DASHBOARD_HTML",
     "render_dashboard_html",
@@ -1945,6 +1947,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </body>
 </html>
 """
+
+# Apply a presentation-only, CSP-compatible design layer to the existing app.
+# Original DOM IDs, API calls, token handling and read-only behavior remain intact.
+DASHBOARD_HTML = apply_industrial_theme(DASHBOARD_HTML)
 
 
 def render_dashboard_html(
