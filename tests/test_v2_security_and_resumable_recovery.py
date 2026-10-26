@@ -76,6 +76,7 @@ class TestSecurityAndResumableRecoveryRegressions(unittest.TestCase):
     def test_query_token_strictly_rejected(self):
         """Query parameter tokens (?token=...) are strictly rejected on all endpoints."""
         server = start_monitor_server(
+            poll_interval=None,
             host="127.0.0.1",
             port=0,
             registry=self.registry,
@@ -111,6 +112,7 @@ class TestSecurityAndResumableRecoveryRegressions(unittest.TestCase):
     def test_cors_rejects_wildcard_and_unauthorized_origins(self):
         """Monitor server does NOT send wildcard CORS header and ignores untrusted origins."""
         server = start_monitor_server(
+            poll_interval=None,
             host="127.0.0.1",
             port=0,
             registry=self.registry,
@@ -150,6 +152,7 @@ class TestSecurityAndResumableRecoveryRegressions(unittest.TestCase):
         # Unencrypted HTTP external bind without trusted proxy -> ValueError
         with self.assertRaises(ValueError) as ctx:
             start_monitor_server(
+                poll_interval=None,
                 host="0.0.0.0",
                 port=9876,
                 allow_external=True,
@@ -161,6 +164,7 @@ class TestSecurityAndResumableRecoveryRegressions(unittest.TestCase):
 
         # With trusted_proxy=True or require_tls=True -> permitted
         srv = start_monitor_server(
+            poll_interval=None,
             host="127.0.0.1",
             port=0,
             allow_external=False,

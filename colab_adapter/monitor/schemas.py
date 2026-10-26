@@ -20,7 +20,7 @@ class AccountSample:
     source: str = "colab usage"
     balance_cu: Optional[float] = None
     rate_cu_per_hour: Optional[float] = None
-    active_assignments: int = 0
+    active_assignments: Optional[int] = None
     net_balance_change: Optional[float] = None
     change_type: str = "UNCHANGED"  # "TOP_UP", "SPEND", "UNCHANGED", "UNATTRIBUTED"
     status: str = "OK"  # "OK", "STALE", "ERROR"
@@ -68,7 +68,7 @@ class RunSummary:
     checkpoint_count: int = 0
     latest_checkpoint_name: Optional[str] = None
     latest_checkpoint_sha256: Optional[str] = None
-    drive_publication_status: str = "PENDING"
+    drive_publication_status: str = "NOT RECORDED"
     drive_file_id: Optional[str] = None
     source_snapshot_available: bool = False
     is_runtime_active: bool = True
@@ -99,7 +99,7 @@ class ArtifactDetail:
 class MonitoringSummary:
     current_balance_cu: Optional[float]
     current_rate_cu_per_hour: Optional[float]
-    active_assignments: int
+    active_assignments: Optional[int]
     managed_running_runs: int
     total_runs: int
     monitoring_since: str

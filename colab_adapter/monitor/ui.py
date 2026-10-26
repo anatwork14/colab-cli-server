@@ -733,7 +733,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <h3>Checkpoints & Google Drive Artifacts</h3>
               <span class="card-subtitle">Durable storage verification and SHA-256 integrity</span>
             </div>
-            <span id="insp-drive-badge" class="badge badge-neutral">Drive Status: PENDING</span>
+            <span id="insp-drive-badge" class="badge badge-neutral">Drive Status: NOT RECORDED</span>
           </div>
           <div class="table-responsive">
             <table class="data-table" id="artifacts-table">
@@ -790,6 +790,67 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       return token ? { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' } : { 'Accept': 'application/json' };
     }
+
+    // BEGIN pure-helpers
+    // Pure functions only (no DOM writes except applySummaryKpis, which only sets textContent).
+    // Missing values render as 'Unavailable'; a numeric 0 is only shown when the server reports 0.
+    const KPI_UNAVAILABLE = 'Unavailable';
+    const SESSION_ROW_CAP = 50;
+    const TERMINAL_SESSION_STATES = ['TERMINATED', 'FAILED', 'CLEANED', 'CANCELLED'];
+
+    function isKpiMissing(value) {
+      return value === null || value === undefined || value === '' || !Number.isFinite(Number(value));
+    }
+
+    function kpiAssignmentsText(value) {
+      if (isKpiMissing(value)) return KPI_UNAVAILABLE;
+      return String(Math.trunc(Number(value)));
+    }
+
+    function kpiCountText(value) {
+      return isKpiMissing(value) ? KPI_UNAVAILABLE : String(Math.trunc(Number(value)));
+    }
+
+    function kpiRateText(value) {
+      return isKpiMissing(value) ? KPI_UNAVAILABLE : `${Number(value).toFixed(2)} CU/hr`;
+    }
+
+    function kpiBalanceText(value) {
+      return isKpiMissing(value) ? KPI_UNAVAILABLE : `${Number(value).toFixed(2)} CU`;
+    }
+
+    function applySummaryKpis(s) {
+      const valCu = document.getElementById('val-cu');
+      if (valCu) valCu.textContent = kpiBalanceText(s.current_balance_cu);
+      const metaCu = document.getElementById('meta-cu');
+      if (metaCu) metaCu.textContent = s.is_stale ? 'Warning: Stale snapshot' : 'Official balance';
+      const valRate = document.getElementById('val-rate');
+      if (valRate) valRate.textContent = kpiRateText(s.current_rate_cu_per_hour);
+      const valAssign = document.getElementById('val-assignments');
+      if (valAssign) valAssign.textContent = kpiAssignmentsText(s.active_assignments);
+      const valRuns = document.getElementById('val-runs');
+      if (valRuns) valRuns.textContent = `${kpiCountText(s.managed_running_runs)} / ${kpiCountText(s.total_runs)}`;
+    }
+
+    function isTerminalSession(session) {
+      return TERMINAL_SESSION_STATES.includes(String((session && session.state) || ''));
+    }
+
+    // Live (non-terminal) sessions first; terminated ones only when requested; rows capped.
+    function planSessionRows(sessions, showTerminated, cap) {
+      const list = Array.isArray(sessions) ? sessions : [];
+      const live = list.filter(s => !isTerminalSession(s));
+      const terminated = list.filter(s => isTerminalSession(s));
+      const visible = showTerminated ? live.concat(terminated) : live;
+      const rows = visible.slice(0, cap);
+      return {
+        rows,
+        moreNotShown: visible.length - rows.length,
+        terminatedCount: terminated.length,
+        liveCount: live.length,
+      };
+    }
+    // END pure-helpers
 
     function formatNumber(val, decimals, fallback = '-') {
       if (val === null || val === undefined || val === '') return fallback;
@@ -1011,7 +1072,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const plotH = height - padTop - padBottom;
 
       const balances = valid.map(s => Number(s.balance_cu)).filter(n => Number.isFinite(n));
-      const rates = valid.map(s => (s.rate_cu_per_hour != null ? Number(s.rate_cu_per_hour) : 0)).filter(n => Number.isFinite(n));
+      const rates = valid.filter(s => s.rate_cu_per_hour != null).map(s => Number(s.rate_cu_per_hour)).filter(n => Number.isFinite(n));
 
       if (balances.length === 0) {
         container.appendChild(emptyDiv());
@@ -1036,9 +1097,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const yB = padTop + plotH - ((bVal - minB) / (maxB - minB)) * plotH;
         pointsB.push(`${formatNumber(x, 1)},${formatNumber(yB, 1)}`);
 
-        const r = valid[i].rate_cu_per_hour != null ? Number(valid[i].rate_cu_per_hour) : 0;
-        const yR = padTop + plotH - (r / maxR) * plotH;
-        pointsR.push(`${formatNumber(x, 1)},${formatNumber(yR, 1)}`);
+        const rRaw = valid[i].rate_cu_per_hour;
+        if (rRaw != null && Number.isFinite(Number(rRaw))) {
+          const yR = padTop + plotH - (Number(rRaw) / maxR) * plotH;
+          pointsR.push(`${formatNumber(x, 1)},${formatNumber(yR, 1)}`);
+        }
       }
 
       const svg = createSvgElement('svg', {
@@ -1299,7 +1362,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!tbody) return;
 
       if (driveBadge) {
-        const driveStatus = driveInfo?.drive_publication_status || (artifactsList && artifactsList.some(a => a.storage_provider === 'google_drive' || a.remote_file_id || a.remote_available) ? 'PUBLISHED' : (artifactsList && artifactsList.length ? 'PENDING' : 'DISABLED'));
+        const driveStatus = driveInfo?.drive_publication_status || (artifactsList && artifactsList.some(a => a.storage_provider === 'google_drive' || a.remote_file_id || a.remote_available) ? 'PUBLISHED' : 'NOT RECORDED');
         driveBadge.textContent = `Drive: ${driveStatus}`;
         if (driveStatus === 'PUBLISHED') driveBadge.className = 'badge badge-purple';
         else if (driveStatus === 'PENDING') driveBadge.className = 'badge badge-warning';
@@ -1604,12 +1667,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         const tdDrive = document.createElement('td');
         const driveBadge = document.createElement('span');
-        const dStatus = String(r.drive_publication_status || 'PENDING');
-        const cleanDrive = dStatus.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+        const dStatus = String(r.drive_publication_status || 'NOT RECORDED');
         let driveClass = 'badge-neutral';
         if (dStatus === 'PUBLISHED') driveClass = 'badge-purple';
         else if (dStatus === 'PENDING') driveClass = 'badge-warning';
-        else driveClass = `badge-${cleanDrive}`;
         driveBadge.className = `badge ${driveClass}`;
         driveBadge.textContent = dStatus;
         tdDrive.appendChild(driveBadge);
@@ -1633,71 +1694,113 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    function buildSessionRow(s) {
+      const tr = document.createElement('tr');
+
+      const tdId = document.createElement('td');
+      tdId.className = 'mono';
+      const strongId = document.createElement('strong');
+      strongId.textContent = s.session_id || '-';
+      tdId.appendChild(strongId);
+      tr.appendChild(tdId);
+
+      const tdProj = document.createElement('td');
+      tdProj.className = 'mono';
+      tdProj.textContent = s.project_name || 'unknown';
+      tr.appendChild(tdProj);
+
+      const tdAcc = document.createElement('td');
+      const accBadge = document.createElement('span');
+      accBadge.className = 'badge badge-info';
+      accBadge.textContent = s.accelerator || 'T4';
+      tdAcc.appendChild(accBadge);
+      tr.appendChild(tdAcc);
+
+      const tdState = document.createElement('td');
+      const stateBadge = document.createElement('span');
+      const st = String(s.state || 'UNKNOWN');
+      const cleanState = st.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+      let stateClass = 'badge-neutral';
+      if (st === 'READY' || st === 'RUNNING' || st === 'ACTIVE') stateClass = 'badge-success';
+      else if (st === 'TERMINATED' || st === 'FAILED') stateClass = 'badge-danger';
+      else stateClass = 'badge-warning';
+      stateBadge.className = `badge ${stateClass}`;
+      stateBadge.textContent = st;
+      tdState.appendChild(stateBadge);
+      tr.appendChild(tdState);
+
+      const tdExp = document.createElement('td');
+      tdExp.className = 'mono';
+      tdExp.textContent = s.expires_at ? String(s.expires_at).slice(0, 19).replace('T', ' ') : '-';
+      tr.appendChild(tdExp);
+
+      const tdVer = document.createElement('td');
+      const verBadge = document.createElement('span');
+      verBadge.className = 'badge badge-managed';
+      verBadge.textContent = 'Managed';
+      tdVer.appendChild(verBadge);
+      tr.appendChild(tdVer);
+
+      return tr;
+    }
+
+    let cachedSessions = [];
+    let sessionsShowTerminated = false;
+
+    function buildSessionMessageRow(text) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      td.className = 'table-empty';
+      td.textContent = text;
+      tr.appendChild(td);
+      return tr;
+    }
+
+    function buildSessionToggleRow(terminatedCount) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn btn-sm btn-secondary';
+      btn.setAttribute('aria-expanded', sessionsShowTerminated ? 'true' : 'false');
+      btn.textContent = sessionsShowTerminated
+        ? `Hide ${terminatedCount} terminated`
+        : `Show ${terminatedCount} terminated`;
+      btn.addEventListener('click', () => {
+        sessionsShowTerminated = !sessionsShowTerminated;
+        renderSessionsTable(cachedSessions);
+      });
+      td.appendChild(btn);
+      tr.appendChild(td);
+      return tr;
+    }
+
     function renderSessionsTable(sessions) {
       const tbody = document.getElementById('sessions-tbody');
       if (!tbody) return;
 
+      cachedSessions = Array.isArray(sessions) ? sessions : [];
       tbody.replaceChildren();
 
-      if (!sessions || sessions.length === 0) {
-        const tr = document.createElement('tr');
-        const td = document.createElement('td');
-        td.colSpan = 6;
-        td.className = 'table-empty';
-        td.textContent = 'No active managed Colab sessions';
-        tr.appendChild(td);
-        tbody.appendChild(tr);
+      if (cachedSessions.length === 0) {
+        tbody.appendChild(buildSessionMessageRow('No active managed Colab sessions'));
         return;
       }
 
-      for (const s of sessions) {
-        const tr = document.createElement('tr');
-
-        const tdId = document.createElement('td');
-        tdId.className = 'mono';
-        const strongId = document.createElement('strong');
-        strongId.textContent = s.session_id || '-';
-        tdId.appendChild(strongId);
-        tr.appendChild(tdId);
-
-        const tdProj = document.createElement('td');
-        tdProj.className = 'mono';
-        tdProj.textContent = s.project_name || 'unknown';
-        tr.appendChild(tdProj);
-
-        const tdAcc = document.createElement('td');
-        const accBadge = document.createElement('span');
-        accBadge.className = 'badge badge-info';
-        accBadge.textContent = s.accelerator || 'T4';
-        tdAcc.appendChild(accBadge);
-        tr.appendChild(tdAcc);
-
-        const tdState = document.createElement('td');
-        const stateBadge = document.createElement('span');
-        const st = String(s.state || 'UNKNOWN');
-        const cleanState = st.toLowerCase().replace(/[^a-z0-9_-]/g, '');
-        let stateClass = 'badge-neutral';
-        if (st === 'READY' || st === 'RUNNING' || st === 'ACTIVE') stateClass = 'badge-success';
-        else if (st === 'TERMINATED' || st === 'FAILED') stateClass = 'badge-danger';
-        else stateClass = 'badge-warning';
-        stateBadge.className = `badge ${stateClass}`;
-        stateBadge.textContent = st;
-        tdState.appendChild(stateBadge);
-        tr.appendChild(tdState);
-
-        const tdExp = document.createElement('td');
-        tdExp.className = 'mono';
-        tdExp.textContent = s.expires_at ? String(s.expires_at).slice(0, 19).replace('T', ' ') : '-';
-        tr.appendChild(tdExp);
-
-        const tdVer = document.createElement('td');
-        const verBadge = document.createElement('span');
-        verBadge.className = 'badge badge-managed';
-        verBadge.textContent = 'Managed';
-        tdVer.appendChild(verBadge);
-        tr.appendChild(tdVer);
-
-        tbody.appendChild(tr);
+      const plan = planSessionRows(cachedSessions, sessionsShowTerminated, SESSION_ROW_CAP);
+      if (plan.rows.length === 0) {
+        tbody.appendChild(buildSessionMessageRow('No active managed Colab sessions'));
+      }
+      for (const session of plan.rows) {
+        tbody.appendChild(buildSessionRow(session));
+      }
+      if (plan.moreNotShown > 0) {
+        tbody.appendChild(buildSessionMessageRow(`${plan.moreNotShown} more not shown`));
+      }
+      if (plan.terminatedCount > 0) {
+        tbody.appendChild(buildSessionToggleRow(plan.terminatedCount));
       }
     }
 
@@ -1731,7 +1834,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
           const meta = document.getElementById('header-meta');
           if (meta) {
-            const uptime = h.uptime_seconds != null ? `${Math.floor(Number(h.uptime_seconds) / 60)}m` : '0m';
+            const uptime = h.uptime_seconds != null ? `${Math.floor(Number(h.uptime_seconds) / 60)}m` : KPI_UNAVAILABLE;
             meta.textContent = `Uptime: ${uptime} • Samples: ${h.sample_count || 0}`;
           }
 
@@ -1752,35 +1855,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         // 2. Summary
         if (summaryRes.ok) {
           const s = await summaryRes.json();
-          const valCu = document.getElementById('val-cu');
-          if (valCu) {
-            const cuNum = Number(s.current_balance_cu);
-            valCu.textContent = (s.current_balance_cu != null && Number.isFinite(cuNum))
-              ? `${formatNumber(cuNum, 2)} CU`
-              : 'Unavailable';
-          }
-          const metaCu = document.getElementById('meta-cu');
-          if (metaCu) {
-            metaCu.textContent = s.is_stale ? 'Warning: Stale snapshot' : 'Official balance';
-          }
-
-          const valRate = document.getElementById('val-rate');
-          if (valRate) {
-            const rateNum = Number(s.current_rate_cu_per_hour);
-            valRate.textContent = (s.current_rate_cu_per_hour != null && Number.isFinite(rateNum))
-              ? `${formatNumber(rateNum, 2)} CU/hr`
-              : '0.00 CU/hr';
-          }
-
-          const valAssign = document.getElementById('val-assignments');
-          if (valAssign) {
-            valAssign.textContent = s.active_assignments != null ? String(s.active_assignments) : '0';
-          }
-
-          const valRuns = document.getElementById('val-runs');
-          if (valRuns) {
-            valRuns.textContent = `${s.managed_running_runs || 0} / ${s.total_runs || 0}`;
-          }
+          applySummaryKpis(s);
         }
 
         // 3. Compute Samples

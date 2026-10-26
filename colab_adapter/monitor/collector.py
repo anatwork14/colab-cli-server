@@ -31,11 +31,14 @@ _RATE_PATTERN = re.compile(r"(?:rate|consumption)\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?
 _ASSIGNMENTS_PATTERN = re.compile(r"(?:assignments?|active\s+sessions?)\s*[:=]?\s*([0-9]+)", re.IGNORECASE)
 
 
-def parse_usage_output(output: str) -> Tuple[Optional[float], Optional[float], int]:
-    """Parse compute units, rate, and active assignments from colab usage output."""
+def parse_usage_output(output: str) -> Tuple[Optional[float], Optional[float], Optional[int]]:
+    """Parse compute units, rate, and active assignments from colab usage output.
+
+    A value missing from the output is None (unknown), never 0.
+    """
     cu = None
     rate = None
-    assignments = 0
+    assignments = None
 
     m_cu = _CU_PATTERN.search(output)
     if m_cu:
@@ -171,7 +174,7 @@ class AccountUsageCollector:
                     if net_change > 0:
                         change_type = "TOP_UP"  # Honest accounting: balance increase
                     elif net_change < 0:
-                        if unmanaged_sessions_count > 0 or assignments > 1:
+                        if unmanaged_sessions_count > 0 or (assignments or 0) > 1:
                             change_type = "UNATTRIBUTED"  # External sessions active on account
                         else:
                             change_type = "SPEND"

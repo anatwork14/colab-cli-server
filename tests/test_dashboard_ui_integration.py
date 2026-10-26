@@ -588,7 +588,8 @@ class TestDashboardUIIntegration(unittest.TestCase):
             with urllib.request.urlopen(req_summary) as resp:
                 summary = json.loads(resp.read().decode("utf-8"))
                 self.assertIsNone(summary["current_balance_cu"])
-                self.assertEqual(summary["active_assignments"], 0)
+                # No sample means assignments are unknown (null), never a guessed 0.
+                self.assertIsNone(summary["active_assignments"])
 
             # Invariant: Empty states match explicit UI contract labels
             self.assertIn("No historical compute samples observed yet", DASHBOARD_HTML)

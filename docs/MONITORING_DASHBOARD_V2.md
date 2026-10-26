@@ -61,8 +61,8 @@ Localhost HTTP Server (127.0.0.1:8080 or TLS Reverse Proxy)
 #### 2. Account Compute-Unit & Burn-Rate Section
 Grid of 5 high-contrast KPI cards:
 - **Compute Units Balance**: Displays `current_balance_cu` (e.g. `84.50 CU`) or explicit `Unavailable` state when not yet observed.
-- **Consumption Rate**: Displays `current_rate_cu_per_hour` (e.g. `1.90 CU/hr`).
-- **Active Assignments**: Current number of allocated Colab virtual machines.
+- **Consumption Rate**: Displays `current_rate_cu_per_hour` (e.g. `1.90 CU/hr`), or `Unavailable` when null.
+- **Active Assignments**: Current number of allocated Colab virtual machines. Shows `Unavailable` when the latest usage sample did not report a count (`active_assignments` is `null`); it never shows a guessed `0`.
 - **Managed Runs**: Displays ratio of `managed_running_runs / total_runs`.
 - **Collector Health & Freshness**: Real-time status, backoff level, and last sample collection timestamp.
 
@@ -71,12 +71,14 @@ Grid of 5 high-contrast KPI cards:
 - Renders an inline, responsive SVG time-series chart with dual polylines:
   - Solid blue line (`#58a6ff`): Observed `balance_cu`.
   - Dashed green line (`#3fb950`): Consumption rate `rate_cu_per_hour`.
-- **Zero Fabrication**: If no historical samples exist, displays `"No historical compute samples observed yet"` (never interpolates fictitious past spending).
+- **Zero Fabrication**: If no historical samples exist, displays `"No historical compute samples observed yet"` (never interpolates fictitious past spending). A sample whose `rate_cu_per_hour` is `null` is skipped on the rate line, not plotted as 0.
 
 #### 4. Active Managed Sessions Table
-- Lists all active Colab sessions registered with `ManagedSessionRegistry`.
+- Lists Colab sessions registered with `ManagedSessionRegistry`, non-terminal sessions first (`READY`, `RUNNING`, `ACTIVE`, `PROVISIONING`, `STOPPING`, `UNKNOWN`).
+- Terminated sessions (`TERMINATED`, `FAILED`, `CLEANED`, `CANCELLED`) are collapsed behind a button labelled `Show N terminated` (`Hide N terminated` when expanded).
+- At most 50 rows are rendered. A `N more not shown` line appears when more rows exist.
 - Columns: `Session ID`, `Project Name`, `Accelerator (GPU)`, `State`, `Lease Expiration`, and `Verification Badge` (`Managed`).
-- Displays an empty state banner when no sessions are currently active.
+- Displays an empty state banner when no sessions are registered.
 
 #### 5. Training Runs & Historical Navigation Table
 - Live filtering by `Project ID` and experiment `Status` (`RUNNING`, `COMPLETED`, `FAILED`, `TERMINATED`).
@@ -87,7 +89,7 @@ Grid of 5 high-contrast KPI cards:
   - `Epoch / Step`
   - `Latest Metrics`: Extracted `loss`, `val_loss`, `accuracy`, and measured `gpu_util_pct`.
   - `Checkpoints`: Total saved checkpoints and latest checkpoint filename.
-  - `Drive Status`: Google Drive publication badge (`PUBLISHED`, `PENDING`, `DISABLED`).
+  - `Drive Status`: Google Drive publication badge (`PUBLISHED`, `PENDING`, `NOT RECORDED`). See the Drive status definitions in section 8.
   - `Source Snapshot`: Indicates whether code snapshot archive is available for exact reproducibility.
 - Interactive selection: Clicking any row highlights it and opens the **Run Inspector Panel**.
 
@@ -321,6 +323,25 @@ In the event of an operational issue or security regression in production or sta
    Because `MonitorServer` is strictly read-only and unmanaged sessions are safeguarded by `ManagedSessionRegistry`, stopping the dashboard has zero impact on active Colab runtimes.
 
 ## 8. Project-Scoped Monitoring Identity (PR #24, offline)
+
+### Drive publication status (`drive_publication_status`)
+
+Returned by `/api/v1/runs` (per run), `/api/v1/runs/<run_id>/drive` and shown in the dashboard. Values:
+
+- `PUBLISHED`: a Google Drive-backed artifact (`storage_provider: google_drive`, a `remote_file_id`, or `remote_available`) is recorded in the run manifest. This wins even if an earlier attempt was interrupted.
+- `PENDING`: an interrupted or in-progress Drive transfer is actually recorded. The recorded signals are a manifest `status` of `PARTIAL` or `FAILED`, or a `drive_publication_status` / `transfer_status` field with one of `UPLOAD_PENDING`, `UPLOADING`, `RETRY_PENDING`, `UPLOAD_FAILED`, `LOCAL_VERIFIED`, `PENDING`, `FAILED`, `PARTIAL` on an artifact, its `metadata`, or a telemetry event (`details` or top level). The manifest default `IN_PROGRESS` is not evidence of a transfer.
+- `NOT RECORDED`: no Drive information exists in the manifest or telemetry. Local-only runs get this value. It replaces the former guessed `PENDING` and `DISABLED` values.
+
+Earlier releases returned `PENDING` for every run without a Drive artifact and `DISABLED` when a run had no artifacts. Clients should treat `NOT RECORDED` as "unknown, not pending".
+
+### Account usage polling
+
+The monitor server runs one daemon thread (`colab-monitor-poller`) that calls the read-only `colab --auth=oauth2 usage` command through `AccountUsageCollector.poll_once()`. It never runs `new`, `run`, `ssh`, `stop` or `sessions`.
+
+- Interval: `--poll-interval SECONDS` on `python3 -m colab_adapter.cli monitor` (default `60`). `0` disables polling. Values below 15 are raised to 15. The first poll happens one interval after start, not at start.
+- Backoff: after each failed poll (an `ERROR` sample or an exception) the delay doubles, up to 600 s. The next success resets it to the interval. The collector's `backoff_level` and the health endpoint report failures.
+- Shutdown: `server.shutdown()` and `server.server_close()` wake the thread and stop it within about one second. Poll errors never stop the HTTP server.
+- Missing values: a usage output without an `Active assignments:` line gives `active_assignments: null`. A failed poll gives `null` balance, rate and assignments.
 
 Implemented in `colab_adapter/monitor/server.py` and `colab_adapter/telemetry.py` on branch `fix/v2-postmerge-hardening-23` (PR #24). Offline tests only; the dashboard has not been validated against a live Colab account.
 
