@@ -183,3 +183,18 @@ Findings (issue #31, not fixed): the account-usage collector is never started (`
 Limits: this validates the SSH-tunnel path and the monitor's authentication and read-only behaviour from a second device. It does not validate public exposure, TLS or a reverse proxy, display of more than one checkpoint revision, or the live collector. The data was seeded from the recorded G5 output rather than streamed by a running job, so "telemetry matches the executed workload" is verified against a recorded run.
 
 Updated verdict: `PARTIAL_LIVE_VALIDATION`. Verified live: Drive D1-D5, one bounded T4 session (sync, probe, training, checkpoint hash match, verified manual stop), the guard deadline stop (success path) and second-device monitoring. Still missing for `LIVE_INTEGRATION_VERIFIED`: the integrated workflow (GPU checkpoint published to Drive in one flow), failure paths on real Colab (nonzero `new`, orphan or `[?]`, 'not found' stop, Drive 403/429), and owner and Opus sign-off.
+
+### 7.10 I1 integrated step: GPU checkpoint published to Drive, 2026-10-26
+Scope (stated narrowly): this joins two separately verified live pieces. The 3,111-byte checkpoint produced on the real T4 in the G5 run and verified at four points in G6 (sha256 `277d08f9…fdec9f`) was published through the real `GoogleDriveArtifactStore` with the dedicated `drive.file` token into a new disposable root folder `colab-live-integrated-20261026T012445Z` (project `live-smoke`, run `run-g5-20261026`, path `checkpoints/model.pt`). It is NOT a single continuous GPU-to-Drive run: the GPU session had already been stopped and the file was published from its saved local copy in a later step. Authorization: the owner chose "Both, publish first" in reply to the question of which flow to run next (a Drive write; no GPU allocation).
+
+| Check | Result | Observed |
+|---|---|---|
+| Source is the G6-verified file | PASS | script asserts sha256 equals `277d08f9…fdec9f` before publishing |
+| Publish | PASS | remote file id recorded, size 3,111, sha256 equal, artifact id carries the full sha256, `is_latest` true |
+| Round trip on a fresh adapter instance | PASS | downloaded bytes sha256 equals `277d08f9…fdec9f` (3,111 bytes) |
+| Replay | PASS | second `publish` returned the same remote file id; the API counts show 1 upload init and 1 upload chunk in total |
+| Secrets | PASS | no access, refresh or client-secret value appears in the output |
+
+API requests: 32 (19 list, 6 folder create, 2 get, 2 download, 1 upload init, 1 upload chunk, 1 patch), cap 60 for this step. Evidence: `~/colab-live-evidence/integrated-20261026/evidence.json` (0600). No deletion was performed; the new root folder and file remain in Drive for the owner to remove in the web UI (the same `drive.file` limitation on trashing a root folder was seen earlier).
+
+Updated verdict: `PARTIAL_LIVE_VALIDATION`. Verified live: Drive D1-D5, one bounded T4 session, the guard deadline stop (success path), second-device monitoring, and publication of the real GPU checkpoint to Drive with a verified round trip. Still missing for `LIVE_INTEGRATION_VERIFIED`: failure paths on real Colab (nonzero `new`, orphan or `[?]`, 'not found' stop, Drive 403/429), a single continuous GPU-to-Drive workflow, and owner and Opus sign-off.
