@@ -1,6 +1,6 @@
 # Live Test Evidence Record
 
-Status: **TEMPLATE, PARTIALLY FILLED.** Only the offline baseline row has any content. Every other row is `NOT RUN` until a test is actually executed and its artifacts are recorded.
+Status: **LIVE RESULTS RECORDED IN SECTION 7 (2026-10-26); the table in Section 3 is the original template and is superseded by Section 7 for the tests listed there.** Only the offline baseline row has any content. Every other row is `NOT RUN` until a test is actually executed and its artifacts are recorded.
 
 ## 1. Header
 
@@ -98,3 +98,51 @@ Current verdict: `<TO BE FILLED>` (no live test has been executed at the time of
 3. If a prerequisite is missing (second device, owner approval, quota, credential validity), the row is **BLOCKED**, not PASS or FAIL.
 4. Resource figures are observed account-wide deltas, not per-job billing.
 5. Unfilled `<TO BE FILLED>` cells are not evidence. Do not infer them.
+
+
+## 7. Live results, 2026-10-26 (main `3a62c9b291f755e06533756eba590dcd4d3ea094`)
+
+Environment: Ubuntu 20.04.6, Python 3.8.10, official Colab CLI 0.7.5 (`--auth=oauth2`), uv 0.12.13. Remote runtime: Python 3.13.16, Torch 2.11.0+cu130, Tesla T4. Local suite on this commit: 847 tests, OK, 3 skipped (torch-dependent); post-merge CI run 40213697055: 3.8, 3.12, 3.13 and browser-security all success. Private raw evidence (not in the repo): `~/colab-live-evidence/drive-20261026/` (mode 0600). Identifiers below are the harness-created test objects only; no account address, token or secret appears here.
+
+### 7.1 Authorization (owner, in chat)
+- Drive: `APPROVE DRIVE SMOKE TEST` (scope `drive.file`, 3 revisions, cap 150 requests, no deletion by the harness).
+- GPU: `APPROVE 1 T4 SESSION — 900 SECONDS — 5 CU LIMIT`; the owner personally ran `project approve apr-7d94d6d7…` in their own terminal and typed the phrase (`approved_at` recorded 00:40:06 UTC). One `project up`.
+- Cleanup: "Allow all" (owner) for the follow-up items; only the Drive test tree was trashed (see 7.4).
+
+### 7.2 Live Google Drive (real API, real `GoogleDriveArtifactStore`)
+| Test | Result | Observed |
+|---|---|---|
+| D1 first publish | PASS | remote id, size, MD5, re-downloaded bytes' SHA256, manifest and journal verified (19.1 s) |
+| D2 B then C | PASS | 3 distinct remote ids, each full hash verified, history kept (20.1 s) |
+| D3 replay A | PASS | no upload, no PATCH, A historical, C still latest (1.6 s) |
+| D4 recovery | PASS | exact A, B, C on a fresh store; after deleting only the isolated test manifest and backup, latest recovered (8.7 s) |
+| D5 compatibility | PASS | property byte limits, real PATCH, `pageSize=1` listing, Unicode and long names, error reporting (20.7 s) |
+
+API requests: 88 of the 150 cap (42 list, 12 get, 9 download, 9 patch, 6 folder create, 5 upload init, 5 upload chunk). Secret scan: 0 leaks. Revision hashes (full values in the private evidence): A `08c4676f…` 65,536 B; B `be1d62f8…` 196,608 B; C `d7784ed9…` 524,288 B. Not exercised live: real 403/429 rate-limit and retry behaviour (cannot be provoked safely).
+
+### 7.3 Live Colab T4 (one allocation)
+| Step | Result | Observed |
+|---|---|---|
+| Baseline | PASS | 186.75 CU, 0.00/hr, Active assignments 0, no runtime, no managed session |
+| `project up` (single) | PASS | exit 0, session `colab-v2-live-smoke-ca8ca3ab` READY in about 19 s, T4, lease 900 s |
+| G3d guard and account | PASS | guard alive, deadline about 888 s ahead, `assignments_before` 0, Active assignments 1, session listed by name, usage rate 1.07/hr |
+| G4 sync + probe | PASS | 3 files / 13,258 bytes synced; `CUDA available: True`, Tesla T4, `GPU_PROBE_OK device=cuda:0 checksum=-674`, final `EXIT_CODE 0` |
+| G5 training | PASS | `Device: cuda:0`, 60 metric events for steps 1 to 60, loss 9.74 to 0.088, run_started / checkpoint_saved / run_finished present, `DONE_OK`, final `EXIT_CODE 0` (about 10 s) |
+| G6 checkpoint | PASS | remote `sha256sum`, sidecar, `DONE_OK` value and the locally decoded 3,111-byte file all `277d08f9c90aba66d3ebf234553a9720ec86342dfcb8fae320cf3f0ea6fdec9f` |
+| Teardown | PASS | `project stop` exit 0; real `sessions`: none; `usage`: Active assignments 0; registry TERMINATED, `verification: strong`, `orphan_possible: false`; no lease-guard process left |
+
+Resources: one session, about 2 minutes. Account-wide balance 186.75 to 186.74 CU (display rounds to 0.01; an account-wide delta, not per-job billing). No GPU run was started outside the plan.
+
+### 7.4 Cleanup of the Drive test data
+Authorized by the owner. The root folder could not be trashed with the narrow token: Drive answered 403 `appNotAuthorizedToChild` even after every item inside it was trashed. All 11 items under the root (5 files, 5 sub-folders, plus the `projects` tree) were moved to Trash (reversible); the empty root folder `colab-live-smoke-20261026T003700Z-ea2fb8` remains and must be removed by the owner in the Drive web UI. A broader-scope token was deliberately not used. Finding: with a `drive.file` token, trashing the harness root folder fails; the harness's cleanup plan should say so.
+
+### 7.5 Not run / unverified
+- Guard deadline drill (optional G7): not run; the guard's own deadline stop has never been observed on real Colab. Only the manual verified stop was exercised.
+- Failure paths on real Colab (nonzero `new`, orphan runtime, `[?]` line, "not found" stop): not exercised; they remain offline-verified only.
+- Cross-device monitoring: not run (needs a second device or SSH tunnel) - BLOCKED.
+- Integrated workflow (checkpoint to Drive after GPU): not run.
+- V1 `run`/`submit_job` and `colab_server.py run`: not covered and not safe-by-design for live use (known gap in PR #28).
+- Provisioning under load, long-running exec output limits, and usage-count lag were not characterized.
+
+### 7.6 Verdict at this point
+`PARTIAL_LIVE_VALIDATION`. Verified live: Drive D1-D5, one bounded T4 session with sync, GPU probe, training, checkpoint hash match, verified teardown, and clean accounting. Mandatory scenarios still missing for `LIVE_INTEGRATION_VERIFIED`: guard drill (G7), cross-device monitoring, integrated workflow, owner and Opus sign-off.
