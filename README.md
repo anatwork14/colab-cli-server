@@ -165,7 +165,7 @@ This wrapper and its documentation are licensed under [MIT](LICENSE). Google's `
 
 ## V2 — VKong-Inspired Project Workspaces and Training Monitor
 
-> **Status:** Colab CLI Server V2 (Milestones M1–M8, Google Drive Durable Storage & Cross-Device Workspaces) was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Post-merge hardening and multi-revision catastrophic recovery (Review `5642047783` F1–F4) are delivered in **Issue #23 (`fix/v2-postmerge-hardening-23`)**. Status: `READY_FOR_INDEPENDENT_MERGE_REVIEW pending CI only`. All human approval gates strictly preserved.
+> **Status:** Colab CLI Server V2 (Milestones M1–M8, Google Drive Durable Storage & Cross-Device Workspaces) was merged into `main` via PR #22 (`670c6bc` / `a1629f9846f19c8d5d4e90469ee9e376b64d98e9`). Post-merge hardening and multi-revision catastrophic recovery (Review `5642047783` F1–F4) are delivered in **Issue #23 (`fix/v2-postmerge-hardening-23`)**. Status: merged. A first live validation was run on 2026-10-26; the success path is verified with limitations (verdict `LIVE_SUCCESS_PATH_VERIFIED_WITH_LIMITATIONS`, see [docs/live/LIVE_TEST_EVIDENCE.md](docs/live/LIVE_TEST_EVIDENCE.md)). This is not production readiness and not failure-path verification. All human approval gates remain in force.
 
 The V2 implementation extends the original one-shot adapter into a comprehensive project-centric remote GPU workspace system and real-time training monitor:
 
@@ -173,7 +173,7 @@ The V2 implementation extends the original one-shot adapter into a comprehensive
 - **Content-Addressed Incremental Sync:** Two-phase workspace synchronization transfers only modified files via streaming chunked SHA-256 diffing, with atomic commit and opt-in remote file deletion.
 - **Collision-Resistant Session Lifecycle:** Project runtime leases (`colab-v2-<name>-<uuid>`) prevent collisions, enforce state machine transitions, lock against concurrent allocations, and fail-closed on unmanaged user sessions.
 - **Multi-Tier Checkpoint & Immutable Revision Recovery:** Staged atomic download with integrity checksums, ZIP header verification, safe PyTorch `weights_only=True` inspection, and immutable `@sha256_<digest>` revision history (`PublicationManifest` v2) preserving both latest and historical checkpoints across local and Google Drive storage.
-- **Private Cross-Device Training & Compute Monitor:** Read-only HTTP/SSE dashboard displaying compute unit balance, burn rates, top-up detection, unattributed spend alerts, run loss/step charts, and checkpoint revision history (`LATEST` vs `HISTORICAL`), hardened with per-response cryptographic CSP nonces and verified in headless Chromium CI.
+- **Private Cross-Device Training & Compute Monitor:** Read-only HTTP/SSE dashboard displaying compute unit balance and burn rates when the usage poller has data (otherwise shown as *Unavailable*; the poller and display fixes in PR #32 have not been retested live), top-up detection, unattributed spend alerts, run loss/step charts, and checkpoint revision history (`LATEST` vs `HISTORICAL`), hardened with per-response cryptographic CSP nonces and verified in headless Chromium CI.
 
 ### Project Workspace CLI Commands
 
@@ -330,7 +330,7 @@ python3 -m colab_adapter.cli project up --manifest ./research-project/colab-proj
 
 **Testing & Verification Demarcation:**
 - All features and failure recovery modes are verified offline using deterministic mock clients (`OFFLINE_RELEASE_READY`).
-- Real Google Drive and Google Colab environments have never been exercised in this codebase/worktree; live OAuth token exchanges, Drive cloud writes, and remote GPU compute are strictly unauthorized without explicit operator approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`).
+- Live validation status: on 2026-10-26 the owner-approved success path was exercised against real Google Drive (D1-D5, `drive.file` scope) and real Colab (one bounded T4 session, a lease-guard deadline drill, a second-device monitor check and a Drive publication of the GPU checkpoint); see [docs/live/LIVE_TEST_EVIDENCE.md](docs/live/LIVE_TEST_EVIDENCE.md). Real-provider failure paths (nonzero `colab new`, orphan or `[?]` runtimes, Drive 403/429), a single continuous GPU-to-Drive run and a post-#32 live monitor retest are still unverified. Every live OAuth exchange, Drive write and GPU allocation still requires explicit, specific operator approval (`LIVE_VALIDATION_REQUIRES_APPROVAL`); the lease guard is a best-effort host-side deadline, not a billing cap.
 
 **Security & Account Protection:**
 - Poller executes strictly read-only official CLI queries (`colab usage`, `colab sessions`) and **never** provisions cloud VMs.
