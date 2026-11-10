@@ -63,6 +63,8 @@ class AssetPolicyTests(unittest.TestCase):
                    "sources": [{"type": "archive", "path": str(archive),
                                 "sha256": assets.hash_file(archive)}]}
             spec = _asset_manifest(root, row)
+            original_spec = root / "asset-original.json"
+            original_spec.write_bytes(spec.read_bytes())
             scratch = root / "gpu"
             assets.stage(spec, "model-01", scratch)
             mirrored = assets.pack(spec, "model-01", scratch, root / "optional-mirror.tar")
@@ -77,7 +79,7 @@ class AssetPolicyTests(unittest.TestCase):
             self.assertTrue(assets.verify(other, "model-01", root / "new-gpu")["verified"])
             archive.write_bytes(b"tampered-archive")
             with self.assertRaises(ValueError):
-                assets.stage(spec, "model-01", root / "third-gpu")
+                assets.stage(original_spec, "model-01", root / "third-gpu")
 
     def test_reject_archive_traversal_and_symlink(self):
         with tempfile.TemporaryDirectory() as folder:
