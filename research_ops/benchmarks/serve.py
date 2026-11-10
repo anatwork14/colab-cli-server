@@ -131,6 +131,19 @@ def start(args):
             if type(n) is not int or not 1<=n<=16:
                 raise ValueError("Invalid speculative token count")
             argv.extend(["--speculative-config",json.dumps(cfg,separators=(",",":"))])
+    if getattr(args, "throughput_sweep", False):
+        if not arm or arm.mode!="normal" or arm.method is not None:
+            raise RuntimeError("Initial throughput sweep supports BASE arm only; H2O and DA require GPU-qualified engine")
+        if int(args.max_model_len)<18432:
+            raise ValueError("Use max-model-len >= 18432 to fit 16,384 input + 256 output + chat template")
+        # vLLM 0.29.0: these MUST be frozen on the real engine, not merely
+        # represented by a client-side manifest or disabled in a post-hoc graph.
+        argv.extend([
+            "--no-enable-prefix-caching",
+            "--max-num-seqs","32",
+            "--default-chat-template-kwargs",
+            json.dumps({"enable_thinking":False},separators=(",",":")),
+        ])
     engine=verify_engine(args.engine_mode,args.source_root,args.source_revision,require_gpu=True)
     target=Path(args.output_root).resolve()/args.run_id
     target.mkdir(parents=True,exist_ok=False)
@@ -150,6 +163,8 @@ def start(args):
         "draft_asset_tree_sha256":(
             draft_receipt["tree_sha256"] if draft_receipt else None),
         "da_hook_runtime_verified":False,
+        "throughput_sweep_server":bool(getattr(args,"throughput_sweep",False)),
+        "cache_protocol":"disabled" if getattr(args,"throughput_sweep",False) else "unknown",
     }
     _atomic_json(target/"server_process.json",record)
     return record
@@ -235,6 +250,8 @@ def main():
                    help="Verified staged HF draft asset ID for DFlash/EAGLE3")
     p.add_argument("--h2o-policy-manifest",
                    help="Optional H2O policy-only receipt; GPU execution is intentionally blocked")
+    p.add_argument("--throughput-sweep",action="store_true",
+                   help="Freeze no prefix caching, non-thinking chat and max-num-seqs=32 (base arm only)")
     p.add_argument("--output-root",default="/content/research-vllm-servers")
     p.add_argument("--run-id",required=True)
     p.add_argument("--execute",action="store_true")
