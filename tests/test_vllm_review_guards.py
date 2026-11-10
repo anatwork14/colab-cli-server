@@ -76,6 +76,17 @@ class LiveServerSafetyTests(unittest.TestCase):
                     serve._assert_model_origin({"role":"model","source":src},
                                                "Qwen/Qwen3.5-4B")
 
+    def test_normal_experiment_cannot_inherit_author_da_activation(self):
+        args=SimpleNamespace(execute=True,run_id="audit-01",port=8000,
+            gpu_memory_utilization=0.85,max_model_len=32768,max_images=1,
+            experiment_mode="normal")
+        with patch.dict(serve.os.environ,
+                        {"H2O_VLLM_MODE":"disabled","DATTN_MODEL":"Qwen/Qwen3.5-4B"}):
+            with patch.object(serve,"verify_asset",
+                              side_effect=AssertionError("should fail before assets")):
+                with self.assertRaisesRegex(RuntimeError,"clean isolated engine"):
+                    serve.start(args)
+
     def test_h2o_passthrough_cannot_contaminate_benchmark_process(self):
         args=SimpleNamespace(execute=True,run_id="audit-01",port=8000,
             gpu_memory_utilization=0.85,max_model_len=32768,max_images=1)
