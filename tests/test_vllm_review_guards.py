@@ -62,14 +62,18 @@ class LiveServerSafetyTests(unittest.TestCase):
             "role":"model","source":{"type":"huggingface",
              "repo_id":"Qwen/Qwen3.5-4B","revision":pin}},
             "Qwen/Qwen3.5-4B")["revision"],pin)
-        cache={"role":"model","source":{"type":"archive",
+        cache={"role":"model","tree_sha256":"d"*64,
+               "source":{"type":"archive",
                "path":"/content/weights.tar","sha256":"f"*64,
-               "origin_repo_id":"Qwen/Qwen3.5-4B","origin_revision":pin}}
+               "origin_repo_id":"Qwen/Qwen3.5-4B","origin_revision":pin,
+               "origin_tree_sha256":"d"*64}}
         self.assertEqual(serve._assert_model_origin(cache,"Qwen/Qwen3.5-4B")["revision"],pin)
         for src in (
             {"type":"huggingface","repo_id":"wrong/weights","revision":pin},
             {"type":"directory","path":"/content/cache","tree_sha256":"a"*64},
             {"type":"archive","origin_repo_id":"Qwen/Qwen3.5-4B","origin_revision":"main"},
+            {"type":"archive","origin_repo_id":"Qwen/Qwen3.5-4B",
+             "origin_revision":pin,"origin_tree_sha256":"1"*64},
         ):
             with self.subTest(src=src):
                 with self.assertRaises(ValueError):
