@@ -216,7 +216,8 @@ def _hardware():
 def run(args):
     if not SLUG.fullmatch(args.run_id):
         raise ValueError("Invalid run ID")
-    if args.concurrency<1 or args.concurrency>32 or args.limit<0 or args.max_tokens<1 or args.timeout<1:
+    if (args.concurrency<1 or args.concurrency>32 or args.limit<0 or
+            args.max_tokens<1 or args.timeout<1 or args.warmup<0 or args.warmup>10):
         raise ValueError("Invalid concurrency, limit or generation budget")
     if args.kind=="mmlongbench_doc" and not args.deep_pdf:
         raise ValueError("MMLongBench-Doc GPU execution requires --deep-pdf preflight")
@@ -234,6 +235,26 @@ def run(args):
     engine_receipt=verify_engine(args.engine_mode,args.source_root,
                                  args.source_revision,require_gpu=True)
     hardware=_hardware()
+    # A model id can be an alias for arbitrary weights. Tie this server process
+    # to the exact staged asset, committed engine and local TCP port.
+    from .serve import _owned
+    srv=json.loads(Path(args.server_receipt).read_text(encoding="utf8"))
+    if not _owned(srv):
+        raise RuntimeError("No live process matching the pinned server process receipt")
+    if srv.get("model_asset_sha256") != model_receipt["tree_sha256"]:
+        raise RuntimeError("Served weight source differs from frozen model")
+    if srv.get("engine") != engine_receipt:
+        raise RuntimeError("Served engine does not match frozen runtime provenance")
+    if srv.get("serving_model") != args.model:
+        raise RuntimeError("Served-model alias differs from frozen model name")
+    command=srv.get("argv_without_tokens", [])
+    expected_port=urlsplit(args.url).port or 80
+    try:
+        command_port=int(command[command.index("--port")+1])
+    except (ValueError,IndexError,TypeError):
+        raise RuntimeError("Server receipt has no recorded localhost port")
+    if command_port != expected_port:
+        raise RuntimeError("Server receipt port does not match requested vLLM endpoint")
     server=server_check(args.url,args.model)
     if args.limit and args.limit>=args.expected_count:
         raise ValueError("--limit is a pilot subset knob, not full population")
@@ -252,6 +273,8 @@ def run(args):
         "max_tokens":args.max_tokens,"max_images":args.max_images,
         "max_pages":args.max_pages,"dpi":args.dpi,
         "concurrency":args.concurrency,"temperature":0,
+        "warmup_requests":args.warmup,
+        "server_pid_start_ticks":srv["start_ticks"],
         "subset":bool(args.limit),"run_id_header":args.run_id,
     }
     meta=out/"run_config.json"
@@ -263,7 +286,6 @@ def run(args):
     else:
         out.mkdir(parents=True)
         _atomic_json(meta,config)
-    started=time.perf_counter()
     indexed = list(enumerate(selected))
     pending=[]
     receipts=[None]*len(indexed)
@@ -296,6 +318,19 @@ def run(args):
         _atomic_json(_slug_receipt(out,name),result)
         return i,result
 
+    # Warmup runs use ORIGINAL dataset questions. Exclude warmup output from
+    # quality/latency and explicitly record count before measured requests.
+    if pending and args.warmup:
+        for k in range(args.warmup):
+            warm_messages,_=build(args.kind,selected[k%len(selected)],dataset_root,
+                max_images=args.max_images,max_pages=args.max_pages,dpi=args.dpi)
+            streaming_completion(args.url,args.model,warm_messages,
+                                 max_tokens=args.max_tokens,timeout_s=args.timeout)
+        _atomic_json(out/"warmup_status.json",{
+            "status":"REAL_DATA_WARMUP_COMPLETED","count":args.warmup,
+            "excluded_from_score":True,"original_question_ids":[
+                ids[k%len(selected)] for k in range(args.warmup)]})
+    started=time.perf_counter()
     if pending:
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             for future in as_completed([pool.submit(eval_one,i,row) for i,row in pending]):
@@ -322,6 +357,7 @@ def run(args):
     summary["dataset_audit_sha256"]=hashlib.sha256(
         json.dumps(qualification,sort_keys=True).encode()).hexdigest()
     summary["resume_used"]=args.resume
+    summary["warmup_requests"]=args.warmup
     summary["existing_receipts_before_run"]=len(indexed)-len(pending)
     summary["completed_utc"]=utc()
     _atomic_json(out/"engineering_summary.json",summary)
@@ -340,6 +376,7 @@ def main():
     p.add_argument("--samples-rel",required=True)
     p.add_argument("--expected-count",type=int,required=True)
     p.add_argument("--model",required=True,help="Exact served model id")
+    p.add_argument("--server-receipt",required=True,help="Verified live server_process.json path")
     p.add_argument("--url",default="http://127.0.0.1:8000")
     p.add_argument("--engine-mode",choices=("stock","source_python","source_compiled"),default="stock")
     p.add_argument("--source-root")
@@ -351,6 +388,7 @@ def main():
     p.add_argument("--max-pages",type=int,default=128)
     p.add_argument("--dpi",type=int,default=72)
     p.add_argument("--concurrency",type=int,default=1)
+    p.add_argument("--warmup",type=int,default=1,help="Real-question warmups, excluded from score")
     p.add_argument("--limit",type=int,default=0,help="Real-row engineering subset; never official")
     p.add_argument("--timeout",type=int,default=180)
     p.add_argument("--deep-pdf",action="store_true")
