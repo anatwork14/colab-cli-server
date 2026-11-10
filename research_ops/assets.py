@@ -341,13 +341,57 @@ def plan(manifest_file, asset_id, scratch, source_index=None):
             "require_execute_for_download_or_copy": True}
 
 
+def pack(manifest_file, asset_id, scratch, output):
+    """Make optional immutable TAR mirror from a verified staged asset.
+
+    Pack locally first. Only put it in Google Drive when operator explicitly
+    chooses that destination and has reviewed licensing/privacy/storage quota.
+    """
+    verified = verify(manifest_file, asset_id, scratch)
+    source = Path(scratch).expanduser().resolve() / asset_id
+    outfile = Path(output).expanduser()
+    if not outfile.is_absolute() or outfile.suffix != ".tar":
+        raise ValueError("Mirror output must be an absolute .tar path")
+    outfile = outfile.resolve()
+    if outfile.exists() or (Path(str(outfile) + ".sha256.json")).exists():
+        raise FileExistsError("Refusing to overwrite existing cached archive/sidecar")
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    fd, filename = tempfile.mkstemp(prefix="." + outfile.name + ".", dir=str(outfile.parent))
+    os.close(fd)
+    try:
+        with tarfile.open(filename, "w") as tf:
+            for path, relative in _tree_files(source):
+                info = tf.gettarinfo(str(path), arcname=relative)
+                info.uid, info.gid = 0, 0
+                info.uname, info.gname = "", ""
+                info.mtime = 0
+                with path.open("rb") as reader:
+                    tf.addfile(info, reader)
+        sha256 = hash_file(filename)
+        os.replace(filename, str(outfile))
+        result = {"status": "VERIFIED_OPTIONAL_ARCHIVE_MIRROR",
+                  "asset_id": asset_id, "archive": str(outfile),
+                  "archive_sha256": sha256, "source_tree_sha256": verified["tree_sha256"],
+                  "bytes": outfile.stat().st_size,
+                  "source_template": {"type": "archive", "path": str(outfile),
+                                      "sha256": sha256},
+                  "warning": "Drive mirror is OPTIONAL. Remote upload/replication verification is not implied."}
+        Path(str(outfile) + ".sha256.json").write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return result
+    finally:
+        if os.path.exists(filename):
+            os.unlink(filename)
+
+
 def main():
     p = argparse.ArgumentParser(description="Pinned real model/dataset staging; dry-run first.")
-    p.add_argument("action", choices=("plan", "stage", "verify", "validate"))
+    p.add_argument("action", choices=("plan", "stage", "verify", "validate", "pack"))
     p.add_argument("--manifest", required=True)
     p.add_argument("--asset")
     p.add_argument("--scratch", default="/content/research-assets")
     p.add_argument("--source-index", type=int, default=None)
+    p.add_argument("--output", help="Absolute .tar destination for optional verified mirror")
     p.add_argument("--execute", action="store_true",
                    help="Explicitly allow file copying/downloading into scratch")
     a = p.parse_args()
@@ -361,7 +405,11 @@ def main():
     elif a.action == "verify":
         result = verify(a.manifest, a.asset, a.scratch)
     elif not a.execute:
-        raise SystemExit("stage requires --execute (can download large weights); run plan first")
+        raise SystemExit("stage/pack require --execute (large file I/O); run plan first")
+    elif a.action == "pack":
+        if not a.output:
+            p.error("pack requires --output /absolute/path/asset.tar")
+        result = pack(a.manifest, a.asset, a.scratch, a.output)
     else:
         result = stage(a.manifest, a.asset, a.scratch, a.source_index)
     print(json.dumps(result, indent=2, sort_keys=True))
