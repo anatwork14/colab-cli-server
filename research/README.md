@@ -15,7 +15,7 @@ benchmark-data generation, or linking to other GitHub research repositories.**
       protocols/            Frozen asset and experiment definitions
       studies/              Study-level hypotheses and ablation matrices
       experiments/          Declared experimental cells, before GPU runs
-      observations/         Evidenced engineering notes AFTER runs
+      observations/         Evidence notes plus explicitly UNOBSERVED living plans
       results/              Published summaries only; never raw/large blobs
       agents/               Agent operating requirements
     tests/test_research_*.py  Offline CPU tests, no GPU/Drive API
@@ -84,3 +84,5 @@ allocate Colab sessions or trigger Google Drive API operations.
   neither research_ops nor an agent can allocate via its API.
 - The older examples/train_model.py and examples/synthetic_dataset.py remain
   historical generic examples, not active data-science research methods.
+
+Owner-requested evolving first benchmark: [Qwen3.5-4B Base versus EAGLE3 on MemLens and MMLongBench-Doc](observations/2026-11-10-qwen35-4b-base-vs-eagle3-memlens-mmlongbench.md). A plan is not an observed result; frozen executed run evidence stays immutable.

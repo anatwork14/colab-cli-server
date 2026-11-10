@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "plan_id": "qwen35-4b-base-eagle3-memlens32k-mmlongdoc",
+  "plan_revision": "0.1",
+  "updated_date": "2026-11-10",
+  "status": "PLANNED_NOT_EXECUTED",
+  "mutable_observation": true,
+  "experimental_results_available": false,
+  "training": false,
+  "finetuning": false,
+  "engine": {
+    "name": "vllm",
+    "version": "0.29.0",
+    "upstream_git_sha": "98dff2a81d747d1dba01a47f939f48c3526d4206",
+    "runtime_source_sha": null,
+    "max_num_seqs": 32,
+    "prefix_caching": false,
+    "endpoint": "/v1/chat/completions",
+    "streaming": true
+  },
+  "model": {
+    "repo_id": "Qwen/Qwen3.5-4B",
+    "revision": null,
+    "post_trained": true,
+    "parameters_billion": 4
+  },
+  "arms": [
+    {
+      "id": "A0",
+      "name": "base",
+      "mode": "normal",
+      "draft": null,
+      "qualification": "PENDING_GPU_BASELINE"
+    },
+    {
+      "id": "A1",
+      "name": "eagle3",
+      "mode": "speculative",
+      "method": "eagle3",
+      "draft_repo_id": "yuyijiong/Qwen3.5-4B-Eagle3",
+      "draft_revision": null,
+      "speculative_tokens_candidate": 3,
+      "multimodal_compatibility": "BLOCKED_UNQUALIFIED"
+    }
+  ],
+  "datasets": [
+    {
+      "id": "memlens32k",
+      "publisher": "xiyuRenBill/MEMLENS",
+      "revision": null,
+      "original_question_file": "dataset_32k.json",
+      "questions": 789,
+      "images_expected": 4695,
+      "official_scorer": "LLM_AS_JUDGE"
+    },
+    {
+      "id": "mmlongdoc",
+      "publisher": "yubo2333/MMLongBench-Doc",
+      "revision": null,
+      "original_question_format": "PARQUET",
+      "questions": 1091,
+      "original_pdfs_expected": 135,
+      "official_scorer": "ANSWER_EXTRACTION_PLUS_ORIGINAL_SCORE"
+    }
+  ],
+  "quality": {
+    "original_unmodified_inputs": true,
+    "all_original_questions": true,
+    "temperature": 0,
+    "thinking_disabled": "REQUIRES_CHAT_TEMPLATE_VERIFICATION",
+    "max_output_tokens_initial": 256,
+    "ignore_eos": false,
+    "synthetic_data": false,
+    "official_judges_qualified": false,
+    "planned_arm_question_evaluations": 3760
+  },
+  "performance": {
+    "input_token_targets": [
+      128,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "ccu": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "n_requests_rule": "max(16,4*ccu)",
+    "warmups_rule": "ccu",
+    "eligible_inputs": "ORIGINAL_AUTHENTIC_NATURALLY_MATCHING_TOKEN_BUCKETS",
+    "bucket_tolerance_fraction_proposal": 0.1,
+    "missing_bucket_status": "INSUFFICIENT_AUTHENTIC_INPUTS",
+    "no_truncation_or_padding": true,
+    "matched_trace_between_arms": true,
+    "seed_new_per_repetition": true,
+    "output_tokens_target": 256,
+    "ignore_eos": "REQUIRE_RUNTIME_PROOF_CHAT_STREAM",
+    "temperature": 0,
+    "max_num_seqs": 32,
+    "prefix_caching": false,
+    "cells_per_dataset_arm": 42,
+    "theoretical_total_cells": 168,
+    "measured_requests_per_dataset_arm": 1904,
+    "warmup_requests_per_dataset_arm": 441,
+    "theoretical_total_measured_requests": 7616,
+    "theoretical_total_warmup_requests": 1764,
+    "planned_initial_repetitions": 1,
+    "proposed_reportable_repetitions": 3
+  },
+  "metrics": {
+    "official_quality": [
+      "memlens_judged_accuracy",
+      "memlens_by_question_type",
+      "mmlong_accuracy",
+      "mmlong_f1",
+      "cross_page",
+      "unanswerable",
+      "doc_type",
+      "evidence_type",
+      "quality_delta"
+    ],
+    "hallucination": [
+      "supported_answer_rate",
+      "unsupported_false_support_rate",
+      "unanswerable_false_assertion_rate",
+      "judge_coverage"
+    ],
+    "latency": [
+      "ttft_p50_p95_p99",
+      "tpot_true_or_explicit_estimate_p50_p95_p99",
+      "e2e_p50_p95_p99",
+      "queue_latency"
+    ],
+    "throughput": [
+      "request_per_sec",
+      "output_token_per_sec",
+      "total_token_per_sec",
+      "effective_ccu",
+      "scaling_efficiency"
+    ],
+    "memory": [
+      "peak_gpu_vram",
+      "peak_process_vram",
+      "torch_allocated_reserved",
+      "kv_cache_utilization",
+      "preemption",
+      "oom"
+    ],
+    "eagle3": [
+      "draft_proposed_tokens",
+      "draft_accepted_tokens",
+      "acceptance_ratio",
+      "rejection_count",
+      "verified_steps",
+      "draft_latency",
+      "draft_vram",
+      "fallback_count"
+    ],
+    "reliability": [
+      "attempts",
+      "success",
+      "failures",
+      "timeouts",
+      "oom",
+      "http_errors",
+      "cancellations",
+      "output_count_compliance"
+    ],
+    "paired": [
+      "speedup_ttft",
+      "speedup_tpot",
+      "speedup_e2e",
+      "throughput_speedup",
+      "vram_delta",
+      "official_quality_delta",
+      "bootstrap_confidence_interval"
+    ]
+  },
+  "readiness": {
+    "model_pin": "PENDING",
+    "dataset_pins": "PENDING",
+    "base_multimodal": "PENDING",
+    "eagle3_multimodal": "BLOCKED_UNQUALIFIED",
+    "official_scores": "NOT_RUN",
+    "dataset_length_coverage": "PENDING",
+    "ccu32_warmup": "RUNNER_CAP_10_MUST_FIX",
+    "ignore_eos_chat": "UNQUALIFIED",
+    "gpu_authorized": false,
+    "execution": "NOT_RUN"
+  },
+  "measured": {
+    "accuracy": null,
+    "f1": null,
+    "hallucination": null,
+    "ttft": null,
+    "tpot": null,
+    "throughput": null,
+    "vram": null,
+    "eagle_acceptance": null
+  },
+  "change_log": [
+    {
+      "date": "2026-11-10",
+      "revision": "0.1",
+      "change": "Initial two dataset and Base/EAGLE3 only living observation plan",
+      "executed": false
+    }
+  ]
+}
