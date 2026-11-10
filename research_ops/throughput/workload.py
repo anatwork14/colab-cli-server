@@ -10,6 +10,7 @@ The original random IDs need not equal the final chat-template token sequence.
 For raw-ID injection use a separately labelled /v1/completions experiment.
 """
 import hashlib
+from functools import lru_cache
 import json
 import random
 import re
@@ -27,6 +28,15 @@ class PromptConstructionError(ValueError):
 def child_seed(seed,index):
     raw="{}:{}".format(seed,index).encode("ascii")
     return int.from_bytes(hashlib.sha256(raw).digest()[:8],"big") & ((1<<63)-1)
+
+
+@lru_cache(maxsize=8)
+def _allowed_token_ids(vocab_size,special):
+    """Build the approved ID pool ONCE per tokenizer vocabulary, not per request."""
+    if type(vocab_size) is not int or vocab_size<100:
+        raise PromptConstructionError("Tokenizer vocabulary invalid")
+    special=set(special)
+    return tuple(i for i in range(vocab_size) if i not in special)
 
 
 def render_chat(tokenizer,text):
@@ -49,11 +59,8 @@ def build_prompt(tokenizer,target_tokens,seed,*,max_attempts=30):
         raise PromptConstructionError("Seed must be a nonnegative integer")
     if type(max_attempts) is not int or max_attempts<1:
         raise PromptConstructionError("Invalid adjustment budget")
-    special=set(getattr(tokenizer,"all_special_ids",[]))
-    vocab_size=int(tokenizer.vocab_size)
-    if vocab_size < 100:
-        raise PromptConstructionError("Unrealistic tokenizer vocabulary")
-    allowed=[token for token in range(vocab_size) if token not in special]
+    special=tuple(sorted(set(getattr(tokenizer,"all_special_ids",[]))))
+    allowed=_allowed_token_ids(int(tokenizer.vocab_size),special)
     rng=random.Random(seed)
     shell=len(render_chat(tokenizer,""))
     if shell>=target_tokens:
