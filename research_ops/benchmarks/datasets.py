@@ -22,7 +22,8 @@ def safe_relative(path):
     if not isinstance(path, str) or not path or any(ord(ch) < 32 for ch in path):
         raise DatasetIntegrityError("Invalid or empty dataset-relative path")
     path = path[2:] if path.startswith("./") else path
-    if "\\" in path or path.startswith("/") or any(x in ("", ".", "..") for x in path.split("/")):
+    if ("://" in path or ":" in path.split("/",1)[0] or "\\" in path or
+            path.startswith("/") or any(x in ("", ".", "..") for x in path.split("/")):
         raise DatasetIntegrityError("Unsafe dataset-relative path")
     return path
 
