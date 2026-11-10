@@ -55,7 +55,7 @@ def start(args):
         arm=make_arm(args.model_profile,args.experiment_mode,args.spec_method)
         if arm.da_roles:
             raise RuntimeError(
-                "DA vLLM 0.29.0 hook is NOT installed/qualified. "
+                "Author dattn vLLM 0.29.0 DA is not Qwen3.5-VLM/vision-layout verified. "
                 "Cannot run stock attention and claim Declarative Attention.")
         if args.speculative_config_json:
             raise ValueError("Cannot combine research arm and legacy speculative configuration")

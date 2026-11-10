@@ -83,7 +83,7 @@ def make_arm(model, mode, method=None, *, catalog=None):
             draft = details["draft_id"]
             tokens = details["num_speculative_tokens"]
     da_roles = DA_ROLES[mode]
-    status = ("DA_ENGINE_HOOK_NOT_INTEGRATED" if da_roles else
+    status = ("AUTHORS_DATTN_029_QWEN35_VLM_DA_UNQUALIFIED" if da_roles else
               "DRAFT_RUNTIME_UNQUALIFIED" if method in ("dflash", "eagle3") else
               "MTP_GPU_UNQUALIFIED" if method == "mtp" else
               "STOCK_GPU_BASELINE_PENDING")

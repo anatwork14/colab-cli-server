@@ -58,22 +58,13 @@ def token_spans(spans, prompt_length):
 
 
 def load_vendored_machine():
-    """Load only original vendored DA core without optional training dependencies.
-
-    The upstream package initializer imports x_transformers, which is
-    irrelevant to training-free inference. We directly load the exact
-    checked-in core module; torch/einops/jinja2 remain runtime dependencies.
-    """
-    core = VENDOR / "declarative_attention" / "declarative_attention.py"
-    if not core.is_file() or not (VENDOR / "LICENSE").is_file():
-        raise DAQualificationError("Pinned upstream DA source/license missing")
-    spec = importlib.util.spec_from_file_location(
-        "_colab_cli_vendored_declarative_attention", str(core))
-    if spec is None or spec.loader is None:
-        raise DAQualificationError("Cannot load pinned upstream DA source")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.DeclarativeAttention
+    # The lucidrains prototype is not the canonical author-backed engine.
+    # Offline state-machine tests may inject a deliberately fake machine,
+    # but a runtime must load the real dattn vLLM plugin in the GPU process.
+    raise DAQualificationError(
+        "Deprecated prototype loader. The canonical authors' dattn engine "
+        "lives at research/vendor/author-declarative-attention. "
+        "Use research_ops.vllm_engine.author_da and a validated VLM plugin.")
 
 
 @dataclass
