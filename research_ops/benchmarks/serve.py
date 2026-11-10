@@ -28,6 +28,14 @@ def _assert_model_origin(receipt, expected_repo_id):
         repo_id, revision=source.get("repo_id"),source.get("revision")
     elif source.get("type") in ("directory", "archive"):
         repo_id, revision=source.get("origin_repo_id"),source.get("origin_revision")
+        source_tree=source.get("origin_tree_sha256")
+        staged_tree=receipt.get("tree_sha256")
+        if (not isinstance(source_tree,str) or
+                not re.fullmatch(r"[a-f0-9]{64}",source_tree) or
+                source_tree!=staged_tree):
+            raise ValueError(
+                "Local model mirror needs an original HF snapshot tree SHA256 "
+                "matching the exact staged bytes; labels alone are insufficient")
     else:
         raise ValueError("Unsupported model source provenance")
     if repo_id != expected_repo_id or not isinstance(revision,str) or not re.fullmatch(r"[a-f0-9]{40}",revision):
