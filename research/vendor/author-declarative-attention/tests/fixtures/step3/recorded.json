@@ -1,0 +1,22 @@
+{
+  "responses": [
+    {"subset":"a","row_index":0,"format_correct":true,"dac_metrics":{"total_steps":10,"attended_tokens":100},"rendered_prompt_tokens":20},
+    {"subset":"a","row_index":1,"format_correct":true,"dac_metrics":{"total_steps":30,"attended_tokens":300},"rendered_prompt_tokens":40},
+    {"subset":"b","row_index":0,"format_correct":true,"dac_metrics":{"total_steps":90,"attended_tokens":900},"rendered_prompt_tokens":60},
+    {"subset":"b","row_index":1,"format_correct":false,"dac_metrics":{"total_steps":110,"attended_tokens":1100},"rendered_prompt_tokens":80},
+    {"subset":"b","row_index":2,"format_correct":true,"dac_metrics":{"total_steps":100,"attended_tokens":1000},"rendered_prompt_tokens":70}
+  ],
+  "reference_judgments": [
+    {"subset":"a","row_index":0,"correct":true},
+    {"subset":"a","row_index":1,"correct":false},
+    {"subset":"b","row_index":0,"correct":true},
+    {"subset":"b","row_index":2,"correct":true}
+  ],
+  "candidate_judgments": [
+    {"subset":"a","row_index":0,"correct":true,"dac_correct":true},
+    {"subset":"a","row_index":1,"correct":true,"dac_correct":false},
+    {"subset":"b","row_index":0,"correct":true,"dac_correct":true},
+    {"subset":"b","row_index":2,"correct":true,"dac_correct":true}
+  ],
+  "expected_macro":{"strict_accuracy":0.5833333333333333,"tolerant_accuracy":0.8333333333333333,"steps":60,"attended":600}
+}
