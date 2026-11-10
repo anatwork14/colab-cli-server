@@ -139,6 +139,8 @@ def request_stream(url,model,prompt,seed,timeout=900):
             if response.status!=200:
                 raise RuntimeError("Non-200 HTTP streaming response")
             for line in response:
+                if time.perf_counter()-start>timeout:
+                    raise RuntimeError("Streaming request exceeded absolute timeout")
                 stripped=line.strip()
                 if not stripped.startswith(b"data:"):
                     continue
@@ -154,6 +156,8 @@ def request_stream(url,model,prompt,seed,timeout=900):
                 for choice in event.get("choices",[]):
                     delta=choice.get("delta") or {}
                     content=delta.get("content")
+                    if delta.get("reasoning") or delta.get("reasoning_content"):
+                        raise RuntimeError("Thinking stream detected despite explicit non-thinking protocol")
                     ids=_get_token_ids(choice)
                     # Ignore role-only events, which vLLM's built-in benchmark
                     # may otherwise count as first-token latency.
@@ -180,7 +184,10 @@ def request_stream(url,model,prompt,seed,timeout=900):
         raise RuntimeError("Truncated/early-finished output: {} tokens instead of 256".format(actual_output))
     if stream_token_count and stream_token_count!=actual_output:
         raise RuntimeError("Stream token IDs do not sum to final completion usage")
-    text_sha=hashlib.sha256("".join(text_parts).encode("utf8")).hexdigest()
+    text="".join(text_parts)
+    if "<think>" in text or "</think>" in text:
+        raise RuntimeError("Explicit thinking markers leaked into non-thinking generation")
+    text_sha=hashlib.sha256(text.encode("utf8")).hexdigest()
     return {
         "status":"SUCCESS","prompt_tokens":actual_prompt,
         "completion_tokens":actual_output,"finish_reason":finish,
