@@ -1,0 +1,17 @@
+{
+  "source_repository": "https://github.com/itsnamgyu/declarative-attention",
+  "source_commit": "24110b7b441ad9423f55952a2c02d23eac80ec52",
+  "source_project": "dattn",
+  "project_version": "0.1.0",
+  "license": "MIT",
+  "project_python": "3.13",
+  "pinned_vllm": "0.29.0",
+  "copied_source_tree": "src/dattn/ (all 77 tracked source/template files)",
+  "copied_support": "LICENSE, README.md, Makefile, pyproject.toml, docs/DESIGN.md, docs/PROVENANCE.md, research/NOTES.md, research/backend_profiles.toml",
+  "excluded": "tests/, scripts/, uv.lock, dotfiles; may be synchronized from exact pinned revision during authorized native conformance testing",
+  "relationship_to_lucidrains": "Author repository is scientifically authoritative; preexisting research/vendor/declarative-attention is an independent secondary reimplementation only, not the DA engine baseline",
+  "published_profiles": "Gemma-4-31B-it and Qwen3.6-27B on SM100, not Qwen3.5-4B VLM",
+  "gpu_validation": "NOT_RUN",
+  "speculative_validation": "NOT_RUN",
+  "adaptation_policy": "Place project modifications in research_ops/vllm_engine and separately reviewed source copies; never alter vendored author files without recording diff."
+}
