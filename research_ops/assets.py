@@ -353,6 +353,8 @@ def pack(manifest_file, asset_id, scratch, output):
     if not outfile.is_absolute() or outfile.suffix != ".tar":
         raise ValueError("Mirror output must be an absolute .tar path")
     outfile = outfile.resolve()
+    if str(outfile).startswith("/content/drive/") and not os.path.ismount("/content/drive"):
+        raise RuntimeError("Google Drive mount unavailable; refusing false persistent mirror")
     if outfile.exists() or (Path(str(outfile) + ".sha256.json")).exists():
         raise FileExistsError("Refusing to overwrite existing cached archive/sidecar")
     outfile.parent.mkdir(parents=True, exist_ok=True)

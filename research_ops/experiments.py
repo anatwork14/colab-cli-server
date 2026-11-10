@@ -85,12 +85,15 @@ def plan_experiment(experiment, assets, scratch):
             "real_data_only": True, "model_training": False}
 
 
-def freeze(experiment, assets, scratch, output, run_id, require_gpu=False):
+def freeze(experiment, assets, scratch, output, run_id, require_gpu=False, cell_id=None):
     doc = validate_experiment(experiment, assets)
     if not RUN.fullmatch(run_id):
         raise ValueError("Invalid run ID")
+    selected = [c for c in doc["cells"] if cell_id is None or c["id"] == cell_id]
+    if len(selected) != 1:
+        raise ValueError("Freeze exactly one cell per active engine installation; supply --cell-id")
     observations = {}
-    for cell in doc["cells"]:
+    for cell in selected:
         engine = cell["engine"]
         engine_status = engine_verify(engine["mode"], engine.get("source_root"),
                                       engine.get("source_revision"), require_gpu=require_gpu)
@@ -124,6 +127,7 @@ def main():
     p.add_argument("--scratch", default="/content/research-assets")
     p.add_argument("--output", default="/content/research-runs")
     p.add_argument("--run-id")
+    p.add_argument("--cell-id", help="Exactly one cell; required for multi-arm studies")
     p.add_argument("--require-gpu", action="store_true")
     p.add_argument("--execute", action="store_true")
     a = p.parse_args()
@@ -132,7 +136,7 @@ def main():
     else:
         if not a.execute or not a.run_id:
             p.error("freeze requires --execute and --run-id; never implies benchmark completion")
-        out = freeze(a.experiment, a.assets, a.scratch, a.output, a.run_id, a.require_gpu)
+        out = freeze(a.experiment, a.assets, a.scratch, a.output, a.run_id, a.require_gpu, a.cell_id)
     print(json.dumps(out, indent=2, sort_keys=True))
 
 
