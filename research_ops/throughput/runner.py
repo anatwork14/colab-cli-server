@@ -251,8 +251,9 @@ def run_cell(args):
     # Fail-fast exclusive managed-GPU lock, held by the child runner across
     # prompt preparation, warmup and measured loads. Prevents two agent jobs
     # from contaminating one server throughput measurement.
-    lock_path=Path(args.output_root).resolve()/".exclusive-throughput-gpu.lock"
-    lock_path.parent.mkdir(parents=True,exist_ok=True)
+    # One lock across alternate output directories so agents cannot bypass
+    # per-GPU exclusivity by pointing two jobs at different result roots.
+    lock_path=Path("/tmp/colab-cli-server-single-gpu-throughput.lock")
     lock_handle=lock_path.open("a+")
     try:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)
