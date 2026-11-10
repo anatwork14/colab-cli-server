@@ -216,7 +216,7 @@ def _hardware():
 def run(args):
     if not SLUG.fullmatch(args.run_id):
         raise ValueError("Invalid run ID")
-    if args.concurrency<1 or args.concurrency>32 or args.limit<0 or args.max_tokens<1:
+    if args.concurrency<1 or args.concurrency>32 or args.limit<0 or args.max_tokens<1 or args.timeout<1:
         raise ValueError("Invalid concurrency, limit or generation budget")
     if args.kind=="mmlongbench_doc" and not args.deep_pdf:
         raise ValueError("MMLongBench-Doc GPU execution requires --deep-pdf preflight")
@@ -304,6 +304,17 @@ def run(args):
 
     duration=max(time.perf_counter()-started,1e-9)
     summary=summarize(args.kind,selected,receipts,duration,subset=bool(args.limit))
+    # Resume may reuse previous receipts measured hours earlier; the current
+    # wall clock cannot truthfully describe throughput of all those requests.
+    if len(pending)!=len(indexed):
+        summary["throughput_completed_requests_per_second"]=None
+        summary["throughput_all_attempts_per_second"]=None
+        summary["wall_seconds"]=None
+        summary["throughput_status"]="NOT_MEASURED_ON_RESUME_MIXED_TIME_WINDOWS"
+    else:
+        summary["throughput_status"]="MEASURED_ON_THIS_CLIENT_RUN"
+    if summary["failures"]:
+        summary["status"]="FAILED_REQUESTS_OFFICIAL_SCORER_PENDING"
     summary["run_id"]=args.run_id
     summary["question_file_sha256"]=hash_file(samples)
     summary["model_asset_tree_sha256"]=model_receipt["tree_sha256"]
