@@ -6,6 +6,7 @@ Declarative Attention execution is made merely from a CLI argument.
 """
 import argparse
 from dataclasses import dataclass
+from typing import Optional, Tuple
 import json
 from pathlib import Path
 import re
@@ -25,10 +26,10 @@ class Arm:
     model_profile: str
     target_id: str
     mode: str
-    method: str | None
-    da_roles: tuple[str, ...]
-    draft_id: str | None
-    num_speculative_tokens: int | None
+    method: Optional[str]
+    da_roles: Tuple[str, ...]
+    draft_id: Optional[str]
+    num_speculative_tokens: Optional[int]
     status: str
 
     @property
