@@ -358,3 +358,7 @@ research questions, protocols, experiment cells, observations and results.
 No other research repository is linked, and no GPU or Google Drive operation
 happens during CI. Read [research/README.md](research/README.md) and
 [research/decisions/0001-verified-asset-cache-policy.md](research/decisions/0001-verified-asset-cache-policy.md).
+
+## AI-agent VLM benchmark protocols
+
+Standalone real-data MemLens and MMLongBench-Doc Colab benchmarking tools: [agent runbook](research/benchmarks/AGENT_RUNBOOK.md) and [code-only Colab project manifest](research/benchmarks/colab-project.json). Requires independently verified real datasets, a GPU allocation and official scorers. No synthetic benchmark data or linked external research repo.

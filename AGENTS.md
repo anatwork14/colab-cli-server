@@ -116,3 +116,17 @@ source build rather than claim patched source while running a stock wheel.
 experiments.py freeze writes FROZEN_NOT_EXECUTED; ONLY actual checked GPU
 logs and complete dataset-qualified scoring can prove an experiment result.
 Colab lifecycle remains exclusively in the already approved adapter.
+
+
+## MemLens/MMLongBench-Doc real benchmark gates
+
+Read research/benchmarks/AGENT_RUNBOOK.md before planning or executing any
+VLM benchmark. The AI agent may run offline project validate/plan, real
+dataset audits, test suites and write pending approval requests. A human
+must explicitly approve GPU session provisioning, large transfers and
+official judge expenses. No automatic Colab allocation from research_ops.
+Never silently omit broken PDFs, missing images, long document pages or
+missing question IDs from denominator. Do not call proxy exact match
+"official accuracy". MemLens requires its official LLM judge; MMLongBench
+requires official answer extraction + upstream score. No VLM dataset
+synthesis or model training. No cross-repository runtime integration.
