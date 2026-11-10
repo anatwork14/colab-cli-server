@@ -223,12 +223,11 @@ class ModeQualificationTests(unittest.TestCase):
             self.assertTrue(record["throughput_sweep_server"])
 
     def test_gpu_cell_without_execute_always_blocks(self):
-        args=SimpleNamespace(protocol=None,model="qwen35_08b",arm="base",
-              context=128,ccu=1,execute=False)
-        with self.assertRaises(ValueError):
-            # avoid use of None protocol in normal run; explicit API never
-            # provides an execution path without --execute.
-            runner._option([], "--no-such-flag")
+        from research_ops.throughput.plan import DEFAULT_CONFIG
+        args=SimpleNamespace(protocol=str(DEFAULT_CONFIG),model="qwen35_08b",
+              arm="base",context=128,ccu=1,execute=False)
+        with self.assertRaisesRegex(ValueError,"Explicit --execute"):
+            runner.run_cell(args)
 
 
 if __name__=="__main__":
