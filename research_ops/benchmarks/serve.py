@@ -117,13 +117,38 @@ def start(args):
     return record
 
 
+def _port_from_record(record):
+    """The caller cannot pick an unrelated local vLLM service at status time."""
+    argv=record.get("argv_without_tokens")
+    if not isinstance(argv,list) or argv.count("--port") != 1:
+        raise ValueError("Frozen server receipt must record exactly one --port")
+    idx=argv.index("--port")
+    try:
+        port=int(argv[idx+1])
+    except (IndexError,TypeError,ValueError):
+        raise ValueError("Invalid frozen port in server receipt")
+    if not 1<=port<=65535 or "--host" not in argv:
+        raise ValueError("Frozen server must declare localhost bind and valid port")
+    host_index=argv.index("--host")
+    if host_index+1>=len(argv) or argv[host_index+1]!="127.0.0.1":
+        raise ValueError("Frozen server unexpectedly binds to a non-loopback host")
+    return port
+
+
 def status(args):
     target=Path(args.output_root).resolve()/args.run_id
     record=json.loads((target/"server_process.json").read_text(encoding="utf8"))
     if not _owned(record):
         return {"status":"NOT_RUNNING","run_id":args.run_id,"owned_pid_alive":False}
     try:
-        check=server_check("http://127.0.0.1:"+str(args.port),record["serving_model"])
+        frozen_port=_port_from_record(record)
+    except ValueError:
+        return {"status":"INVALID_FROZEN_SERVER_RECEIPT","run_id":args.run_id,"owned_pid_alive":True}
+    if frozen_port!=args.port:
+        return {"status":"FROZEN_PORT_MISMATCH","run_id":args.run_id,
+                "owned_pid_alive":True,"frozen_port":frozen_port}
+    try:
+        check=server_check("http://127.0.0.1:"+str(frozen_port),record["serving_model"])
         return {"status":"READY_VERSION_VERIFIED","run_id":args.run_id,
                 "owned_pid_alive":True,"server":check}
     except Exception as exc:
@@ -139,8 +164,8 @@ def stop(args):
     if not args.execute:
         raise ValueError("stop requires explicit --execute")
     pgid=os.getpgid(record["pid"])
-    if pgid==os.getpgrp():
-        raise RuntimeError("Refusing to terminate own controller process group")
+    if pgid==os.getpgrp() or pgid!=record["pid"] or not _owned(record):
+        raise RuntimeError("Refusing termination of non-owned or recycled server process group")
     os.killpg(pgid,signal.SIGTERM)
     return {"status":"STOP_REQUESTED","pid":record["pid"],"stopped":True,
             "termination_verified":False}
