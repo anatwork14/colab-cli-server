@@ -28,7 +28,7 @@ attention statistics. Those must remain separate control and ownership planes.
 | R02 | High | Server readiness command could contact a different healthy localhost port | Verify frozen port and exact loopback bind before health probe |
 | R03 | High | Stop might race a wrong process group | Check frozen PID start ticks and correct owned PGID before SIGTERM |
 | R04 | High | Benchmark results could be mislabeled as MTP/DFlash/EAGLE3 | Require explicit experiment-arm match, draft byte hash and frozen server receipt |
-| R05 | High | Cached archive model could be labeled Qwen without original provenance | Require matching upstream HF repo and full 40-hex revision even for local archives |
+| R05 | High | Cached archive model could be labeled Qwen without original provenance | Require matching upstream HF repo, 40-hex revision and original snapshot tree SHA256 equal to staged bytes. Source provenance still needs independent acquisition records |
 | R06 | P0 scientific | H2O CPU selector/pass-through could be mistaken for real GPU eviction | Policy-only manifest validation; any H2O GPU serving request remains blocked |
 | R07 | P0 scientific | DA FOCUS or LOCAL may return to GLOBAL and need KV evicted by H2O | Mark all physical reclaim blocked until proven no-reentry or exact history KV reconstruction |
 | R08 | High | GQA head disagreements, partially protected blocks and GDN state complicate reclaim | CPU bridge intersects all head candidate sets, requires entire blocks and protects DA/evidence/sink/tail; rejects GDN, prefill and speculative cases |
@@ -101,3 +101,22 @@ correct multimodal and speculative behavior, then paired real benchmark
 quality/latency/throughput with independent official dataset scoring.
 
 **Do not merge or claim publication-quality GPU improvements before G1–G6.**
+
+
+## Local model-weight mirror manifest example
+
+To use original Hugging Face weights from a pre-downloaded archive/directory
+instead of re-downloading on Colab, the immutable asset manifest's chosen
+source requires three separate publisher-origin fields:
+
+    origin_repo_id: Qwen/Qwen3.5-4B
+    origin_revision: <FULL_40_CHAR_HF_MODEL_COMMIT>
+    origin_tree_sha256: <64_CHAR_SHA256_OF_AUTHENTIC_SOURCE_TREE>
+
+The original source tree hash must equal the exact freshly staged content
+tree; otherwise research server startup rejects the cache. The original
+HF commit and tree digest should be recorded during the **first authentic
+publisher download**, not invented from the local cache's filename or
+self-declared vendor label. The hash protects local byte integrity, but an
+independently verified source receipt is still needed to establish
+publisher authorship. An H2O manifest has no model provenance authority.
