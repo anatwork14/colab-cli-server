@@ -1,5 +1,11 @@
 # Agent Colab CLI research pilot: MemLens + MMLongBench-Doc
 
+Official data source prerequisite: read AUTHENTIC_DATASETS.md and
+OFFICIAL_SOURCES.json. Resolve full HF revisions before downloading original
+questions/images/PDFs. No third-party mirror or floating main source can be
+treated as a paper-grade benchmark input.
+
+
 **Standalone** inference-engine research in colab-cli-server only. Do NOT
 connect other experiment repositories. Do NOT train, fine-tune, create
 synthetic benchmark records, or fabricate quality numbers.

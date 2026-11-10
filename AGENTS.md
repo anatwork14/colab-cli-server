@@ -130,3 +130,13 @@ missing question IDs from denominator. Do not call proxy exact match
 "official accuracy". MemLens requires its official LLM judge; MMLongBench
 requires official answer extraction + upstream score. No VLM dataset
 synthesis or model training. No cross-repository runtime integration.
+
+ 
+## Authentic benchmark input provenance
+Consult research/benchmarks/AUTHENTIC_DATASETS.md. Primary data must come
+from authors' HF datasets xiyuRenBill/MEMLENS and yubo2333/MMLongBench-Doc;
+use full immutable SHA, source SHA receipts and zero missing media.
+Author GitHub scoring code is a cited reference only, never automatically
+added as a submodule/runtime import. Network download with fetch --execute
+requires operator approval for storage/bandwidth. No synthetic benchmark
+records, altered PDF or unverified Drive mirror may masquerade as real data.

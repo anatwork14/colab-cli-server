@@ -362,3 +362,5 @@ happens during CI. Read [research/README.md](research/README.md) and
 ## AI-agent VLM benchmark protocols
 
 Standalone real-data MemLens and MMLongBench-Doc Colab benchmarking tools: [agent runbook](research/benchmarks/AGENT_RUNBOOK.md) and [code-only Colab project manifest](research/benchmarks/colab-project.json). Requires independently verified real datasets, a GPU allocation and official scorers. No synthetic benchmark data or linked external research repo.
+
+Verified publisher sources: [MemLens and MMLongBench-Doc acquisition](research/benchmarks/AUTHENTIC_DATASETS.md).
