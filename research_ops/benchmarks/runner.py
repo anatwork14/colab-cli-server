@@ -255,6 +255,15 @@ def run(args):
         raise RuntimeError("Server receipt has no recorded localhost port")
     if command_port != expected_port:
         raise RuntimeError("Server receipt port does not match requested vLLM endpoint")
+    arm=srv.get("experiment_arm")
+    expected_arm=getattr(args, "expected_experiment_arm", None)
+    if arm is not None:
+        if not isinstance(arm,dict) or arm.get("id") != expected_arm:
+            raise RuntimeError("Experiment arm must match the explicitly frozen runner expectation")
+        if arm.get("declarative_attention_roles") and srv.get("da_hook_runtime_verified") is not True:
+            raise RuntimeError("DA experiment must have real engine attention-hook proof")
+    elif expected_arm is not None:
+        raise RuntimeError("Experimental arm requested but server is a legacy unclassified process")
     server=server_check(args.url,args.model)
     if args.limit and args.limit>=args.expected_count:
         raise ValueError("--limit is a pilot subset knob, not full population")
@@ -269,6 +278,8 @@ def run(args):
         "dataset_asset_tree_sha256":dataset_receipt["tree_sha256"],
         "asset_manifest_sha256":hash_file(args.assets),
         "server":server,"engine":engine_receipt,
+        "experiment_arm":arm,
+        "draft_asset_tree_sha256":srv.get("draft_asset_tree_sha256"),
         "gpu":hardware,"limit":args.limit,
         "max_tokens":args.max_tokens,"max_images":args.max_images,
         "max_pages":args.max_pages,"dpi":args.dpi,
@@ -377,6 +388,7 @@ def main():
     p.add_argument("--expected-count",type=int,required=True)
     p.add_argument("--model",required=True,help="Exact served model id")
     p.add_argument("--server-receipt",required=True,help="Verified live server_process.json path")
+    p.add_argument("--expected-experiment-arm",help="Require exact research arm ID from frozen server receipt")
     p.add_argument("--url",default="http://127.0.0.1:8000")
     p.add_argument("--engine-mode",choices=("stock","source_python","source_compiled"),default="stock")
     p.add_argument("--source-root")
