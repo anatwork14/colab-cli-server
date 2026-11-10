@@ -106,3 +106,7 @@ groups and resolved metadata-builder classes.
 Normal speculative profiles remain independently testable using the
 existing plan/serve integration; a working draft model or source mask
 alone is NOT evidence that the combined DA arm has been implemented.
+
+## Technical-lead integration review
+
+See [REVIEW_AND_H2O_GATE.md](REVIEW_AND_H2O_GATE.md). The H2O adapter is CPU-policy only; DA and H2O both register the singleton CUSTOM backend. Physical eviction must address DA GLOBAL history reentry, scheduler ownership and grouped-query KV blocks before any combined performance claim.

@@ -51,6 +51,9 @@ class H2OBridgeReviewTests(unittest.TestCase):
         self.assertFalse(p.physical_eviction_performed)
         self.assertIsNone(p.physical_kv_bytes_freed)
         self.assertFalse(p.gpu_qualified)
+        self.assertTrue(p.da_global_reentry_hazard)
+        self.assertFalse(p.historic_kv_reconstruction_verified)
+        self.assertFalse(p.physical_reclaim_authorized)
 
     def test_only_common_full_blocks_can_be_nominated(self):
         p=plan_protected_eviction_candidates(
