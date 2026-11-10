@@ -66,6 +66,11 @@ def start(args):
     # Co-loading it with DA uses the same singleton CUSTOM backend slot.
     if os.environ.get("H2O_VLLM_MODE","disabled").strip().lower() not in ("","disabled"):
         raise RuntimeError("Benchmark process must disable H2O CUSTOM canary; use isolated engines")
+    if getattr(args,"experiment_mode",None) and any(
+            os.environ.get(key) for key in ("DATTN_MODEL","DATTN_BASE_BACKEND")):
+        raise RuntimeError(
+            "Normal/speculative benchmark must not inherit author DA plugin activation; "
+            "use a clean isolated engine process")
     if getattr(args,"h2o_policy_manifest",None):
         from research_ops.vllm_engine.h2o_bridge import (
             validate_h2o_policy_receipt, reject_h2o_gpu_execution)
