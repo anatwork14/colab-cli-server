@@ -126,11 +126,11 @@ speculative settings can be passed using a strictly validated optional
 
 MemLens on ORIGINAL 32k release questions, a pilot of first 2 questions:
 
-    python3 -m research_ops.benchmarks.runner --kind memlens --assets /content/assets.json --model-asset REAL_MODEL_ID --dataset-asset MEMLENS_ID --samples-rel dataset_32k.json --expected-count 789 --model REAL_MODEL_SERVING_NAME --max-images 160 --max-tokens 256 --concurrency 1 --limit 2 --run-id memlens-pilot-001 --execute
+    python3 -m research_ops.benchmarks.runner --kind memlens --assets /content/assets.json --model-asset REAL_MODEL_ID --dataset-asset MEMLENS_ID --samples-rel dataset_32k.json --expected-count 789 --model REAL_MODEL_SERVING_NAME --server-receipt /content/research-vllm-servers/serve-001/server_process.json --max-images 160 --max-tokens 256 --warmup 1 --concurrency 1 --limit 2 --run-id memlens-pilot-001 --execute
 
 MMLongBench-Doc on actual full PDF page images (not evidence-only):
 
-    python3 -m research_ops.benchmarks.runner --kind mmlongbench_doc --assets /content/assets.json --model-asset REAL_MODEL_ID --dataset-asset MMLONG_ID --samples-rel samples.json --expected-count 1091 --deep-pdf --max-pages 128 --dpi 72 --model REAL_MODEL_SERVING_NAME --max-tokens 256 --concurrency 1 --limit 2 --run-id doc-pilot-001 --execute
+    python3 -m research_ops.benchmarks.runner --kind mmlongbench_doc --assets /content/assets.json --model-asset REAL_MODEL_ID --dataset-asset MMLONG_ID --samples-rel samples.json --expected-count 1091 --deep-pdf --max-pages 128 --dpi 72 --model REAL_MODEL_SERVING_NAME --server-receipt /content/research-vllm-servers/serve-001/server_process.json --max-tokens 256 --warmup 1 --concurrency 1 --limit 2 --run-id doc-pilot-001 --execute
 
 These are ENGINEERING PILOTS using real questions, not official score runs.
 Remove --limit for full population after success, with an explicit new run
@@ -139,6 +139,8 @@ or missing images must produce failures, NOT quiet page/image truncation.
 Do not compare dpi=72 engineering results against paper numbers where
 different page-rendering settings were used. The source benchmark may need
 more than 128 pages or max_model_len 32768; fail closed and inspect.
+
+The runner requires the live local server_process.json receipt to match the exact staged model weights, committed engine import path and serving port. Warmup requests use ORIGINAL questions and are excluded from measured quality/latency.
 
 The runner creates one immutable JSON receipt per original sample ID,
 writes engineering_summary.json and never labels proxy exact match as an
