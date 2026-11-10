@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "training": false,
+  "synthetic_data": false,
+  "assets_manifest": "/content/research-assets/manifests/assets.json",
+  "asset_scratch": "/content/research-assets",
+  "model_asset_id": "REPLACE_WITH_PINNED_MODEL_ASSET",
+  "datasets": [
+    {
+      "kind": "memlens",
+      "asset_id": "REPLACE_WITH_REAL_MEMLENS_ASSET",
+      "samples_rel": "dataset_32k.json",
+      "expected_count": 789,
+      "deep_pdf": false
+    },
+    {
+      "kind": "mmlongbench_doc",
+      "asset_id": "REPLACE_WITH_REAL_DOC_ASSET",
+      "samples_rel": "samples.json",
+      "expected_count": 1091,
+      "deep_pdf": true
+    }
+  ]
+}

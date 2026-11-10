@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "vlm-two-dataset",
+    "root": "../.."
+  },
+  "runtime": {
+    "gpu": "A100",
+    "timeout_seconds": 600,
+    "retain_session": false
+  },
+  "workspace": {
+    "remote_root": "/content/colab-workspaces/vlm-two-dataset",
+    "include": [
+      "research_ops/**"
+    ],
+    "exclude": [
+      "research/**/runs/**",
+      "research/**/artifacts/**",
+      "**/*.safetensors",
+      "**/*.parquet",
+      "**/*.pdf",
+      "**/*.png",
+      "**/*.jpg",
+      "**/*.tar",
+      "**/*.zip"
+    ],
+    "delete_remote": false
+  },
+  "execution": {
+    "entrypoint": "research_ops/benchmarks/runner.py",
+    "args": []
+  },
+  "artifacts": {
+    "pull": [],
+    "local_dir": "./artifacts"
+  }
+}

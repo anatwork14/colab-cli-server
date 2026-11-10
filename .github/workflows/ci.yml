@@ -23,6 +23,16 @@ jobs:
         run: python -m compileall -q colab_server.py colab_adapter research_ops examples tests
       - name: Run offline tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Agent-side offline data gates (no cloud allocation)
+        run: |
+          python -m colab_adapter.cli project validate --manifest research/benchmarks/colab-project.json --json
+          python -m colab_adapter.cli project plan --manifest research/benchmarks/colab-project.json --json
+          if python -m research_ops.benchmarks.agent plan --campaign research/benchmarks/campaign.example.json; then
+            echo "Unexpectedly claimed readiness without real pinned datasets"
+            exit 1
+          else
+            test $? -eq 2
+          fi
       - name: Check shell syntax
         run: bash -n scripts/install.sh scripts/authenticate.sh
       - name: Dry-run local plan (never allocates)

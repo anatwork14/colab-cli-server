@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "policy": "AUTHORS_HUGGINGFACE_DATA_AND_AUTHORS_GITHUB_SCORER_SEPARATE_NEVER_MIX_RELEASES",
+  "selected": [
+    {
+      "id": "memlens",
+      "name": "MemLens",
+      "dataset_repo": "xiyuRenBill/MEMLENS",
+      "dataset_url": "https://huggingface.co/datasets/xiyuRenBill/MEMLENS",
+      "author_code_repo": "https://github.com/xrenaf/MEMLENS",
+      "author_code_revision": "77f3ab9a52fa2d6a17978e2dffe80438a4ecced2",
+      "preferred_format": "original_json",
+      "variants": [
+        "32k",
+        "64k",
+        "128k",
+        "256k"
+      ],
+      "default_variant": "32k",
+      "expected_question_count": 789,
+      "expected_image_count_all_contexts": 4695,
+      "required_files": [
+        "dataset_{variant}.json",
+        "release_images/**"
+      ],
+      "scorer": "llm_judge.py (official LLM-as-judge; not plain EM)",
+      "data_license": "CC-BY-4.0 for annotations; each underlying image retains source-specific rights",
+      "hf_full_revision": "REQUIRES_SERVER_SIDE_RESOLVE_DO_NOT_USE_MAIN_FOR_BENCHMARK"
+    },
+    {
+      "id": "mmlongbench_doc",
+      "name": "MMLongBench-Doc",
+      "dataset_repo": "yubo2333/MMLongBench-Doc",
+      "dataset_url": "https://huggingface.co/datasets/yubo2333/MMLongBench-Doc",
+      "author_code_repo": "https://github.com/mayubo2333/MMLongBench-Doc",
+      "author_code_revision": "d73f0dc0be7e0a2ff6a403d5fe65fcd96461f384",
+      "preferred_format": "publisher_parquet_represented_as_original_question_json",
+      "variants": [
+        "default"
+      ],
+      "default_variant": "default",
+      "expected_question_count": 1091,
+      "expected_pdf_count": 135,
+      "required_files": [
+        "data/train-*.parquet",
+        "documents/*.pdf"
+      ],
+      "scorer": "eval/extract_answer.py followed by eval/eval_score.py (official protocol)",
+      "data_license": "CC-BY-NC-4.0 (research/non-commercial; check license before redistribution)",
+      "hf_full_revision": "REQUIRES_SERVER_SIDE_RESOLVE_DO_NOT_USE_MAIN_FOR_BENCHMARK"
+    }
+  ]
+}
