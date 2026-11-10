@@ -140,3 +140,7 @@ Author GitHub scoring code is a cited reference only, never automatically
 added as a submodule/runtime import. Network download with fetch --execute
 requires operator approval for storage/bandwidth. No synthetic benchmark
 records, altered PDF or unverified Drive mirror may masquerade as real data.
+
+## Canonical authors' Declarative Attention
+
+Research engine authority is the full MIT-licensed itsnamgyu/declarative-attention snapshot at commit 24110b7b, copied verbatim with 178/178 verified Git blob IDs. Read research/vllm_engine/AUTHORS_ENGINE.md. The previous lucidrains source is secondary only, not the engine. Authors' implementation pins vllm 0.29.0 + Python3.13 but its tested profiles are Qwen3.6-27B/Gemma4-31B SM100 and it excludes speculative decoding. Do not claim Qwen3.5-4B DA on Colab SM80/SM89 or draft/target/both integration until actual engine GPU, image token-offset and accepted-token rollback tests pass.
