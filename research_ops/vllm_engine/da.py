@@ -6,9 +6,8 @@ Actual inference must fail closed until source and GPU proof exist.
 """
 from dataclasses import dataclass
 from pathlib import Path
-import importlib
+import importlib.util
 import re
-import sys
 from typing import Callable, Dict, Optional, Tuple
 
 VENDOR = Path(__file__).resolve().parents[2] / "research" / "vendor" / "declarative-attention"
@@ -59,17 +58,21 @@ def token_spans(spans, prompt_length):
 
 
 def load_vendored_machine():
-    if not (VENDOR / "declarative_attention" / "vllm.py").is_file():
-        raise DAQualificationError("Vendored original DA source not present")
-    vendor = str(VENDOR.resolve())
-    if vendor not in sys.path:
-        sys.path.insert(0, vendor)
-    module = importlib.import_module("declarative_attention")
-    # Do not silently use unrelated pip-installed declarative_attention.
-    try:
-        Path(module.__file__).resolve().relative_to(VENDOR.resolve())
-    except ValueError as exc:
-        raise DAQualificationError("Wrong DA package imported; not our vendored source") from exc
+    """Load only original vendored DA core without optional training dependencies.
+
+    The upstream package initializer imports x_transformers, which is
+    irrelevant to training-free inference. We directly load the exact
+    checked-in core module; torch/einops/jinja2 remain runtime dependencies.
+    """
+    core = VENDOR / "declarative_attention" / "declarative_attention.py"
+    if not core.is_file() or not (VENDOR / "LICENSE").is_file():
+        raise DAQualificationError("Pinned upstream DA source/license missing")
+    spec = importlib.util.spec_from_file_location(
+        "_colab_cli_vendored_declarative_attention", str(core))
+    if spec is None or spec.loader is None:
+        raise DAQualificationError("Cannot load pinned upstream DA source")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     return module.DeclarativeAttention
 
 
