@@ -15,6 +15,7 @@ import time
 from research_ops.assets import verify as verify_asset
 from research_ops.engine import verify as verify_engine
 from .runner import _atomic_json, server_check
+from research_ops.vllm_engine.matrix import MODES, METHODS, make_arm, command_for_arm
 
 SAFE=re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,79}$")
 
@@ -40,41 +41,77 @@ def start(args):
         raise ValueError("Explicit --execute required to start a GPU-serving process")
     if not SAFE.fullmatch(args.run_id):
         raise ValueError("Invalid process run ID")
-    if not (1<=args.port<=65535 and 0.1<=args.gpu_memory_utilization<=0.96
-            and args.max_model_len>=128 and 1<=args.max_images<=1024):
+    if not (1 <= args.port <= 65535 and
+            0.1 <= args.gpu_memory_utilization <= 0.96 and
+            args.max_model_len >= 128 and 1 <= args.max_images <= 1024):
         raise ValueError("Invalid inference-serving limits")
     receipt=verify_asset(args.assets,args.model_asset,args.scratch)
+    model_path=Path(receipt["staged_path"])
+    arm=None
+    draft_receipt=None
+
+    # Keep legacy call sites intact unless a research mode is explicitly used.
+    if getattr(args,"experiment_mode",None):
+        arm=make_arm(args.model_profile,args.experiment_mode,args.spec_method)
+        if arm.da_roles:
+            raise RuntimeError(
+                "Author dattn vLLM 0.29.0 DA is not Qwen3.5-VLM/vision-layout verified. "
+                "Cannot run stock attention and claim Declarative Attention.")
+        if args.speculative_config_json:
+            raise ValueError("Cannot combine research arm and legacy speculative configuration")
+        source=receipt.get("source",{})
+        if source.get("type") == "huggingface" and source.get("repo_id") != arm.target_id:
+            raise ValueError("Target checkpoint does not match Qwen model profile")
+        if arm.method in ("dflash","eagle3"):
+            if not args.draft_asset:
+                raise ValueError("DFlash/EAGLE3 requires pinned draft asset ID")
+            draft_receipt=verify_asset(args.assets,args.draft_asset,args.scratch)
+            draft_source=draft_receipt.get("source",{})
+            if draft_source.get("type") == "huggingface" and draft_source.get("repo_id") != arm.draft_id:
+                raise ValueError("Wrong draft checkpoint for selected method and target")
+            if draft_receipt["tree_sha256"] == receipt["tree_sha256"]:
+                raise ValueError("Draft and target checkpoints unexpectedly identical")
+        elif args.draft_asset:
+            raise ValueError("MTP uses target-native layers, no external draft")
+        argv=command_for_arm(arm,str(model_path),
+              draft_path=(str(Path(draft_receipt["staged_path"])) if draft_receipt else None),
+              served_name=args.model,max_model_len=args.max_model_len,
+              gpu_memory_utilization=args.gpu_memory_utilization,
+              max_images=args.max_images)
+        argv.extend(["--port",str(args.port)])
+    else:
+        if getattr(args,"spec_method",None) or getattr(args,"draft_asset",None):
+            raise ValueError("Use --experiment-mode when selecting research drafts")
+        argv=["vllm","serve",str(model_path),"--served-model-name",args.model,
+              "--host","127.0.0.1","--port",str(args.port),
+              "--max-model-len",str(args.max_model_len),
+              "--gpu-memory-utilization",str(args.gpu_memory_utilization),
+              "--limit-mm-per-prompt",json.dumps({"image":args.max_images})]
+        if args.speculative_config_json:
+            cfg=json.loads(args.speculative_config_json)
+            if not isinstance(cfg,dict) or cfg.get("method") not in (
+                    "mtp","qwen3_5_mtp","gemma4_mtp"):
+                raise ValueError("Legacy speculative method unsupported")
+            n=cfg.get("num_speculative_tokens")
+            if type(n) is not int or not 1<=n<=16:
+                raise ValueError("Invalid speculative token count")
+            argv.extend(["--speculative-config",json.dumps(cfg,separators=(",",":"))])
     engine=verify_engine(args.engine_mode,args.source_root,args.source_revision,require_gpu=True)
     target=Path(args.output_root).resolve()/args.run_id
     target.mkdir(parents=True,exist_ok=False)
     output=target/"server.log"
-    model_path=Path(receipt["staged_path"])
-    argv=["vllm","serve",str(model_path),
-          "--served-model-name",args.model,
-          "--host","127.0.0.1","--port",str(args.port),
-          "--max-model-len",str(args.max_model_len),
-          "--gpu-memory-utilization",str(args.gpu_memory_utilization),
-          "--limit-mm-per-prompt",json.dumps({"image":args.max_images})]
-    if args.speculative_config_json:
-        cfg=json.loads(args.speculative_config_json)
-        if not isinstance(cfg,dict) or cfg.get("method") not in (
-                "mtp","qwen3_5_mtp","gemma4_mtp"):
-            raise ValueError("Unsupported speculative decoding method")
-        n=cfg.get("num_speculative_tokens")
-        if type(n) is not int or n<1 or n>16:
-            raise ValueError("num_speculative_tokens must be 1..16")
-        argv.extend(["--speculative-config",json.dumps(cfg,separators=(",",":"))])
     with output.open("x",encoding="utf8") as log:
         p=subprocess.Popen(argv,stdout=log,stderr=subprocess.STDOUT,
                            stdin=subprocess.DEVNULL,start_new_session=True)
-    # The command doesn't wait for model loading, which can exceed the
-    # Colab adapter's per-exec timeout. A separate status poll is required.
     record={
         "run_id":args.run_id,"pid":p.pid,"start_ticks":_start_ticks(p.pid),
         "gpu_process":"STARTING_UNQUALIFIED","serving_model":args.model,
         "engine":engine,"model_asset_sha256":receipt["tree_sha256"],
-        "argv_without_tokens":argv,"log":str(output),
-        "local_only":True,
+        "argv_without_tokens":argv,"log":str(output),"local_only":True,
+        "experiment_arm":arm.to_dict() if arm else None,
+        "draft_asset_tree_sha256":(
+            draft_receipt["tree_sha256"] if draft_receipt else None),
+        "da_hook_runtime_verified":False,
     }
     _atomic_json(target/"server_process.json",record)
     return record
@@ -125,6 +162,14 @@ def main():
     p.add_argument("--max-images",type=int,default=160)
     p.add_argument("--gpu-memory-utilization",type=float,default=0.85)
     p.add_argument("--speculative-config-json")
+    p.add_argument("--experiment-mode",choices=MODES,
+                   help="Opt into strict six-mode research experiment")
+    p.add_argument("--spec-method",choices=METHODS,
+                   help="For speculative and speculative+DA categories")
+    p.add_argument("--model-profile",default="qwen35_4b",
+                   help="Qwen3.5 model profile in pinned checkpoint catalog")
+    p.add_argument("--draft-asset",
+                   help="Verified staged HF draft asset ID for DFlash/EAGLE3")
     p.add_argument("--output-root",default="/content/research-vllm-servers")
     p.add_argument("--run-id",required=True)
     p.add_argument("--execute",action="store_true")

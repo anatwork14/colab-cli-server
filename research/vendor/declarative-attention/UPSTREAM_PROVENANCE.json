@@ -1,0 +1,22 @@
+{
+  "source_url": "https://github.com/lucidrains/declarative-attention",
+  "source_commit": "9249110f8d879c5684ce71f6678685afd0538e5d",
+  "license": "MIT",
+  "project_release": "0.0.8",
+  "upstream_copied_paths": [
+    "LICENSE",
+    "README.md",
+    "pyproject.toml",
+    ".gitignore",
+    "declarative_attention/__init__.py",
+    "declarative_attention/declarative_attention.py",
+    "declarative_attention/vllm.py",
+    "declarative_attention/x_transformers.py",
+    "tests/test_declarative_attn.py",
+    "tests/test_vllm.py",
+    "tests/test_x_transformers.py"
+  ],
+  "excluded_noncode_image": "fig1.png",
+  "reason": "Preserve upstream code and tests byte-for-byte; custom adaptations live under research_ops/vllm_engine/, never edit vendor tree silently.",
+  "scoped_dependency": "Optional torch>=2.5, einops, jinja2, torch-einops-utils, Python>=3.10; not imported in Python 3.8 CI."
+}

@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "source_corpus": {
+    "vendor": "https://github.com/itsnamgyu/declarative-attention",
+    "vendor_revision": "24110b7b441ad9423f55952a2c02d23eac80ec52",
+    "engine_version": "0.29.0",
+    "engine_upstream_revision": "98dff2a81d747d1dba01a47f939f48c3526d4206",
+    "secondary_reference": "https://github.com/lucidrains/declarative-attention",
+    "author_package": "dattn==0.1.0",
+    "author_python": "3.13",
+    "author_tested_models": [
+      "Qwen/Qwen3.6-27B",
+      "google/gemma-4-31B-it"
+    ],
+    "author_gpu_scope": "SM100",
+    "author_speculative_status": "NOT_SUPPORTED_BY_UPSTREAM"
+  },
+  "selected_target": "qwen35_4b",
+  "models": {
+    "qwen35_4b": {
+      "target_id": "Qwen/Qwen3.5-4B",
+      "parameters_billion": 4,
+      "vision_capable": true,
+      "model_stage": "post_trained",
+      "hub_revision": null,
+      "native_mtp": {
+        "available_in_model_family": true,
+        "num_speculative_tokens": 1,
+        "needs_draft_checkpoint": false,
+        "qualified_vllm_gpu": false
+      },
+      "dflash": {
+        "draft_id": "z-lab/Qwen3.5-4B-DFlash",
+        "parameters_billion": 0.6,
+        "hub_revision": null,
+        "method": "dflash",
+        "num_speculative_tokens": 8,
+        "validation": "DRAFT_PUBLISHED_GPU_VLLM_029_UNQUALIFIED",
+        "source": "https://huggingface.co/z-lab/Qwen3.5-4B-DFlash"
+      },
+      "eagle3": {
+        "draft_id": "yuyijiong/Qwen3.5-4B-Eagle3",
+        "parameters_billion": 0.2,
+        "hub_revision": null,
+        "method": "eagle3",
+        "num_speculative_tokens": 3,
+        "validation": "COMMUNITY_CHECKPOINT_SGLANG_DOCUMENTED_VLLM_029_UNQUALIFIED",
+        "source": "https://huggingface.co/yuyijiong/Qwen3.5-4B-Eagle3"
+      }
+    },
+    "qwen35_9b": {
+      "target_id": "Qwen/Qwen3.5-9B",
+      "parameters_billion": 9,
+      "vision_capable": true,
+      "model_stage": "post_trained",
+      "hub_revision": null,
+      "native_mtp": {
+        "available_in_model_family": true,
+        "num_speculative_tokens": 1,
+        "needs_draft_checkpoint": false,
+        "qualified_vllm_gpu": false
+      },
+      "dflash": {
+        "draft_id": "z-lab/Qwen3.5-9B-DFlash",
+        "parameters_billion": null,
+        "hub_revision": null,
+        "method": "dflash",
+        "num_speculative_tokens": 8,
+        "validation": "DRAFT_PUBLISHED_GPU_VLLM_029_UNQUALIFIED",
+        "source": "https://huggingface.co/z-lab/Qwen3.5-9B-DFlash"
+      },
+      "eagle3": {
+        "draft_id": "yuyijiong/Qwen3.5-9B-Eagle3",
+        "parameters_billion": null,
+        "hub_revision": null,
+        "method": "eagle3",
+        "num_speculative_tokens": 3,
+        "validation": "COMMUNITY_CHECKPOINT_SGLANG_DOCUMENTED_VLLM_029_UNQUALIFIED",
+        "source": "https://huggingface.co/yuyijiong/Qwen3.5-9B-Eagle3"
+      }
+    },
+    "qwen35_08b": {
+      "target_id": "Qwen/Qwen3.5-0.8B",
+      "parameters_billion": 0.8,
+      "vision_capable": true,
+      "model_stage": "post_trained",
+      "hub_revision": null,
+      "native_mtp": {
+        "available_in_model_family": true,
+        "num_speculative_tokens": 1,
+        "qualified_vllm_gpu": false
+      },
+      "dflash": null,
+      "eagle3": null
+    },
+    "qwen35_2b": {
+      "target_id": "Qwen/Qwen3.5-2B",
+      "parameters_billion": 2,
+      "vision_capable": true,
+      "model_stage": "post_trained",
+      "hub_revision": null,
+      "native_mtp": {
+        "available_in_model_family": true,
+        "num_speculative_tokens": 1,
+        "qualified_vllm_gpu": false
+      },
+      "dflash": null,
+      "eagle3": null
+    }
+  },
+  "guards": {
+    "no_training": true,
+    "no_finetuning": true,
+    "no_synthetic_dataset": true,
+    "strict_hf_full_revision_on_gpu": true,
+    "multimodal_draft_compatibility_unqualified": true,
+    "da_runtime_backend": "AUTHOR_DATTN_VLLM_029_NOT_YET_GPU_QUALIFIED_FOR_QWEN35_VLM",
+    "da_hybrid_attention_and_visual_mapping": "MUST_BE_VERIFIED"
+  }
+}

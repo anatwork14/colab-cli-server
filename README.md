@@ -364,3 +364,5 @@ happens during CI. Read [research/README.md](research/README.md) and
 Standalone real-data MemLens and MMLongBench-Doc Colab benchmarking tools: [agent runbook](research/benchmarks/AGENT_RUNBOOK.md) and [code-only Colab project manifest](research/benchmarks/colab-project.json). Requires independently verified real datasets, a GPU allocation and official scorers. No synthetic benchmark data or linked external research repo.
 
 Verified publisher sources: [MemLens and MMLongBench-Doc acquisition](research/benchmarks/AUTHENTIC_DATASETS.md).
+
+[Canonical authors' DA integration and strict Qwen3.5 VLM gates](research/vllm_engine/AUTHORS_ENGINE.md) — original source copied in full at an immutable commit, 178/178 blob hashes verified; our experimental GPU integrations remain unqualified.

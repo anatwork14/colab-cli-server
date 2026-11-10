@@ -1,0 +1,282 @@
+# Explicit model/use configurations. Qwen walltime uses the native planner and CPU mirror.
+
+["google/gemma-4-31B-it/parity"]
+model_id = "google/gemma-4-31B-it"
+capability = "sm100"
+use = "parity"
+base_backend = "TRITON_ATTN"
+dattn_block_size = 32
+needs_compacted_seq_lens_cpu = false
+
+["google/gemma-4-31B-it/parity".engine_args]
+async_scheduling = false
+decode_context_parallel_size = 1
+disable_cascade_attn = true
+disable_log_stats = false
+enable_prefix_caching = false
+enforce_eager = false
+kv_cache_dtype = "auto"
+max_num_batched_tokens = 16384
+pipeline_parallel_size = 1
+prefill_context_parallel_size = 1
+tensor_parallel_size = 1
+model = "google/gemma-4-31B-it"
+attention_backend = "TRITON_ATTN"
+block_size = 16
+attention_config = "{\"backend_per_kind\": {\"full_attention\": \"CUSTOM\"}}"
+logits_processors = ["dattn.engine.processor:DattnLogitsProcessor"]
+worker_extension_cls = "dattn.engine.worker_ext.DattnWorkerExtension"
+max_model_len = 262144
+gpu_memory_utilization = 0.85
+kv_cache_memory_bytes = 107374182400
+max_num_seqs = 64
+
+["google/gemma-4-31B-it/parity".env]
+VLLM_USE_V2_MODEL_RUNNER = "0"
+VLLM_USE_FLASHINFER_SAMPLER = "0"
+VLLM_ENABLE_V1_MULTIPROCESSING = "0"
+VLLM_ATTENTION_BACKEND = "__must_be_unset__"
+
+["google/gemma-4-31B-it/parity".bench]
+max_tokens = 8192
+repetitions = 2
+batches_per_task = 5
+subset_size = 128
+seed = 0
+leading_trim = 8
+n_resamples = 2000
+ci = 0.95
+
+["google/gemma-4-31B-it/walltime"]
+model_id = "google/gemma-4-31B-it"
+capability = "sm100"
+use = "walltime"
+base_backend = "TRITON_ATTN"
+dattn_block_size = 32
+needs_compacted_seq_lens_cpu = false
+
+["google/gemma-4-31B-it/walltime".engine_args]
+async_scheduling = false
+decode_context_parallel_size = 1
+disable_cascade_attn = true
+disable_log_stats = false
+enable_prefix_caching = true
+enforce_eager = false
+kv_cache_dtype = "auto"
+max_num_batched_tokens = 16384
+pipeline_parallel_size = 1
+prefill_context_parallel_size = 1
+tensor_parallel_size = 1
+model = "google/gemma-4-31B-it"
+attention_backend = "TRITON_ATTN"
+block_size = 16
+attention_config = "{\"backend_per_kind\": {\"full_attention\": \"CUSTOM\"}}"
+logits_processors = ["dattn.engine.processor:DattnLogitsProcessor"]
+worker_extension_cls = "dattn.engine.worker_ext.DattnWorkerExtension"
+max_model_len = 262144
+gpu_memory_utilization = 0.92
+max_num_seqs = 64
+kv_cache_memory_bytes = "TO BE PINNED FROM PROBE"
+
+["google/gemma-4-31B-it/walltime".env]
+VLLM_USE_V2_MODEL_RUNNER = "0"
+VLLM_USE_FLASHINFER_SAMPLER = "0"
+VLLM_ENABLE_V1_MULTIPROCESSING = "0"
+VLLM_ATTENTION_BACKEND = "__must_be_unset__"
+
+["google/gemma-4-31B-it/walltime".bench]
+max_tokens = 512
+repetitions = 8
+batches_per_task = 5
+subset_size = 128
+seed = 0
+leading_trim = 8
+n_resamples = 2000
+ci = 0.95
+
+["Qwen/Qwen3.6-27B/parity"]
+model_id = "Qwen/Qwen3.6-27B"
+capability = "sm100"
+use = "parity"
+base_backend = "FLASHINFER"
+dattn_block_size = 16
+needs_compacted_seq_lens_cpu = false
+
+["Qwen/Qwen3.6-27B/parity".engine_args]
+async_scheduling = false
+decode_context_parallel_size = 1
+disable_cascade_attn = true
+disable_log_stats = false
+enable_prefix_caching = false
+enforce_eager = false
+kv_cache_dtype = "auto"
+max_num_batched_tokens = 16384
+pipeline_parallel_size = 1
+prefill_context_parallel_size = 1
+tensor_parallel_size = 1
+model = "Qwen/Qwen3.6-27B"
+attention_backend = "FLASHINFER"
+attention_config = "{\"backend_per_kind\": {\"full_attention\": \"CUSTOM\"}}"
+logits_processors = ["dattn.engine.processor:DattnLogitsProcessor"]
+worker_extension_cls = "dattn.engine.worker_ext.DattnWorkerExtension"
+max_model_len = 262144
+gpu_memory_utilization = 0.85
+kv_cache_memory_bytes = 107374182400
+max_num_seqs = 128
+
+["Qwen/Qwen3.6-27B/parity".env]
+VLLM_USE_V2_MODEL_RUNNER = "0"
+VLLM_USE_FLASHINFER_SAMPLER = "0"
+VLLM_ENABLE_V1_MULTIPROCESSING = "0"
+VLLM_ATTENTION_BACKEND = "__must_be_unset__"
+
+["Qwen/Qwen3.6-27B/parity".bench]
+max_tokens = 8192
+repetitions = 2
+batches_per_task = 5
+subset_size = 128
+seed = 0
+leading_trim = 8
+n_resamples = 2000
+ci = 0.95
+
+["Qwen/Qwen3.6-27B/walltime"]
+model_id = "Qwen/Qwen3.6-27B"
+capability = "sm100"
+use = "walltime"
+base_backend = "FLASHINFER"
+dattn_block_size = 16
+needs_compacted_seq_lens_cpu = true
+
+["Qwen/Qwen3.6-27B/walltime".engine_args]
+async_scheduling = false
+decode_context_parallel_size = 1
+disable_cascade_attn = true
+disable_log_stats = false
+enable_prefix_caching = true
+enforce_eager = false
+kv_cache_dtype = "auto"
+max_num_batched_tokens = 16384
+pipeline_parallel_size = 1
+prefill_context_parallel_size = 1
+tensor_parallel_size = 1
+model = "Qwen/Qwen3.6-27B"
+attention_backend = "FLASHINFER"
+attention_config = "{\"backend_per_kind\": {\"full_attention\": \"CUSTOM\"}, \"use_trtllm_attention\": false}"
+logits_processors = ["dattn.engine.processor:DattnLogitsProcessor"]
+worker_extension_cls = "dattn.engine.worker_ext.DattnWorkerExtension"
+max_model_len = 262144
+gpu_memory_utilization = 0.92
+max_num_seqs = 128
+kv_cache_memory_bytes = "TO BE PINNED FROM PROBE"
+
+["Qwen/Qwen3.6-27B/walltime".env]
+VLLM_USE_V2_MODEL_RUNNER = "0"
+VLLM_USE_FLASHINFER_SAMPLER = "0"
+VLLM_ENABLE_V1_MULTIPROCESSING = "0"
+VLLM_ATTENTION_BACKEND = "__must_be_unset__"
+
+["Qwen/Qwen3.6-27B/walltime".bench]
+max_tokens = 512
+repetitions = 8
+batches_per_task = 5
+subset_size = 128
+seed = 0
+leading_trim = 8
+n_resamples = 2000
+ci = 0.95
+
+["google/gemma-4-31B-it/parity_prefix"]
+model_id = "google/gemma-4-31B-it"
+capability = "sm100"
+use = "parity_prefix"
+base_backend = "TRITON_ATTN"
+dattn_block_size = 32
+needs_compacted_seq_lens_cpu = false
+
+["google/gemma-4-31B-it/parity_prefix".engine_args]
+async_scheduling = false
+decode_context_parallel_size = 1
+disable_cascade_attn = true
+disable_log_stats = false
+enable_prefix_caching = true
+enforce_eager = false
+kv_cache_dtype = "auto"
+max_num_batched_tokens = 16384
+pipeline_parallel_size = 1
+prefill_context_parallel_size = 1
+tensor_parallel_size = 1
+model = "google/gemma-4-31B-it"
+attention_backend = "TRITON_ATTN"
+block_size = 16
+attention_config = "{\"backend_per_kind\": {\"full_attention\": \"CUSTOM\"}}"
+logits_processors = ["dattn.engine.processor:DattnLogitsProcessor"]
+worker_extension_cls = "dattn.engine.worker_ext.DattnWorkerExtension"
+max_model_len = 262144
+gpu_memory_utilization = 0.85
+kv_cache_memory_bytes = 107374182400
+max_num_seqs = 64
+
+["google/gemma-4-31B-it/parity_prefix".env]
+VLLM_USE_V2_MODEL_RUNNER = "0"
+VLLM_USE_FLASHINFER_SAMPLER = "0"
+VLLM_ENABLE_V1_MULTIPROCESSING = "0"
+VLLM_ATTENTION_BACKEND = "__must_be_unset__"
+
+["google/gemma-4-31B-it/parity_prefix".bench]
+max_tokens = 8192
+repetitions = 2
+batches_per_task = 5
+subset_size = 128
+seed = 0
+leading_trim = 8
+n_resamples = 2000
+ci = 0.95
+
+
+["Qwen/Qwen3.6-27B/parity_prefix"]
+model_id = "Qwen/Qwen3.6-27B"
+capability = "sm100"
+use = "parity_prefix"
+base_backend = "FLASHINFER"
+dattn_block_size = 16
+needs_compacted_seq_lens_cpu = false
+
+["Qwen/Qwen3.6-27B/parity_prefix".engine_args]
+async_scheduling = false
+decode_context_parallel_size = 1
+disable_cascade_attn = true
+disable_log_stats = false
+enable_prefix_caching = true
+enforce_eager = false
+kv_cache_dtype = "auto"
+max_num_batched_tokens = 16384
+pipeline_parallel_size = 1
+prefill_context_parallel_size = 1
+tensor_parallel_size = 1
+model = "Qwen/Qwen3.6-27B"
+attention_backend = "FLASHINFER"
+attention_config = "{\"backend_per_kind\": {\"full_attention\": \"CUSTOM\"}}"
+logits_processors = ["dattn.engine.processor:DattnLogitsProcessor"]
+worker_extension_cls = "dattn.engine.worker_ext.DattnWorkerExtension"
+max_model_len = 262144
+gpu_memory_utilization = 0.85
+kv_cache_memory_bytes = 107374182400
+max_num_seqs = 128
+
+["Qwen/Qwen3.6-27B/parity_prefix".env]
+VLLM_USE_V2_MODEL_RUNNER = "0"
+VLLM_USE_FLASHINFER_SAMPLER = "0"
+VLLM_ENABLE_V1_MULTIPROCESSING = "0"
+VLLM_ATTENTION_BACKEND = "__must_be_unset__"
+
+["Qwen/Qwen3.6-27B/parity_prefix".bench]
+max_tokens = 8192
+repetitions = 2
+batches_per_task = 5
+subset_size = 128
+seed = 0
+leading_trim = 8
+n_resamples = 2000
+ci = 0.95
+
