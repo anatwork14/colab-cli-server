@@ -110,9 +110,11 @@ class AssetPolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 assets.read_manifest(spec)
             row["expected_files"] = ["config.json"]
+            _asset_manifest(root, row)
             with self.assertRaises(ValueError):
                 assets.read_manifest(spec)
             row["sources"][0]["revision"] = "a" * 40
+            _asset_manifest(root, row)
             self.assertEqual(assets.read_manifest(spec)["assets"][0]["id"], "model-01")
 
     def test_no_silent_fallback_on_corrupt_local_mirror(self):
