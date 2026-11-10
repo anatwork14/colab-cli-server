@@ -213,6 +213,32 @@ def _hardware():
     return p.stdout.strip().splitlines()
 
 
+def check_research_arm(receipt, expected_arm):
+    """Prevent comparing different inference engines under the same run label."""
+    arm=receipt.get("experiment_arm")
+    if arm is None:
+        if expected_arm is not None:
+            raise RuntimeError("Expected a research arm but server has no experiment classification")
+        return None
+    if (not isinstance(arm,dict) or
+            not isinstance(arm.get("id"),str) or
+            arm["id"] != expected_arm):
+        raise RuntimeError("Server experiment arm does not match frozen runner expectation")
+    if arm.get("offline_plan_only") is not False:
+        raise RuntimeError("An offline arm plan is not a live research engine receipt")
+    if arm.get("speculative_method") in ("dflash","eagle3"):
+        draft_sha=receipt.get("draft_asset_tree_sha256")
+        if not isinstance(draft_sha,str) or not re.fullmatch(r"[a-f0-9]{64}",draft_sha):
+            raise RuntimeError("External speculative draft requires pinned staged byte hash")
+    if arm.get("declarative_attention_roles"):
+        if receipt.get("da_hook_runtime_verified") is not True:
+            raise RuntimeError("No qualified DA attention-hook evidence")
+        raise RuntimeError(
+            "DA on Qwen3.5 multimodal is not yet GPU qualified in this runner; "
+            "do not fabricate a performance or accuracy comparison")
+    return arm
+
+
 def run(args):
     if not SLUG.fullmatch(args.run_id):
         raise ValueError("Invalid run ID")
@@ -255,15 +281,7 @@ def run(args):
         raise RuntimeError("Server receipt has no recorded localhost port")
     if command_port != expected_port:
         raise RuntimeError("Server receipt port does not match requested vLLM endpoint")
-    arm=srv.get("experiment_arm")
-    expected_arm=getattr(args, "expected_experiment_arm", None)
-    if arm is not None:
-        if not isinstance(arm,dict) or arm.get("id") != expected_arm:
-            raise RuntimeError("Experiment arm must match the explicitly frozen runner expectation")
-        if arm.get("declarative_attention_roles") and srv.get("da_hook_runtime_verified") is not True:
-            raise RuntimeError("DA experiment must have real engine attention-hook proof")
-    elif expected_arm is not None:
-        raise RuntimeError("Experimental arm requested but server is a legacy unclassified process")
+    arm=check_research_arm(srv,getattr(args,"expected_experiment_arm",None))
     server=server_check(args.url,args.model)
     if args.limit and args.limit>=args.expected_count:
         raise ValueError("--limit is a pilot subset knob, not full population")
