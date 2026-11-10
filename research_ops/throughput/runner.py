@@ -6,6 +6,7 @@ All inputs (warmup included) are original random token-ID draws decoded
 and verified against the effective chat template length before timing.
 """
 import argparse
+import fcntl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import hashlib
@@ -247,6 +248,17 @@ def run_cell(args):
     if not RUN_ID.fullmatch(args.run_id):
         raise ValueError("Invalid unique attempt ID")
     cell=target[0]
+    # Fail-fast exclusive managed-GPU lock, held by the child runner across
+    # prompt preparation, warmup and measured loads. Prevents two agent jobs
+    # from contaminating one server throughput measurement.
+    lock_path=Path(args.output_root).resolve()/".exclusive-throughput-gpu.lock"
+    lock_path.parent.mkdir(parents=True,exist_ok=True)
+    lock_handle=lock_path.open("a+")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock_handle.close()
+        raise RuntimeError("Another GPU throughput cell is already active") from exc
     server=attest_server(args.server_receipt,args.model,args.arm,config,args.url)
     hardware=gpu_info()
     if not args.timeout or args.timeout<1 or args.timeout>21600:
@@ -304,6 +316,7 @@ def run_cell(args):
     print(json.dumps({"output":str(dest),"summary":outcome},indent=2))
     if outcome["status"]!="ENGINEERING_COMPLETE":
         raise SystemExit(4)
+    # The lock remains held until Python closes lock_handle on process exit.
 
 
 def main():
