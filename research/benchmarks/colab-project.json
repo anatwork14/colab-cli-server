@@ -12,7 +12,9 @@
   "workspace": {
     "remote_root": "/content/colab-workspaces/vlm-two-dataset",
     "include": [
-      "research_ops/**"
+      "research_ops/**",
+      "research/vllm_engine/checkpoint_catalog.json",
+      "research/benchmarks/qwen35_inference_sweep.json"
     ],
     "exclude": [
       "research/**/runs/**",

@@ -144,3 +144,7 @@ records, altered PDF or unverified Drive mirror may masquerade as real data.
 ## Canonical authors' Declarative Attention
 
 Research engine authority is the full MIT-licensed itsnamgyu/declarative-attention snapshot at commit 24110b7b, copied verbatim with 178/178 verified Git blob IDs. Read research/vllm_engine/AUTHORS_ENGINE.md. The previous lucidrains source is secondary only, not the engine. Authors' implementation pins vllm 0.29.0 + Python3.13 but its tested profiles are Qwen3.6-27B/Gemma4-31B SM100 and it excludes speculative decoding. Do not claim Qwen3.5-4B DA on Colab SM80/SM89 or draft/target/both integration until actual engine GPU, image token-offset and accepted-token rollback tests pass.
+
+## Qwen3.5 streaming throughput research
+
+Read research/benchmarks/QWEN35_BASE_SWEEP_RUNBOOK.md before any experiment. The 252 cells are planned, not measured; only 84 Base cells can run after approved GPU preflight. H2O and DA remain blocked until real GPU engine correctness. Random token-ID-derived chat text is distinct from raw prompt_token_ids injection. Never repeat warmups, ignore output shorter than 256, mislabel prefix caching, fake VRAM metrics or silently allocate/extend Colab. Persist each cell to dedicated host and verify hashes. No merge to main without review.

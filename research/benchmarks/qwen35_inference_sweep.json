@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "id": "qwen35-posttrained-text-prefill-ccu-20261110",
+  "purpose": "GPU throughput / capacity / TTFT only; no quality claims and no synthetic evaluation dataset",
+  "engine_version": "0.29.0",
+  "models": [
+    {
+      "key": "qwen35_08b",
+      "id": "Qwen/Qwen3.5-0.8B",
+      "stage": "posttrained_chat",
+      "source_url": "https://huggingface.co/Qwen/Qwen3.5-0.8B",
+      "full_hf_revision": null
+    },
+    {
+      "key": "qwen35_4b",
+      "id": "Qwen/Qwen3.5-4B",
+      "stage": "posttrained_chat",
+      "source_url": "https://huggingface.co/Qwen/Qwen3.5-4B",
+      "full_hf_revision": null
+    }
+  ],
+  "arms": [
+    {
+      "key": "base",
+      "engine_mode": "normal",
+      "qualification": "GPU_BASELINE_NOT_YET_RUN"
+    },
+    {
+      "key": "h2o",
+      "engine_mode": "h2o",
+      "qualification": "BLOCKED_NO_REAL_H2O_KV_EVICTION"
+    },
+    {
+      "key": "da",
+      "engine_mode": "da_normal",
+      "qualification": "BLOCKED_QWEN35_VLM_DA_GPU_PARITY_NOT_QUALIFIED"
+    }
+  ],
+  "concurrency": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32
+  ],
+  "input_lengths": [
+    128,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384
+  ],
+  "output_tokens": 256,
+  "input_representation": "random_original_token_ids_detokenized_into_chat_text_reencoded_exact_effective_chat_length",
+  "tokenizer": "frozen original model tokenizer, no remote trust",
+  "sample_plan": "each request is unique; no repeated warmups or base-model inputs",
+  "measured_request_formula": "max(16,4*ccu)",
+  "warmup_request_formula": "ccu",
+  "endpoint": "/v1/chat/completions",
+  "stream": true,
+  "thinking": false,
+  "sampling": {
+    "temperature": 0,
+    "ignore_eos": true,
+    "min_tokens": 256,
+    "max_completion_tokens": 256
+  },
+  "server": {
+    "max_num_seqs": 32,
+    "max_model_len": 18432,
+    "enable_prefix_caching": false,
+    "requested_max_num_batched_tokens": null
+  },
+  "generation": {
+    "random_seed_policy": "per-cell secure random seed stored in receipt; per-request derived child seed; no silent retries",
+    "first_token_measurement": "first content or returned token_ids, not role-only SSE event"
+  },
+  "environment": {
+    "single_gpu_per_run": true,
+    "backend": "vllm V1",
+    "gpu_device_pin_required": true
+  },
+  "reliability": {
+    "full_run_requires_all_cells_and_all_requests": true,
+    "fail_if_output_short": true,
+    "zero_failed_requests_for_complete": true,
+    "no_automatic_gpu_allocation": true
+  },
+  "official_dataset_scoring": false
+}
