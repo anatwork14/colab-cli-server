@@ -348,3 +348,13 @@ python3 -m colab_adapter.cli project up --manifest ./research-project/colab-proj
 - [Expected results](docs/EXPECTED_RESULTS_V2.md) — Measurable acceptance criteria
 - [Cross-device Monitor Guide](docs/MONITORING_DASHBOARD_V2.md) — Dashboard architecture and API specification
 
+
+
+## Standalone inference-engine research workspace
+
+This infrastructure also supports training-free, real-data inference research:
+engine source revision checks, frozen asset cache/staging, and separation of
+research questions, protocols, experiment cells, observations and results.
+No other research repository is linked, and no GPU or Google Drive operation
+happens during CI. Read [research/README.md](research/README.md) and
+[research/decisions/0001-verified-asset-cache-policy.md](research/decisions/0001-verified-asset-cache-policy.md).
