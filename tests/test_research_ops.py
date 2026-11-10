@@ -101,6 +101,19 @@ class AssetPolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 assets._unpack_archive(link, root / "extract2")
 
+    def test_pack_refuses_fake_google_drive_mount(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            src = root / "src"
+            _write(src, "config.json", b"unit-test")
+            spec = _asset_manifest(root, _dir_asset("model-01", "model", src, ["config.json"]))
+            scratch = root / "scratch"
+            assets.stage(spec, "model-01", scratch)
+            with patch("research_ops.assets.os.path.ismount", return_value=False):
+                with self.assertRaises(RuntimeError):
+                    assets.pack(spec, "model-01", scratch,
+                                "/content/drive/MyDrive/research-models/model.tar")
+
     def test_bad_pins_and_paths(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -160,6 +173,38 @@ class EngineIdentityTests(unittest.TestCase):
 
 
 class ResearchFreezeTests(unittest.TestCase):
+    def test_multi_arm_study_requires_one_frozen_cell_at_a_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            model = root / "model"
+            data = root / "dataset"
+            _write(model, "config.json", b"a")
+            _write(data, "manifest.json", b"b")
+            spec = _asset_manifest(root,
+                _dir_asset("model-01", "model", model, ["config.json"]),
+                _dir_asset("data-01", "dataset", data, ["manifest.json"]))
+            experiment = {
+                "schema_version":1, "kind":"inference_engine_benchmark",
+                "study_id":"test-study", "experiment_id":"test-arms",
+                "research_question":"A?", "hypothesis":"B?",
+                "synthetic_data":False, "training":False,
+                "cells":[{
+                    "id": "baseline", "engine":{"mode":"stock"},
+                    "model_asset_id":"model-01", "dataset_asset_id":"data-01",
+                    "parameters":{}, "metrics":["quality"]
+                }, {
+                    "id": "candidate", "engine":{"mode":"stock"},
+                    "model_asset_id":"model-01", "dataset_asset_id":"data-01",
+                    "parameters":{}, "metrics":["quality"]
+                }]
+            }
+            f = root / "exp.json"
+            f.write_text(json.dumps(experiment))
+            self.assertEqual(len(experiments.validate_experiment(f, spec)["cells"]), 2)
+            with self.assertRaises(ValueError):
+                experiments.freeze(f, spec, root / "empty",
+                                   root / "out", "run-001")
+
     def test_freeze_keeps_input_status_unexecuted(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
