@@ -366,3 +366,5 @@ Standalone real-data MemLens and MMLongBench-Doc Colab benchmarking tools: [agen
 Verified publisher sources: [MemLens and MMLongBench-Doc acquisition](research/benchmarks/AUTHENTIC_DATASETS.md).
 
 [Canonical authors' DA integration and strict Qwen3.5 VLM gates](research/vllm_engine/AUTHORS_ENGINE.md) — original source copied in full at an immutable commit, 178/178 blob hashes verified; our experimental GPU integrations remain unqualified.
+
+Qwen3.5-0.8B/4B throughput benchmarking (252-cell matrix; Base GPU pilots only): [agent runbook](research/benchmarks/QWEN35_BASE_SWEEP_RUNBOOK.md) and [agent directive](research/benchmarks/QWEN35_AGENT_DIRECTIVE.md).
