@@ -15,6 +15,7 @@ import time
 from research_ops.assets import verify as verify_asset
 from research_ops.engine import verify as verify_engine
 from .runner import _atomic_json, server_check
+from research_ops.vllm_engine.matrix import MODES, METHODS, make_arm, command_for_arm
 
 SAFE=re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,79}$")
 
@@ -44,6 +45,40 @@ def start(args):
             and args.max_model_len>=128 and 1<=args.max_images<=1024):
         raise ValueError("Invalid inference-serving limits")
     receipt=verify_asset(args.assets,args.model_asset,args.scratch)
+    arm=None
+    draft_receipt=None
+    # The research mode is an explicit opt-in; historical baseline workflows
+    # remain unchanged until a specific arm is selected.
+    if getattr(args,"experiment_mode",None):
+        arm=make_arm(args.model_profile,args.experiment_mode,args.spec_method)
+        if arm.da_roles:
+            raise RuntimeError(
+                "DA vLLM 0.29.0 GPU hook is NOT integrated/qualified. "
+                "Refusing to serve stock attention under a DA label.")
+        if arm.method in ("dflash","eagle3"):
+            if not args.draft_asset:
+                raise ValueError("DFlash/EAGLE3 needs a pinned external draft asset ID")
+            draft_receipt=verify_asset(args.assets,args.draft_asset,args.scratch)
+            source=draft_receipt.get("source",{})
+            if source.get("type") == "huggingface" and source.get("repo_id") != arm.draft_id:
+                raise ValueError("Draft checkpoint from Hugging Face does not match arm")
+            if draft_receipt["tree_sha256"]==receipt["tree_sha256"]:
+                raise ValueError("Draft and target unexpectedly use identical bytes")
+        elif args.draft_asset:
+            raise ValueError("No separate draft checkpoint for normal/native-MTP arm")
+        target_source=receipt.get("source",{})
+        if target_source.get("type") == "huggingface" and target_source.get("repo_id") != arm.target_id:
+            raise ValueError("Pinned checkpoint does not match selected Qwen3.5 target")
+        if arm is not None:
+        planned=command_for_arm(arm,str(model_path),
+            draft_path=(str(Path(draft_receipt["staged_path"])) if draft_receipt else None),
+            served_name=args.model,max_model_len=args.max_model_len,
+            max_images=args.max_images,gpu_memory_utilization=args.gpu_memory_utilization)
+        # The existing process launcher adds port; derive the authoritative
+        # per-arm command from the strict research profile, not ad hoc guesses.
+        argv=planned+["--port",str(args.port)]
+    if args.speculative_config_json:
+            raise ValueError("Do not combine experiment-mode with legacy speculative config")
     engine=verify_engine(args.engine_mode,args.source_root,args.source_revision,require_gpu=True)
     target=Path(args.output_root).resolve()/args.run_id
     target.mkdir(parents=True,exist_ok=False)
@@ -75,6 +110,10 @@ def start(args):
         "engine":engine,"model_asset_sha256":receipt["tree_sha256"],
         "argv_without_tokens":argv,"log":str(output),
         "local_only":True,
+        "experiment_arm":arm.to_dict() if arm else None,
+        "draft_asset_tree_sha256":(
+            draft_receipt["tree_sha256"] if draft_receipt else None),
+        "da_hook_runtime_verified":False,
     }
     _atomic_json(target/"server_process.json",record)
     return record
@@ -125,6 +164,14 @@ def main():
     p.add_argument("--max-images",type=int,default=160)
     p.add_argument("--gpu-memory-utilization",type=float,default=0.85)
     p.add_argument("--speculative-config-json")
+    p.add_argument("--experiment-mode",choices=MODES,
+                   help="Opt into strict six-mode research experiment")
+    p.add_argument("--spec-method",choices=METHODS,
+                   help="For speculative and speculative+DA categories")
+    p.add_argument("--model-profile",default="qwen35_4b",
+                   help="Qwen3.5 model profile in pinned checkpoint catalog")
+    p.add_argument("--draft-asset",
+                   help="Verified staged HF draft asset ID for DFlash/EAGLE3")
     p.add_argument("--output-root",default="/content/research-vllm-servers")
     p.add_argument("--run-id",required=True)
     p.add_argument("--execute",action="store_true")
