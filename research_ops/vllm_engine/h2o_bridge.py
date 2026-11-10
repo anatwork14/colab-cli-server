@@ -88,6 +88,9 @@ class CandidatePlan:
     physical_eviction_performed: bool = False
     physical_kv_bytes_freed: object = None
     gpu_qualified: bool = False
+    da_global_reentry_hazard: bool = True
+    historic_kv_reconstruction_verified: bool = False
+    physical_reclaim_authorized: bool = False
 
     def to_dict(self):
         return dict(self.__dict__)
@@ -112,6 +115,10 @@ def plan_protected_eviction_candidates(
     All KV/query heads must independently nominate every token in a block.
     Partial final blocks remain resident. This is intentionally conservative:
     vLLM's actual block size may differ across hybrid-attention cache groups.
+
+    DA can move from FOCUS/LOCAL back to GLOBAL and read all historic KV.
+    Hence even filtered candidate blocks remain NONEXECUTABLE until a
+    proven no-reentry or exact KV-reconstruction protocol exists.
     """
     validate_h2o_policy_receipt(manifest)
     if attention_group != "full_attention" or stage != "decode":
