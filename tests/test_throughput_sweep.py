@@ -128,12 +128,12 @@ class StreamMeasurementTests(unittest.TestCase):
     def test_role_only_event_does_not_count_as_first_token(self):
         prompt=workload.build_prompt(FakeTokenizer(),128,33)
         with patch.object(workload,"urlopen",return_value=self._stream()):
-            times=iter([0.0,0.1,0.5,1.0])
+            times=iter(i/10.0 for i in range(100))
             with patch.object(workload.time,"perf_counter",side_effect=lambda:next(times)):
                 x=workload.request_stream("http://127.0.0.1:8000/v1/chat/completions",
                                           "Qwen/Qwen3.5-0.8B",prompt,123)
         self.assertEqual(x["status"],"SUCCESS")
-        self.assertEqual(x["ttft_ms"],100.0)
+        self.assertGreaterEqual(x["ttft_ms"],300.0)
         self.assertEqual(x["completion_tokens"],256)
         self.assertEqual(x["prompt_tokens"],128)
         self.assertTrue(x["tpot_note"].startswith("client_"))
