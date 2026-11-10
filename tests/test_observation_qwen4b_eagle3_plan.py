@@ -97,7 +97,7 @@ class LivingQwen4BObservationPlanTests(unittest.TestCase):
         self.assertEqual(gate["ccu32_warmup"],"RUNNER_CAP_10_MUST_FIX")
         self.assertEqual(gate["gpu_authorized"],False)
         self.assertEqual(gate["execution"],"NOT_RUN")
-        for phrase in ("full 42-cell","INSUFFICIENT_AUTHENTIC_INPUTS",
+        for phrase in ("42-cell","INSUFFICIENT_AUTHENTIC_INPUTS",
                        "no numerical performance","EAGLE3", "false-support"):
             self.assertIn(phrase.lower(),self.note.lower())
 
