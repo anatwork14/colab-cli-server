@@ -215,3 +215,21 @@ Cleanup status at signing (from files and owner instruction only; cloud state no
 
 Owner sign-off checklist: (1) Drive roots inspected and deleted - pending; (2) monitor token files deleted - pending; (3) Colab UI shows no runtime and a balance near 186.69 - pending; (4) stale documentation corrected - done in this record, README and the GPU plan; (5) owner verdict signed - done (Section 1); (6) failure paths, a continuous run and a post-#32 monitor retest recorded as pending future work - done above.
 
+### 7.12 Post-#32 read-only monitor retest, 2026-10-26 (host loopback only)
+Scope: a read-only retest of the monitor after PR #32 (usage poller, *Unavailable* display, Drive status, session table). No GPU, no allocation, no Drive write, no OAuth change. The monitor ran on the host bound to `127.0.0.1:8080` with a throwaway bearer token (deleted afterwards), `poll_interval` 15 s, the same seeded G5 data as Section 7.9, and the real usage poller calling only the read-only `colab --auth=oauth2 usage`. This is a host-loopback test: it does **not** repeat the second-device check, and the browser rendering of the new UI was **not** looked at by a human or a real browser in this step.
+
+| Check | Result | Observed |
+|---|---|---|
+| Clean baseline before start | PASS | real `usage`: 186.69 CU, 0.00/hr, Active assignments 0; real `sessions`: none |
+| Before the first poll | PASS | `/api/v1/summary`: balance `null`, active_assignments `null` (not 0), `is_stale` true |
+| Poller populates data | PASS | after one interval: balance 186.69, rate 0.0, active_assignments 0, `is_stale` false; `/compute/samples` held 4 samples (status OK, source `colab usage`) at roughly 17 s spacing; values equal the real `colab usage` output read at the same time |
+| Full checker on loopback | PASS | `monitor_check.py` overall PASS (`evidence_host_loopback.json`); not cross-device evidence |
+| Served page | PASS | HTTP 200; 0 `.innerHTML` uses and 0 inline `on*` handlers in the served HTML; strings *Unavailable* and *NOT RECORDED* and a terminated-sessions toggle present (string-level check only) |
+| Run list | PASS | `drive_publication_status` is `NOT RECORDED` (was `PENDING`), latest checkpoint `model_g6.pt` state `known`, 1 checkpoint |
+| Secrets | PASS | grep of the monitor log for token and secret patterns and the token value: 0 matches |
+| Clean shutdown | PASS | process killed by PID; port 8080 closed; no `colab` or launcher process remained 20 s later (the poller stopped); no allocation command appeared; final real `sessions`: none; `usage`: Active assignments 0, 186.69 CU unchanged |
+
+Raw files: `~/colab-live-evidence/monitor-retest-20261026/` (0700 directory; summaries, evidence JSON, served page, baseline and final snapshots). Not exercised: poller backoff after real `colab usage` failures (offline-tested only), behaviour with a live running session, the Unavailable path against a failing provider, the rendered session-table toggle in a real browser, and any second-device view of the new UI. The first poll comes one interval after start, so a freshly started monitor shows *Unavailable* until then (observed).
+
+Effect on the earlier limitation list: limitation (5) in Section 7.11 (PR #32 not retested live) is **partly** resolved - the poller and the summary data path are now confirmed live on loopback; the rendered UI and the second-device view remain unverified live. The overall verdict is unchanged: `LIVE_SUCCESS_PATH_VERIFIED_WITH_LIMITATIONS`.
+
