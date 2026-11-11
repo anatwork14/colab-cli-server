@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "kind": "inference_engine_benchmark",
+  "study_id": "engine-validation",
+  "experiment_id": "base-candidate-comparison",
+  "research_question": "Does a source-level change improve serving latency with no task-quality loss?",
+  "hypothesis": "Unverified: to be tested with real frozen assets and qualified metrics.",
+  "training": false,
+  "synthetic_data": false,
+  "cells": [
+    {
+      "id": "baseline",
+      "engine": {
+        "mode": "stock"
+      },
+      "model_asset_id": "real-model",
+      "dataset_asset_id": "real-dataset",
+      "parameters": {
+        "concurrency": 1,
+        "max_output_tokens": 128,
+        "warmup_requests": 5
+      },
+      "metrics": [
+        "ttft_p50_ms",
+        "ttft_p95_ms",
+        "tpot_p50_ms",
+        "end_to_end_p95_ms",
+        "requests_per_second",
+        "task_accuracy"
+      ]
+    }
+  ]
+}

@@ -100,3 +100,19 @@ See [docs/ARTIFACT_RECOVERY.md](docs/ARTIFACT_RECOVERY.md), [docs/GOOGLE_DRIVE_A
 - **Monitor identity**: runs are keyed by `(project_id, run_id)`. Use `?project=`. A bare run id that matches several projects returns 409 `ambiguous_run`. Skip symlinks and exclude `.locks`. Label account-wide counters as account-wide. `is_runtime_active` is conservative.
 - **Offline only**: do not describe mock or offline results as live Colab, Drive or OAuth validation, and never claim `PRODUCTION_READY` or `LIVE_VERIFIED`.
 
+
+
+## New training-free engine research tools
+
+The active research policy is in research/README.md, decisions/ and agents/.
+Do not integrate external research repositories, modify unrelated Colab
+infrastructure, generate benchmark data, or train/fine-tune models.
+research_ops/assets.py does not contact cloud services during plan/validate,
+but stage --execute may download gigabytes, and pack --execute may write
+large archives: obtain explicit transfer/storage approval. Do not commit
+weight/media files or allow local Drive mount I/O in timed TTFT/TPOT. Preserve
+source SHA for modified vLLM; engine.py must verify a real editable/native
+source build rather than claim patched source while running a stock wheel.
+experiments.py freeze writes FROZEN_NOT_EXECUTED; ONLY actual checked GPU
+logs and complete dataset-qualified scoring can prove an experiment result.
+Colab lifecycle remains exclusively in the already approved adapter.

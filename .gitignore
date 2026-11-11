@@ -30,3 +30,21 @@ outputs/
 .gcloud/
 secrets/
 colab_session.json
+
+
+# Active research datasets, models, engine build trees and raw GPU results
+research/runs/
+research/artifacts/
+research/data/
+research/models/
+research/checkouts/
+research/caches/
+research/.cache/
+research/**/.env
+research/**/*.tar
+research/**/*.tar.gz
+research/**/*.zip
+research/**/*.jsonl
+research/**/run_manifest.json
+research/**/.research_asset_receipt.json
+research_ops/**/__pycache__/
